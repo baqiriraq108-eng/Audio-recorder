@@ -1,0 +1,33 @@
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:aapt="http://schemas.android.com/aapt"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+    <!-- Pure minimalist Greek Theta (Θ) symbol with warm orange-to-ivory gradient blend matching Omega (Ω) -->
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M12,2.6 C16.6,2.6 20.0,6.6 20.0,12.0 C20.0,17.4 16.6,21.4 12,21.4 C7.4,21.4 4.0,17.4 4.0,12.0 C4.0,6.6 7.4,2.6 12,2.6 Z M7.6,12.0 L16.4,12.0 M7.6,10.3 L7.6,13.7 M16.4,10.3 L16.4,13.7"
+        android:strokeWidth="2.35"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round">
+        <aapt:attr name="android:strokeColor">
+            <gradient
+                android:startX="4.0"
+                android:startY="3.0"
+                android:endX="20.0"
+                android:endY="21.0"
+                android:type="linear">
+                <item
+                    android:color="#FFE38851"
+                    android:offset="0.0" />
+                <item
+                    android:color="#FFEDA87D"
+                    android:offset="0.52" />
+                <item
+                    android:color="#FFF4D7C7"
+                    android:offset="1.0" />
+            </gradient>
+        </aapt:attr>
+    </path>
+</vector>

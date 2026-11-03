@@ -1,0 +1,89 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:id="@+id/notif_append_confirm_root"
+    android:layout_width="match_parent"
+    android:layout_height="wrap_content"
+    android:gravity="center_vertical"
+    android:orientation="horizontal"
+    android:paddingStart="10dp"
+    android:paddingTop="6dp"
+    android:paddingEnd="10dp"
+    android:paddingBottom="6dp">
+
+    <LinearLayout
+        android:id="@+id/notif_append_dont_button"
+        android:layout_width="0dp"
+        android:layout_height="40dp"
+        android:layout_marginEnd="6dp"
+        android:layout_weight="1"
+        android:background="@drawable/bg_notif_append_button"
+        android:clickable="true"
+        android:focusable="true"
+        android:gravity="center"
+        android:orientation="horizontal"
+        android:paddingStart="12dp"
+        android:paddingEnd="12dp">
+
+        <ImageView
+            android:id="@+id/notif_append_dont_icon"
+            android:layout_width="20dp"
+            android:layout_height="20dp"
+            android:contentDescription="Don't"
+            android:scaleType="fitCenter"
+            android:src="@drawable/ic_notif_greek_theta" />
+
+        <TextView
+            android:id="@+id/notif_append_dont_text"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginStart="8dp"
+            android:ellipsize="end"
+            android:fontFamily="sans-serif-medium"
+            android:letterSpacing="0.03"
+            android:maxLines="1"
+            android:singleLine="true"
+            android:text="Don't"
+            android:textColor="#F4D7C7"
+            android:textSize="15sp"
+            android:textStyle="normal" />
+    </LinearLayout>
+
+    <LinearLayout
+        android:id="@+id/notif_append_save_button"
+        android:layout_width="0dp"
+        android:layout_height="40dp"
+        android:layout_marginStart="6dp"
+        android:layout_weight="1"
+        android:background="@drawable/bg_notif_append_button"
+        android:clickable="true"
+        android:focusable="true"
+        android:gravity="center"
+        android:orientation="horizontal"
+        android:paddingStart="12dp"
+        android:paddingEnd="12dp">
+
+        <ImageView
+            android:id="@+id/notif_append_save_icon"
+            android:layout_width="20dp"
+            android:layout_height="20dp"
+            android:contentDescription="Save"
+            android:scaleType="fitCenter"
+            android:src="@drawable/ic_notif_greek_sigma" />
+
+        <TextView
+            android:id="@+id/notif_append_save_text"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginStart="8dp"
+            android:ellipsize="end"
+            android:fontFamily="sans-serif-medium"
+            android:letterSpacing="0.03"
+            android:maxLines="1"
+            android:singleLine="true"
+            android:text="Save"
+            android:textColor="#F4D7C7"
+            android:textSize="15sp"
+            android:textStyle="normal" />
+    </LinearLayout>
+
+</LinearLayout>

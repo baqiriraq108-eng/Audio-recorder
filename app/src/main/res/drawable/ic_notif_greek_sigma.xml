@@ -1,0 +1,33 @@
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:aapt="http://schemas.android.com/aapt"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+    <!-- Pure minimalist Greek Sigma (Σ) symbol for Save action with warm orange-to-ivory gradient blend -->
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M18.8,6.6 L18.8,4.0 L5.2,4.0 L12.8,12.0 L5.2,20.0 L18.8,20.0 L18.8,17.4"
+        android:strokeWidth="2.35"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round">
+        <aapt:attr name="android:strokeColor">
+            <gradient
+                android:startX="5.0"
+                android:startY="4.0"
+                android:endX="19.0"
+                android:endY="20.0"
+                android:type="linear">
+                <item
+                    android:color="#FFE38851"
+                    android:offset="0.0" />
+                <item
+                    android:color="#FFEDA87D"
+                    android:offset="0.52" />
+                <item
+                    android:color="#FFF4D7C7"
+                    android:offset="1.0" />
+            </gradient>
+        </aapt:attr>
+    </path>
+</vector>

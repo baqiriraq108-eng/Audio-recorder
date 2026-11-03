@@ -300,6 +300,12 @@ class RecorderViewModel(application: Application) : AndroidViewModel(application
                         stopAndSaveImmediatelyFromNotification()
                     }
                 }
+                RecordingForegroundService.ACTION_USER_CONFIRM_APPEND_SAVE -> {
+                    confirmSaveFromNotification()
+                }
+                RecordingForegroundService.ACTION_USER_CANCEL_APPEND_SAVE -> {
+                    cancelSaveFromNotification()
+                }
                 RecordingForegroundService.ACTION_USER_BOOKMARK -> {
                     if (_recordingStatus.value == RecordingStatus.RECORDING ||
                         _recordingStatus.value == RecordingStatus.PAUSED
@@ -399,7 +405,9 @@ class RecorderViewModel(application: Application) : AndroidViewModel(application
             var lastNotifiedSecond = -1L
             audioEngine.elapsedMs.collect { elapsed ->
                 val status = _recordingStatus.value
-                if (status == RecordingStatus.RECORDING || status == RecordingStatus.PAUSED) {
+                if ((status == RecordingStatus.RECORDING || status == RecordingStatus.PAUSED) &&
+                    !_showAppendSaveConfirmDialog.value
+                ) {
                     val baseOffset = _appendTarget.value?.durationMs ?: 0L
                     val totalElapsedMs = (baseOffset + elapsed).coerceAtLeast(0L)
                     val currentSecond = totalElapsedMs / 1000L
@@ -430,6 +438,8 @@ class RecorderViewModel(application: Application) : AndroidViewModel(application
                 addAction(RecordingForegroundService.ACTION_USER_PAUSE)
                 addAction(RecordingForegroundService.ACTION_USER_RESUME)
                 addAction(RecordingForegroundService.ACTION_USER_STOP_SAVE)
+                addAction(RecordingForegroundService.ACTION_USER_CONFIRM_APPEND_SAVE)
+                addAction(RecordingForegroundService.ACTION_USER_CANCEL_APPEND_SAVE)
                 addAction(RecordingForegroundService.ACTION_USER_BOOKMARK)
                 addAction(RecordingForegroundService.ACTION_USER_TOGGLE_SKIP_SILENCE)
                 addAction(RecordingForegroundService.ACTION_USER_DISCARD)
@@ -449,6 +459,8 @@ class RecorderViewModel(application: Application) : AndroidViewModel(application
 
         // Connect direct service callbacks for instant, background-safe execution
         RecordingForegroundService.activeStopSaveHandler = { stopAndSaveImmediatelyFromNotification() }
+        RecordingForegroundService.activeConfirmAppendSaveHandler = { confirmSaveFromNotification() }
+        RecordingForegroundService.activeCancelAppendSaveHandler = { cancelSaveFromNotification() }
         RecordingForegroundService.activePauseHandler = { pauseRecording() }
         RecordingForegroundService.activeResumeHandler = { resumeRecording() }
         RecordingForegroundService.activeBookmarkHandler = { addLiveBookmark() }
@@ -588,20 +600,47 @@ class RecorderViewModel(application: Application) : AndroidViewModel(application
 
     fun requestAppendSaveConfirmation() {
         if (_recordingStatus.value == RecordingStatus.RECORDING) {
-            pauseRecording()
+            audioEngine.pauseRecording()
+            _recordingStatus.value = RecordingStatus.PAUSED
         }
         _openedPlayerRecording.value = null
         _currentDestination.value = AppDestination.RECORDER
         _showAppendSaveConfirmDialog.value = true
+        showAppendSaveConfirmationNotification()
     }
 
     fun dismissAppendSaveConfirmDialog() {
         _showAppendSaveConfirmDialog.value = false
+        syncForegroundNotificationIfRecording()
     }
 
     fun confirmAppendAndMergeRecording() {
         _showAppendSaveConfirmDialog.value = false
         stopAndSaveImmediatelyFromNotification(forceMergeAppend = true)
+    }
+
+    fun confirmSaveFromNotification() {
+        val pending = _pendingSaveSession.value
+        if (pending != null) {
+            _showAppendSaveConfirmDialog.value = false
+            confirmSaveSession(pending.suggestedTitle)
+            return
+        }
+        if (_recordingStatus.value == RecordingStatus.RECORDING ||
+            _recordingStatus.value == RecordingStatus.PAUSED
+        ) {
+            confirmAppendAndMergeRecording()
+        }
+    }
+
+    fun cancelSaveFromNotification() {
+        if (_appendTarget.value != null) {
+            cancelContinueRecordingMode()
+        } else if (_pendingSaveSession.value != null) {
+            discardPendingSession()
+        } else {
+            resetActiveRecording()
+        }
     }
 
     fun stopAndPromptSave() {
@@ -617,11 +656,12 @@ class RecorderViewModel(application: Application) : AndroidViewModel(application
 
         viewModelScope.launch {
             _recordingStatus.value = RecordingStatus.PROCESSING
-            stopForegroundServiceNotification()
+            showAppendSaveConfirmationNotification()
             val (sessionFile, elapsedDuration) = audioEngine.stopRecordingAndFinalize()
             val finalDuration = elapsedDuration.coerceAtLeast(1_000L)
 
             if (sessionFile == null || !sessionFile.exists()) {
+                stopForegroundServiceNotification()
                 _recordingStatus.value = RecordingStatus.ERROR
                 postSnackbar("Unable to finalize recording buffer.")
                 return@launch
@@ -668,10 +708,10 @@ class RecorderViewModel(application: Application) : AndroidViewModel(application
 
     /**
      * Triggered when the user taps the Stop and Save button from the notification / HyperIsland,
-     * or when confirming the "Append to Recording?" dialog (`forceMergeAppend = true`).
+     * or when confirming the save dialog (`forceMergeAppend = true`).
      */
     fun stopAndSaveImmediatelyFromNotification(forceMergeAppend: Boolean = false) {
-        if (_appendTarget.value != null && !forceMergeAppend) {
+        if (!forceMergeAppend) {
             requestAppendSaveConfirmation()
             return
         }
@@ -820,6 +860,7 @@ class RecorderViewModel(application: Application) : AndroidViewModel(application
                     }
                 }
             } else {
+                _showAppendSaveConfirmDialog.value = false
                 val format = _settings.value.defaultFormat
                 val safeFileName = cleanTitle.replace(Regex("[^A-Za-z0-9_\\-]"), "_")
                     .take(36)
@@ -995,7 +1036,10 @@ class RecorderViewModel(application: Application) : AndroidViewModel(application
             )
             val id = repository.insertRecording(entity)
             val savedEntity = entity.copy(id = id)
+            _lastSavedRecordingId.value = id
+            showSavedConfirmationNotification("Finished recording")
             audioEngine.resetSessionDisplayState()
+            _showAppendSaveConfirmDialog.value = false
             _liveBookmarks.value = emptyList()
             _pendingSaveSession.value = null
             _recordingStatus.value = RecordingStatus.READY
@@ -1017,6 +1061,8 @@ class RecorderViewModel(application: Application) : AndroidViewModel(application
             } catch (_: Exception) {}
         }
         audioEngine.cancelAndResetRecording()
+        stopForegroundServiceNotification()
+        _showAppendSaveConfirmDialog.value = false
         _liveBookmarks.value = emptyList()
         _pendingSaveSession.value = null
         _recordingStatus.value = RecordingStatus.READY
@@ -2814,6 +2860,16 @@ class RecorderViewModel(application: Application) : AndroidViewModel(application
         } catch (_: Exception) {}
     }
 
+    private fun showAppendSaveConfirmationNotification() {
+        try {
+            val context = getApplication<Application>()
+            val intent = Intent(context, RecordingForegroundService::class.java).apply {
+                action = RecordingForegroundService.ACTION_SHOW_APPEND_SAVE_CONFIRMATION
+            }
+            context.startService(intent)
+        } catch (_: Exception) {}
+    }
+
     private fun showSavedConfirmationNotification(title: String = "Finished recording") {
         try {
             val context = getApplication<Application>()
@@ -2879,6 +2935,8 @@ class RecorderViewModel(application: Application) : AndroidViewModel(application
 
     override fun onCleared() {
         RecordingForegroundService.activeStopSaveHandler = null
+        RecordingForegroundService.activeConfirmAppendSaveHandler = null
+        RecordingForegroundService.activeCancelAppendSaveHandler = null
         RecordingForegroundService.activePauseHandler = null
         RecordingForegroundService.activeResumeHandler = null
         RecordingForegroundService.activeBookmarkHandler = null

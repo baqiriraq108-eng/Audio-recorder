@@ -28,6 +28,7 @@ class RecordingForegroundService : Service() {
     private var isPausedState: Boolean = false
     private var isSkipSilenceActive: Boolean = false
     private var isAppendingSession: Boolean = false
+    private var isShowingAppendSaveConfirmation: Boolean = false
     private var sessionStartTimeMs: Long = System.currentTimeMillis()
     private var pauseStartedAtMs: Long = 0L
     private var accumulatedPausedMs: Long = 0L
@@ -42,6 +43,8 @@ class RecordingForegroundService : Service() {
 
     internal var lastRecordingPlaybackState: PlaybackState? = null
         private set
+
+    internal fun isAppendSaveConfirmationVisible(): Boolean = isShowingAppendSaveConfirmation
 
     internal fun getActiveMediaSession(): MediaSession? = mediaSession
 
@@ -137,23 +140,40 @@ class RecordingForegroundService : Service() {
     }
 
     internal fun handleRecordingStopSaveFromNotification() {
-        if (isAppendingSession) {
-            dispatchStopSaveAction()
-            try {
-                val openAppIntent = Intent(this, MainActivity::class.java).apply {
-                    action = ACTION_PROMPT_APPEND_SAVE
-                    addFlags(
-                        Intent.FLAG_ACTIVITY_NEW_TASK or
-                            Intent.FLAG_ACTIVITY_SINGLE_TOP or
-                            Intent.FLAG_ACTIVITY_CLEAR_TOP
-                    )
-                }
-                startActivity(openAppIntent)
-            } catch (_: Exception) {}
+        showAppendSaveConfirmation()
+        dispatchStopSaveAction()
+    }
+
+    internal fun dispatchConfirmAppendSaveAction() {
+        val handler = activeConfirmAppendSaveHandler
+        if (handler != null) {
+            handler.invoke()
         } else {
-            showFinishedSavedConfirmation(getString(R.string.notification_finished_recording))
-            dispatchStopSaveAction()
+            sendBroadcast(Intent(ACTION_USER_CONFIRM_APPEND_SAVE).setPackage(packageName))
         }
+    }
+
+    internal fun dispatchCancelAppendSaveAction() {
+        val handler = activeCancelAppendSaveHandler
+        if (handler != null) {
+            handler.invoke()
+        } else {
+            sendBroadcast(Intent(ACTION_USER_CANCEL_APPEND_SAVE).setPackage(packageName))
+        }
+    }
+
+    internal fun handleConfirmAppendSaveFromNotification() {
+        isShowingAppendSaveConfirmation = false
+        isAppendingSession = false
+        showFinishedSavedConfirmation(getString(R.string.notification_finished_recording))
+        dispatchConfirmAppendSaveAction()
+    }
+
+    internal fun handleCancelAppendSaveFromNotification() {
+        isShowingAppendSaveConfirmation = false
+        isAppendingSession = false
+        dispatchCancelAppendSaveAction()
+        stopForegroundInternal()
     }
 
     internal fun dispatchPlaybackBookmarkAction() {
@@ -274,6 +294,12 @@ class RecordingForegroundService : Service() {
                             }
                             ACTION_NOTIFICATION_STOP_SAVE, ACTION_USER_STOP_SAVE -> {
                                 handleRecordingStopSaveFromNotification()
+                            }
+                            ACTION_NOTIFICATION_CONFIRM_APPEND_SAVE, ACTION_USER_CONFIRM_APPEND_SAVE -> {
+                                handleConfirmAppendSaveFromNotification()
+                            }
+                            ACTION_NOTIFICATION_CANCEL_APPEND_SAVE, ACTION_USER_CANCEL_APPEND_SAVE -> {
+                                handleCancelAppendSaveFromNotification()
                             }
                             ACTION_NOTIFICATION_BOOKMARK, ACTION_USER_BOOKMARK -> {
                                 dispatchBookmarkAction()
@@ -445,6 +471,7 @@ class RecordingForegroundService : Service() {
         when (intent?.action) {
             ACTION_START_FOREGROUND -> {
                 isPlaybackMode = false
+                isShowingAppendSaveConfirmation = false
                 currentTitle = intent.getStringExtra(EXTRA_TITLE)?.takeIf { it.isNotBlank() } ?: "Recording"
                 currentStatus = intent.getStringExtra(EXTRA_STATUS).orEmpty()
                 isPausedState = intent.getBooleanExtra(EXTRA_IS_PAUSED, false)
@@ -501,6 +528,9 @@ class RecordingForegroundService : Service() {
                 currentTitle = intent.getStringExtra(EXTRA_TITLE)?.takeIf { it.isNotBlank() } ?: currentTitle
                 currentStatus = intent.getStringExtra(EXTRA_STATUS) ?: currentStatus
                 isPausedState = intent.getBooleanExtra(EXTRA_IS_PAUSED, isPausedState)
+                if (!isPausedState) {
+                    isShowingAppendSaveConfirmation = false
+                }
                 if (intent.hasExtra(EXTRA_IS_SKIP_SILENCE_ACTIVE)) {
                     isSkipSilenceActive = intent.getBooleanExtra(EXTRA_IS_SKIP_SILENCE_ACTIVE, isSkipSilenceActive)
                 }
@@ -518,17 +548,19 @@ class RecordingForegroundService : Service() {
                     pauseStartedAtMs = 0L
                 }
                 val isAwaitingSave = intent.getBooleanExtra(EXTRA_AWAITING_SAVE, false)
-                val nm = getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager
-                nm?.notify(
-                    NOTIFICATION_ID,
-                    buildRecordingNotification(
-                        title = currentTitle,
-                        statusText = currentStatus,
-                        isPaused = isPausedState,
-                        isSkipSilence = isSkipSilenceActive,
-                        isAwaitingSave = isAwaitingSave
+                if (!isShowingAppendSaveConfirmation) {
+                    val nm = getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager
+                    nm?.notify(
+                        NOTIFICATION_ID,
+                        buildRecordingNotification(
+                            title = currentTitle,
+                            statusText = currentStatus,
+                            isPaused = isPausedState,
+                            isSkipSilence = isSkipSilenceActive,
+                            isAwaitingSave = isAwaitingSave
+                        )
                     )
-                )
+                }
             }
 
             ACTION_START_PLAYBACK -> {
@@ -597,6 +629,18 @@ class RecordingForegroundService : Service() {
 
             ACTION_NOTIFICATION_STOP_SAVE -> {
                 handleRecordingStopSaveFromNotification()
+            }
+
+            ACTION_SHOW_APPEND_SAVE_CONFIRMATION -> {
+                showAppendSaveConfirmation()
+            }
+
+            ACTION_NOTIFICATION_CONFIRM_APPEND_SAVE -> {
+                handleConfirmAppendSaveFromNotification()
+            }
+
+            ACTION_NOTIFICATION_CANCEL_APPEND_SAVE -> {
+                handleCancelAppendSaveFromNotification()
             }
 
             ACTION_SHOW_SAVED_CONFIRMATION -> {
@@ -733,30 +777,15 @@ class RecordingForegroundService : Service() {
             )
         }
 
-        val pendingStopSave = if (isAppendingSession) {
-            val promptAppendIntent = Intent(this, MainActivity::class.java).apply {
-                action = ACTION_PROMPT_APPEND_SAVE
-                flags = Intent.FLAG_ACTIVITY_NEW_TASK or
-                    Intent.FLAG_ACTIVITY_SINGLE_TOP or
-                    Intent.FLAG_ACTIVITY_CLEAR_TOP
-            }
-            PendingIntent.getActivity(
-                this,
-                103,
-                promptAppendIntent,
-                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-            )
-        } else {
-            val stopSaveServiceIntent = Intent(this, RecordingForegroundService::class.java).apply {
-                action = ACTION_NOTIFICATION_STOP_SAVE
-            }
-            PendingIntent.getService(
-                this,
-                103,
-                stopSaveServiceIntent,
-                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-            )
+        val stopSaveServiceIntent = Intent(this, RecordingForegroundService::class.java).apply {
+            action = ACTION_NOTIFICATION_STOP_SAVE
         }
+        val pendingStopSave = PendingIntent.getService(
+            this,
+            103,
+            stopSaveServiceIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
 
         val bookmarkServiceIntent = Intent(this, RecordingForegroundService::class.java).apply {
             action = ACTION_NOTIFICATION_BOOKMARK
@@ -1024,11 +1053,127 @@ class RecordingForegroundService : Service() {
     }
 
     /**
-     * Transitions the HyperOS dynamic island and notification shade to the finished confirmation
-     * capsule displaying "Finished recording" with the circular green checkmark badge.
-     * Stays persistently until the user explicitly dismisses it (swipe to dismiss or tap to open).
+     * Transitions the notification to the inline Append Save Confirmation message
+     * featuring equal-sized Θ Don't and Ω Save buttons with warm gradient blending.
      */
+    fun showAppendSaveConfirmation() {
+        isShowingAppendSaveConfirmation = true
+        isPausedState = true
+
+        try {
+            val session = mediaSession
+            if (session != null) {
+                val playbackState = PlaybackState.Builder()
+                    .setActions(0L)
+                    .setState(PlaybackState.STATE_NONE, 0L, 0f)
+                    .build()
+                lastRecordingPlaybackState = playbackState
+                session.setPlaybackState(playbackState)
+                session.isActive = false
+            }
+        } catch (_: Exception) {}
+
+        val notif = buildAppendSaveConfirmationNotification()
+        val nm = getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager
+        nm?.notify(NOTIFICATION_ID, notif)
+    }
+
+    internal fun buildAppendSaveConfirmationNotification(): Notification {
+        createNotificationChannel()
+
+        val openIntent = Intent(this, MainActivity::class.java).apply {
+            flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
+        }
+        val pendingOpen = PendingIntent.getActivity(
+            this,
+            106,
+            openIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+
+        val confirmSaveIntent = Intent(this, RecordingForegroundService::class.java).apply {
+            action = ACTION_NOTIFICATION_CONFIRM_APPEND_SAVE
+        }
+        val pendingConfirmSave = PendingIntent.getService(
+            this,
+            107,
+            confirmSaveIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+
+        val cancelDontIntent = Intent(this, RecordingForegroundService::class.java).apply {
+            action = ACTION_NOTIFICATION_CANCEL_APPEND_SAVE
+        }
+        val pendingCancelDont = PendingIntent.getService(
+            this,
+            108,
+            cancelDontIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+
+        val blendedSaveLabel = buildGradientBlendedEnglishTitle("Save")
+        val blendedDontLabel = buildGradientBlendedEnglishTitle("Don't")
+
+        val compactConfirmView = android.widget.RemoteViews(packageName, R.layout.notification_append_confirm_compact).apply {
+            setImageViewResource(R.id.notif_append_dont_icon, R.drawable.ic_notif_greek_theta)
+            setTextViewText(R.id.notif_append_dont_text, blendedDontLabel)
+            setOnClickPendingIntent(R.id.notif_append_dont_button, pendingCancelDont)
+
+            setImageViewResource(R.id.notif_append_save_icon, R.drawable.ic_notif_greek_sigma)
+            setTextViewText(R.id.notif_append_save_text, blendedSaveLabel)
+            setOnClickPendingIntent(R.id.notif_append_save_button, pendingConfirmSave)
+        }
+
+        val builder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            Notification.Builder(this, CHANNEL_ID)
+        } else {
+            @Suppress("DEPRECATION")
+            Notification.Builder(this)
+        }
+
+        val dontAction = Notification.Action.Builder(
+            Icon.createWithResource(this, R.drawable.ic_notif_greek_theta),
+            buildGradientBlendedEnglishTitle("Θ Don't"),
+            pendingCancelDont
+        ).build()
+
+        val saveAction = Notification.Action.Builder(
+            Icon.createWithResource(this, R.drawable.ic_notif_greek_sigma),
+            buildGradientBlendedEnglishTitle("Σ Save"),
+            pendingConfirmSave
+        ).build()
+
+        builder
+            .setSmallIcon(R.drawable.ic_notif_greek_sigma)
+            .setContentTitle(blendedSaveLabel)
+            .setContentText("")
+            .setContentIntent(pendingOpen)
+            .setCustomContentView(compactConfirmView)
+            .setCustomBigContentView(compactConfirmView)
+            .setCustomHeadsUpContentView(compactConfirmView)
+            .addAction(dontAction)
+            .addAction(saveAction)
+            .setOngoing(true)
+            .setAutoCancel(false)
+            .setOnlyAlertOnce(true)
+            .setVisibility(Notification.VISIBILITY_PUBLIC)
+            .setCategory(Notification.CATEGORY_STATUS)
+            .setColor(0xFFE38851.toInt())
+            .setShowWhen(false)
+            .setUsesChronometer(false)
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            builder.setForegroundServiceBehavior(Notification.FOREGROUND_SERVICE_IMMEDIATE)
+        }
+
+        val notification = builder.build()
+        notification.extras.putIntArray(Notification.EXTRA_COMPACT_ACTIONS, intArrayOf(0, 1))
+        notification.extras.putBoolean("android.requestPromotedOngoing", true)
+        return notification
+    }
+
     fun showFinishedSavedConfirmation(title: String = getString(R.string.notification_finished_recording)) {
+        isShowingAppendSaveConfirmation = false
         releaseWakeLock()
 
         try {
@@ -1223,6 +1368,7 @@ class RecordingForegroundService : Service() {
         const val ACTION_UPDATE_NOTIFICATION = "com.example.action.UPDATE_NOTIFICATION"
         const val ACTION_STOP_FOREGROUND = "com.example.action.STOP_FOREGROUND"
         const val ACTION_SHOW_SAVED_CONFIRMATION = "com.example.action.SHOW_SAVED_CONFIRMATION"
+        const val ACTION_SHOW_APPEND_SAVE_CONFIRMATION = "com.example.action.SHOW_APPEND_SAVE_CONFIRMATION"
         const val ACTION_OPEN_LAST_SAVED_RECORDING = "com.example.action.OPEN_LAST_SAVED_RECORDING"
         const val ACTION_PROMPT_APPEND_SAVE = "com.example.action.PROMPT_APPEND_SAVE"
         const val ACTION_EXTERNAL_PAUSE = "com.example.action.EXTERNAL_PAUSE"
@@ -1230,6 +1376,8 @@ class RecordingForegroundService : Service() {
         const val ACTION_NOTIFICATION_PAUSE = "com.example.action.NOTIFICATION_PAUSE"
         const val ACTION_NOTIFICATION_RESUME = "com.example.action.NOTIFICATION_RESUME"
         const val ACTION_NOTIFICATION_STOP_SAVE = "com.example.action.NOTIFICATION_STOP_SAVE"
+        const val ACTION_NOTIFICATION_CONFIRM_APPEND_SAVE = "com.example.action.NOTIFICATION_CONFIRM_APPEND_SAVE"
+        const val ACTION_NOTIFICATION_CANCEL_APPEND_SAVE = "com.example.action.NOTIFICATION_CANCEL_APPEND_SAVE"
         const val ACTION_NOTIFICATION_BOOKMARK = "com.example.action.NOTIFICATION_BOOKMARK"
         const val ACTION_NOTIFICATION_SKIP_SILENCE = "com.example.action.NOTIFICATION_SKIP_SILENCE"
         const val ACTION_NOTIFICATION_DISCARD = "com.example.action.NOTIFICATION_DISCARD"
@@ -1237,6 +1385,8 @@ class RecordingForegroundService : Service() {
         const val ACTION_USER_PAUSE = "com.example.action.USER_PAUSE"
         const val ACTION_USER_RESUME = "com.example.action.USER_RESUME"
         const val ACTION_USER_STOP_SAVE = "com.example.action.USER_STOP_SAVE"
+        const val ACTION_USER_CONFIRM_APPEND_SAVE = "com.example.action.USER_CONFIRM_APPEND_SAVE"
+        const val ACTION_USER_CANCEL_APPEND_SAVE = "com.example.action.USER_CANCEL_APPEND_SAVE"
         const val ACTION_USER_BOOKMARK = "com.example.action.USER_BOOKMARK"
         const val ACTION_USER_TOGGLE_SKIP_SILENCE = "com.example.action.USER_TOGGLE_SKIP_SILENCE"
         const val ACTION_USER_DISCARD = "com.example.action.USER_DISCARD"
@@ -1275,6 +1425,12 @@ class RecordingForegroundService : Service() {
         // Direct handlers for recording
         @Volatile
         var activeStopSaveHandler: (() -> Unit)? = null
+
+        @Volatile
+        var activeConfirmAppendSaveHandler: (() -> Unit)? = null
+
+        @Volatile
+        var activeCancelAppendSaveHandler: (() -> Unit)? = null
 
         @Volatile
         var activePauseHandler: (() -> Unit)? = null

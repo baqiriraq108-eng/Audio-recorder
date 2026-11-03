@@ -857,8 +857,8 @@ class ExampleRobolectricTest {
         assertTrue(vm.liveBookmarks.value.isEmpty())
         assertEquals(originalByteLength, origFile.length())
 
-        // 2. Append Save Confirmation Popup:
-        //    Pressing Save while appending (either in-app or from notification) opens confirmation popup
+        // 2. Save Confirmation Popup & Inline Notification (Appending & New Recording):
+        //    Pressing Save while appending pauses and shows inline confirmation (Θ Don't / Σ Save) without forcing app launch
         vm.startContinueRecordingFlow(origEntity)
         org.junit.Assert.assertFalse(vm.showAppendSaveConfirmDialog.value)
         vm.stopAndSaveImmediatelyFromNotification(forceMergeAppend = false)
@@ -867,6 +867,52 @@ class ExampleRobolectricTest {
         vm.dismissAppendSaveConfirmDialog()
         org.junit.Assert.assertFalse(vm.showAppendSaveConfirmDialog.value)
         assertEquals(origEntity.id, vm.appendTarget.value?.id)
+
+        // Verify inline Save Confirmation Notification ("Θ Don't" and "Σ Save" buttons)
+        val serviceController = org.robolectric.Robolectric.buildService(
+            com.example.service.RecordingForegroundService::class.java
+        ).create()
+        val service = serviceController.get()
+        val appendConfirmNotif = service.buildAppendSaveConfirmationNotification()
+        assertEquals(0xFFE38851.toInt(), appendConfirmNotif.color)
+        assertEquals(2, appendConfirmNotif.actions.size)
+        assertEquals("Θ Don't", appendConfirmNotif.actions[0].title.toString())
+        assertEquals("Σ Save", appendConfirmNotif.actions[1].title.toString())
+
+        // Verify pressing "Θ Don't" from notification cancels append mode and preserves original recording
+        service.onStartCommand(
+            android.content.Intent(app, com.example.service.RecordingForegroundService::class.java).apply {
+                action = com.example.service.RecordingForegroundService.ACTION_NOTIFICATION_CANCEL_APPEND_SAVE
+            },
+            0,
+            10
+        )
+        org.junit.Assert.assertNull(vm.appendTarget.value)
+        assertEquals(originalByteLength, origFile.length())
+
+        // Verify pressing Stop & Save from notification on a NEW recording (appendTarget == null) also shows confirmation
+        vm.startRecording()
+        org.junit.Assert.assertNull(vm.appendTarget.value)
+        service.onStartCommand(
+            android.content.Intent(app, com.example.service.RecordingForegroundService::class.java).apply {
+                action = com.example.service.RecordingForegroundService.ACTION_NOTIFICATION_STOP_SAVE
+            },
+            0,
+            11
+        )
+        assertTrue(vm.showAppendSaveConfirmDialog.value)
+        assertEquals(com.example.data.RecordingStatus.PAUSED, vm.recordingStatus.value)
+
+        // Verify pressing "Θ Don't" from notification during a new recording discards the new recording and resets to READY
+        service.onStartCommand(
+            android.content.Intent(app, com.example.service.RecordingForegroundService::class.java).apply {
+                action = com.example.service.RecordingForegroundService.ACTION_NOTIFICATION_CANCEL_APPEND_SAVE
+            },
+            0,
+            12
+        )
+        org.junit.Assert.assertFalse(vm.showAppendSaveConfirmDialog.value)
+        assertEquals(com.example.data.RecordingStatus.READY, vm.recordingStatus.value)
 
         // 3. Silence Skip "Saved Time" text bug fix:
         //    When Skip Silent is turned OFF, silenceSkippedSavedMs is 0L

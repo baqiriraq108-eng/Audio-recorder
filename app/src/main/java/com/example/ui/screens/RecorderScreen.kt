@@ -743,7 +743,7 @@ fun RecorderScreen(
                         .padding(horizontal = 24.dp, vertical = 22.dp)
                 ) {
                     Text(
-                        text = "Append to Recording?",
+                        text = if (appendTarget != null) "Append to Recording?" else "Save Recording?",
                         style = MaterialTheme.typography.titleLarge.copy(
                             fontWeight = FontWeight.Bold,
                             fontSize = 20.sp
@@ -755,7 +755,11 @@ fun RecorderScreen(
                     Spacer(modifier = Modifier.height(10.dp))
 
                     Text(
-                        text = "Save and merge this new audio segment into the original file?",
+                        text = if (appendTarget != null) {
+                            "Save and merge this new audio segment into the original file?"
+                        } else {
+                            "Save this new recording to your audio library?"
+                        },
                         style = MaterialTheme.typography.bodyMedium.copy(
                             fontSize = 14.sp,
                             lineHeight = 20.sp
