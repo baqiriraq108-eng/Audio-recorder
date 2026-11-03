@@ -5,15 +5,15 @@
     android:layout_height="wrap_content"
     android:gravity="center_vertical"
     android:orientation="horizontal"
-    android:paddingStart="12dp"
-    android:paddingTop="6dp"
-    android:paddingEnd="12dp"
-    android:paddingBottom="6dp">
+    android:paddingStart="14dp"
+    android:paddingTop="8dp"
+    android:paddingEnd="14dp"
+    android:paddingBottom="8dp">
 
     <ImageView
         android:id="@+id/notif_finished_badge"
-        android:layout_width="36dp"
-        android:layout_height="36dp"
+        android:layout_width="26dp"
+        android:layout_height="26dp"
         android:contentDescription="@string/notification_finished_recording"
         android:scaleType="fitCenter"
         android:src="@drawable/ic_notif_finished_check" />
@@ -22,13 +22,15 @@
         android:id="@+id/notif_finished_title"
         android:layout_width="0dp"
         android:layout_height="wrap_content"
-        android:layout_marginStart="14dp"
+        android:layout_marginStart="12dp"
         android:layout_weight="1"
         android:ellipsize="end"
+        android:fontFamily="sans-serif-medium"
+        android:letterSpacing="0.03"
         android:maxLines="1"
         android:singleLine="true"
         android:text="@string/notification_finished_recording"
-        android:textColor="#E6E1E5"
+        android:textColor="#F4D7C7"
         android:textSize="15sp"
         android:textStyle="normal" />
 

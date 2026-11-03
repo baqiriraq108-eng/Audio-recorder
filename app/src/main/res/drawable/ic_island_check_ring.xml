@@ -1,24 +1,33 @@
 <vector xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:aapt="http://schemas.android.com/aapt"
     android:width="24dp"
     android:height="24dp"
     android:viewportWidth="24"
     android:viewportHeight="24">
-    <!-- Solid black interior disc -->
-    <path
-        android:fillColor="#000000"
-        android:pathData="M12,12m-10,0a10,10 0,1 1,20 0a10,10 0,1 1,-20 0" />
-    <!-- Single crisp green circular ring -->
+    <!-- Pure minimalist Greek Omega (Ω) symbol for Dynamic Island with warm orange-to-ivory gradient blend (no green ring, no checkmark) -->
     <path
         android:fillColor="#00000000"
-        android:pathData="M12,12m-9.5,0a9.5,9.5 0,1 1,19 0a9.5,9.5 0,1 1,-19 0"
-        android:strokeWidth="2.0"
-        android:strokeColor="#1ED760" />
-    <!-- Centered green checkmark -->
-    <path
-        android:fillColor="#00000000"
-        android:pathData="M8.0,12.3 L10.8,15.1 L16.2,9.3"
-        android:strokeWidth="2.2"
-        android:strokeColor="#1ED760"
+        android:pathData="M4.2,18.8 L8.8,18.8 L8.8,16.4 C6.4,15.0 5.0,12.5 5.0,9.6 C5.0,5.5 8.1,2.4 12.0,2.4 C15.9,2.4 19.0,5.5 19.0,9.6 C19.0,12.5 17.6,15.0 15.2,16.4 L15.2,18.8 L19.8,18.8"
+        android:strokeWidth="2.35"
         android:strokeLineCap="round"
-        android:strokeLineJoin="round" />
+        android:strokeLineJoin="round">
+        <aapt:attr name="android:strokeColor">
+            <gradient
+                android:startX="4.0"
+                android:startY="3.0"
+                android:endX="20.0"
+                android:endY="19.0"
+                android:type="linear">
+                <item
+                    android:color="#FFE38851"
+                    android:offset="0.0" />
+                <item
+                    android:color="#FFEDA87D"
+                    android:offset="0.52" />
+                <item
+                    android:color="#FFF4D7C7"
+                    android:offset="1.0" />
+            </gradient>
+        </aapt:attr>
+    </path>
 </vector>

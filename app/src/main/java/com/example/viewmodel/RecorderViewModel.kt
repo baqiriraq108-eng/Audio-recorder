@@ -394,6 +394,36 @@ class RecorderViewModel(application: Application) : AndroidViewModel(application
             }
         }
 
+        // Real-time synchronization of live recording notification & MediaSession timer
+        viewModelScope.launch {
+            var lastNotifiedSecond = -1L
+            audioEngine.elapsedMs.collect { elapsed ->
+                val status = _recordingStatus.value
+                if (status == RecordingStatus.RECORDING || status == RecordingStatus.PAUSED) {
+                    val baseOffset = _appendTarget.value?.durationMs ?: 0L
+                    val totalElapsedMs = (baseOffset + elapsed).coerceAtLeast(0L)
+                    val currentSecond = totalElapsedMs / 1000L
+                    if (currentSecond != lastNotifiedSecond) {
+                        lastNotifiedSecond = currentSecond
+                        val isPaused = status == RecordingStatus.PAUSED
+                        val title = if (isPaused) {
+                            "Paused"
+                        } else {
+                            _appendTarget.value?.title ?: "Recording"
+                        }
+                        updateForegroundServiceNotification(
+                            title = title,
+                            status = "",
+                            isPaused = isPaused,
+                            elapsedMs = totalElapsedMs
+                        )
+                    }
+                } else {
+                    lastNotifiedSecond = -1L
+                }
+            }
+        }
+
         try {
             val filter = IntentFilter().apply {
                 addAction(RecordingForegroundService.ACTION_EXTERNAL_PAUSE)
@@ -2742,12 +2772,15 @@ class RecorderViewModel(application: Application) : AndroidViewModel(application
     private fun startForegroundServiceNotification(title: String, status: String) {
         try {
             val context = getApplication<Application>()
+            val baseOffset = _appendTarget.value?.durationMs ?: 0L
+            val initialElapsedMs = (baseOffset + audioEngine.elapsedMs.value).coerceAtLeast(0L)
             val intent = Intent(context, RecordingForegroundService::class.java).apply {
                 action = RecordingForegroundService.ACTION_START_FOREGROUND
                 putExtra(RecordingForegroundService.EXTRA_TITLE, title)
                 putExtra(RecordingForegroundService.EXTRA_STATUS, status)
                 putExtra(RecordingForegroundService.EXTRA_IS_PAUSED, false)
                 putExtra(RecordingForegroundService.EXTRA_IS_APPENDING, _appendTarget.value != null)
+                putExtra(RecordingForegroundService.EXTRA_RECORDING_ELAPSED_MS, initialElapsedMs)
                 putExtra(
                     RecordingForegroundService.EXTRA_IS_SKIP_SILENCE_ACTIVE,
                     _settings.value.silenceConfig.isEffectivelyEnabled
@@ -2760,7 +2793,8 @@ class RecorderViewModel(application: Application) : AndroidViewModel(application
     private fun updateForegroundServiceNotification(
         title: String,
         status: String,
-        isPaused: Boolean = false
+        isPaused: Boolean = false,
+        elapsedMs: Long = ((_appendTarget.value?.durationMs ?: 0L) + audioEngine.elapsedMs.value).coerceAtLeast(0L)
     ) {
         try {
             val context = getApplication<Application>()
@@ -2770,6 +2804,7 @@ class RecorderViewModel(application: Application) : AndroidViewModel(application
                 putExtra(RecordingForegroundService.EXTRA_STATUS, status)
                 putExtra(RecordingForegroundService.EXTRA_IS_PAUSED, isPaused)
                 putExtra(RecordingForegroundService.EXTRA_IS_APPENDING, _appendTarget.value != null)
+                putExtra(RecordingForegroundService.EXTRA_RECORDING_ELAPSED_MS, elapsedMs)
                 putExtra(
                     RecordingForegroundService.EXTRA_IS_SKIP_SILENCE_ACTIVE,
                     _settings.value.silenceConfig.isEffectivelyEnabled

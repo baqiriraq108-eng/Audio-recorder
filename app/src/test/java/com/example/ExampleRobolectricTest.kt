@@ -554,6 +554,9 @@ class ExampleRobolectricTest {
         assertEquals("Bookmark", activeNotif.actions[2].title.toString())
         assertTrue(activeNotif.actions.none { it.title.toString().contains("Silence", ignoreCase = true) })
         assertEquals(android.app.Notification.VISIBILITY_PUBLIC, activeNotif.visibility)
+        assertEquals(android.app.Notification.CATEGORY_TRANSPORT, activeNotif.category)
+        assertTrue((activeNotif.flags and android.app.Notification.FLAG_ONGOING_EVENT) != 0)
+        assertTrue(activeNotif.extras.getBoolean(android.app.Notification.EXTRA_SHOW_CHRONOMETER))
         org.junit.Assert.assertFalse(activeNotif.extras.getBoolean("miui.focus.enable", false))
         assertTrue(activeNotif.extras.getBoolean("android.requestPromotedOngoing"))
         org.junit.Assert.assertNotNull(activeNotif.extras.getParcelable(android.app.Notification.EXTRA_MEDIA_SESSION))
@@ -561,6 +564,13 @@ class ExampleRobolectricTest {
             intArrayOf(0, 1, 2),
             activeNotif.extras.getIntArray(android.app.Notification.EXTRA_COMPACT_ACTIONS)
         )
+
+        val activePlaybackState = service.lastRecordingPlaybackState
+        org.junit.Assert.assertNotNull(activePlaybackState)
+        assertEquals(android.media.session.PlaybackState.STATE_PLAYING, activePlaybackState?.state)
+        val customActionIds = activePlaybackState?.customActions?.map { it.action }.orEmpty()
+        assertTrue(customActionIds.contains(com.example.service.RecordingForegroundService.ACTION_NOTIFICATION_STOP_SAVE))
+        assertTrue(customActionIds.contains(com.example.service.RecordingForegroundService.ACTION_NOTIFICATION_BOOKMARK))
 
         val pausedNotif = service.buildNotification(
             title = "Paused",
@@ -574,13 +584,21 @@ class ExampleRobolectricTest {
         assertEquals("Stop & Save", pausedNotif.actions[1].title.toString())
         assertEquals("Bookmark", pausedNotif.actions[2].title.toString())
         assertTrue(pausedNotif.actions.none { it.title.toString().contains("Silence", ignoreCase = true) })
+        org.junit.Assert.assertFalse(pausedNotif.extras.getBoolean(android.app.Notification.EXTRA_SHOW_CHRONOMETER))
+        val pausedPlaybackState = service.lastRecordingPlaybackState
+        assertEquals(android.media.session.PlaybackState.STATE_PAUSED, pausedPlaybackState?.state)
 
         // Verify Finished Recording Confirmation Capsule (Dynamic Island & Notification Shade):
-        // Condensed capsule displaying "Finished recording", green circular checkmark badge, and 0 action buttons
+        // Minimalist capsule displaying gradient-blended "Finished recording", Greek Omega (Ω) symbol, warm peach-orange theme color, and 0 action buttons
         val finishedNotif = service.buildFinishedNotification("Finished recording")
-        assertEquals("Finished recording", finishedNotif.extras.getString(android.app.Notification.EXTRA_TITLE))
+        assertEquals("Finished recording", finishedNotif.extras.getCharSequence(android.app.Notification.EXTRA_TITLE)?.toString())
         org.junit.Assert.assertNull(finishedNotif.actions)
-        assertEquals(0xFF00C853.toInt(), finishedNotif.color)
+        assertEquals(0xFFE38851.toInt(), finishedNotif.color)
+        val blendedSpannable = service.buildGradientBlendedEnglishTitle("Finished recording")
+        val colorSpans = blendedSpannable.getSpans(0, blendedSpannable.length, android.text.style.ForegroundColorSpan::class.java)
+        assertEquals("Finished recording".length, colorSpans.size)
+        assertEquals(0xFFE38851.toInt(), colorSpans.first().foregroundColor)
+        assertEquals(0xFFF4D7C7.toInt(), colorSpans.last().foregroundColor)
         org.junit.Assert.assertFalse(finishedNotif.flags and android.app.Notification.FLAG_ONGOING_EVENT != 0)
         org.junit.Assert.assertArrayEquals(
             intArrayOf(),
@@ -767,13 +785,13 @@ class ExampleRobolectricTest {
 
         // 2. Verify Finished Confirmation notification is single-row compact (no MediaStyle seekbar), dismissible, and persistent
         val finishedNotif = service.buildFinishedNotification("Finished recording")
-        assertEquals("Finished recording", finishedNotif.extras.getString(android.app.Notification.EXTRA_TITLE))
+        assertEquals("Finished recording", finishedNotif.extras.getCharSequence(android.app.Notification.EXTRA_TITLE)?.toString())
         // Vertically compact: empty body text, custom single-row contentView attached, no MediaStyle seekbar
         assertEquals("", finishedNotif.extras.getString(android.app.Notification.EXTRA_TEXT))
         org.junit.Assert.assertNotNull(finishedNotif.contentView)
         @Suppress("DEPRECATION")
         org.junit.Assert.assertNull(finishedNotif.extras.getParcelable(android.app.Notification.EXTRA_MEDIA_SESSION))
-        // Verify HyperIsland capsule parameters (left waveform, center text, right check ring, persistent)
+        // Verify HyperIsland capsule parameters (left waveform, center text, right Omega symbol, persistent)
         val focusParam = finishedNotif.extras.getString("miui.focus.param").orEmpty()
         assertTrue(focusParam.contains("miui.focus.pic_island_left"))
         assertTrue(focusParam.contains("Finished recording"))
@@ -793,7 +811,7 @@ class ExampleRobolectricTest {
         val shadowNm = org.robolectric.Shadows.shadowOf(notificationManager)
         val activeNotif = shadowNm.getNotification(com.example.service.RecordingForegroundService.NOTIFICATION_ID)
         org.junit.Assert.assertNotNull(activeNotif)
-        assertEquals("Saved Lecture", activeNotif.extras.getString(android.app.Notification.EXTRA_TITLE))
+        assertEquals("Saved Lecture", activeNotif.extras.getCharSequence(android.app.Notification.EXTRA_TITLE)?.toString())
     }
 
     @Test

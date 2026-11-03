@@ -31,6 +31,7 @@ class RecordingForegroundService : Service() {
     private var sessionStartTimeMs: Long = System.currentTimeMillis()
     private var pauseStartedAtMs: Long = 0L
     private var accumulatedPausedMs: Long = 0L
+    private var recordingElapsedMs: Long = 0L
 
     // Playback state
     private var isPlaybackMode: Boolean = false
@@ -38,6 +39,11 @@ class RecordingForegroundService : Service() {
     private var playbackIsPlaying: Boolean = false
     private var playbackPositionMs: Long = 0L
     private var playbackDurationMs: Long = 0L
+
+    internal var lastRecordingPlaybackState: PlaybackState? = null
+        private set
+
+    internal fun getActiveMediaSession(): MediaSession? = mediaSession
 
     override fun onCreate() {
         super.onCreate()
@@ -78,6 +84,75 @@ class RecordingForegroundService : Service() {
             handler.invoke()
         } else {
             sendBroadcast(Intent(ACTION_USER_BOOKMARK).setPackage(packageName))
+        }
+    }
+
+    internal fun handleRecordingPauseFromNotification() {
+        val now = System.currentTimeMillis()
+        if (!isPausedState) {
+            isPausedState = true
+            pauseStartedAtMs = now
+            if (currentTitle == "Recording") {
+                currentTitle = getString(R.string.notification_status_paused)
+            }
+            val nm = getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager
+            nm?.notify(
+                NOTIFICATION_ID,
+                buildRecordingNotification(
+                    title = currentTitle,
+                    statusText = currentStatus,
+                    isPaused = true,
+                    isSkipSilence = isSkipSilenceActive,
+                    isAwaitingSave = false
+                )
+            )
+        }
+        dispatchPauseAction()
+    }
+
+    internal fun handleRecordingResumeFromNotification() {
+        val now = System.currentTimeMillis()
+        if (isPausedState) {
+            isPausedState = false
+            if (pauseStartedAtMs > 0L) {
+                accumulatedPausedMs += (now - pauseStartedAtMs).coerceAtLeast(0L)
+                pauseStartedAtMs = 0L
+            }
+            if (currentTitle == getString(R.string.notification_status_paused) || currentTitle == "Paused") {
+                currentTitle = "Recording"
+            }
+            val nm = getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager
+            nm?.notify(
+                NOTIFICATION_ID,
+                buildRecordingNotification(
+                    title = currentTitle,
+                    statusText = currentStatus,
+                    isPaused = false,
+                    isSkipSilence = isSkipSilenceActive,
+                    isAwaitingSave = false
+                )
+            )
+        }
+        dispatchResumeAction()
+    }
+
+    internal fun handleRecordingStopSaveFromNotification() {
+        if (isAppendingSession) {
+            dispatchStopSaveAction()
+            try {
+                val openAppIntent = Intent(this, MainActivity::class.java).apply {
+                    action = ACTION_PROMPT_APPEND_SAVE
+                    addFlags(
+                        Intent.FLAG_ACTIVITY_NEW_TASK or
+                            Intent.FLAG_ACTIVITY_SINGLE_TOP or
+                            Intent.FLAG_ACTIVITY_CLEAR_TOP
+                    )
+                }
+                startActivity(openAppIntent)
+            } catch (_: Exception) {}
+        } else {
+            showFinishedSavedConfirmation(getString(R.string.notification_finished_recording))
+            dispatchStopSaveAction()
         }
     }
 
@@ -142,16 +217,20 @@ class RecordingForegroundService : Service() {
                     override fun onPause() {
                         if (isPlaybackMode) {
                             dispatchPlaybackPlayPauseAction()
+                        } else if (isPausedState) {
+                            handleRecordingResumeFromNotification()
                         } else {
-                            dispatchPauseAction()
+                            handleRecordingPauseFromNotification()
                         }
                     }
 
                     override fun onPlay() {
                         if (isPlaybackMode) {
                             dispatchPlaybackPlayPauseAction()
+                        } else if (isPausedState) {
+                            handleRecordingResumeFromNotification()
                         } else {
-                            dispatchResumeAction()
+                            handleRecordingPauseFromNotification()
                         }
                     }
 
@@ -164,12 +243,16 @@ class RecordingForegroundService : Service() {
                     override fun onSkipToPrevious() {
                         if (isPlaybackMode) {
                             dispatchPlaybackPrevAction()
+                        } else {
+                            handleRecordingStopSaveFromNotification()
                         }
                     }
 
                     override fun onSkipToNext() {
                         if (isPlaybackMode) {
                             dispatchPlaybackNextAction()
+                        } else {
+                            dispatchBookmarkAction()
                         }
                     }
 
@@ -177,14 +260,20 @@ class RecordingForegroundService : Service() {
                         if (isPlaybackMode) {
                             stopForegroundInternal()
                         } else {
-                            dispatchStopSaveAction()
+                            handleRecordingStopSaveFromNotification()
                         }
                     }
 
                     override fun onCustomAction(action: String, extras: Bundle?) {
                         when (action) {
+                            ACTION_NOTIFICATION_PAUSE, ACTION_USER_PAUSE -> {
+                                handleRecordingPauseFromNotification()
+                            }
+                            ACTION_NOTIFICATION_RESUME, ACTION_USER_RESUME -> {
+                                handleRecordingResumeFromNotification()
+                            }
                             ACTION_NOTIFICATION_STOP_SAVE, ACTION_USER_STOP_SAVE -> {
-                                dispatchStopSaveAction()
+                                handleRecordingStopSaveFromNotification()
                             }
                             ACTION_NOTIFICATION_BOOKMARK, ACTION_USER_BOOKMARK -> {
                                 dispatchBookmarkAction()
@@ -212,6 +301,29 @@ class RecordingForegroundService : Service() {
         } catch (_: Exception) {}
     }
 
+    private fun formatElapsedTimer(elapsedMs: Long): String {
+        val totalSeconds = (elapsedMs.coerceAtLeast(0L)) / 1000L
+        val hours = totalSeconds / 3600L
+        val minutes = (totalSeconds % 3600L) / 60L
+        val seconds = totalSeconds % 60L
+        return if (hours > 0L) {
+            String.format(java.util.Locale.US, "%02d:%02d:%02d", hours, minutes, seconds)
+        } else {
+            String.format(java.util.Locale.US, "%02d:%02d", minutes, seconds)
+        }
+    }
+
+    private fun computeCurrentRecordingElapsedMs(): Long {
+        if (recordingElapsedMs > 0L) return recordingElapsedMs
+        val now = System.currentTimeMillis()
+        val activePauseDelta = if (isPausedState && pauseStartedAtMs > 0L) {
+            (now - pauseStartedAtMs).coerceAtLeast(0L)
+        } else {
+            0L
+        }
+        return (now - sessionStartTimeMs - accumulatedPausedMs - activePauseDelta).coerceAtLeast(0L)
+    }
+
     private fun updateMediaSessionRecordingState(
         title: String,
         statusText: String,
@@ -226,7 +338,7 @@ class RecordingForegroundService : Service() {
                 isPaused -> PlaybackState.STATE_PAUSED
                 else -> PlaybackState.STATE_PLAYING
             }
-            val elapsed = (System.currentTimeMillis() - sessionStartTimeMs - accumulatedPausedMs).coerceAtLeast(0L)
+            val elapsed = computeCurrentRecordingElapsedMs()
             val playbackStateBuilder = PlaybackState.Builder()
                 .setActions(
                     PlaybackState.ACTION_PAUSE or
@@ -239,6 +351,13 @@ class RecordingForegroundService : Service() {
             if (!isAwaitingSave) {
                 playbackStateBuilder.addCustomAction(
                     PlaybackState.CustomAction.Builder(
+                        ACTION_NOTIFICATION_STOP_SAVE,
+                        getString(R.string.notification_action_stop_save),
+                        R.drawable.ic_notif_stop_save
+                    ).build()
+                )
+                playbackStateBuilder.addCustomAction(
+                    PlaybackState.CustomAction.Builder(
                         ACTION_NOTIFICATION_BOOKMARK,
                         getString(R.string.notification_action_bookmark),
                         R.drawable.ic_notif_bookmark
@@ -246,15 +365,24 @@ class RecordingForegroundService : Service() {
                 )
             }
 
-            session.setPlaybackState(playbackStateBuilder.build())
+            val builtState = playbackStateBuilder.build()
+            lastRecordingPlaybackState = builtState
+            session.setPlaybackState(builtState)
 
-            val displaySubtitle = statusText.ifBlank {
+            val baseStatus = statusText.ifBlank {
                 if (isPaused) getString(R.string.notification_status_paused)
                 else getString(R.string.notification_status_recording)
+            }
+            val formattedTimer = formatElapsedTimer(elapsed)
+            val displaySubtitle = if (baseStatus.contains(formattedTimer)) {
+                baseStatus
+            } else {
+                "$baseStatus • $formattedTimer"
             }
             val metadata = MediaMetadata.Builder()
                 .putString(MediaMetadata.METADATA_KEY_TITLE, title)
                 .putString(MediaMetadata.METADATA_KEY_ARTIST, displaySubtitle)
+                .putString(MediaMetadata.METADATA_KEY_ALBUM, getString(R.string.app_name))
                 .build()
             session.setMetadata(metadata)
             if (!session.isActive) {
@@ -322,8 +450,9 @@ class RecordingForegroundService : Service() {
                 isPausedState = intent.getBooleanExtra(EXTRA_IS_PAUSED, false)
                 isSkipSilenceActive = intent.getBooleanExtra(EXTRA_IS_SKIP_SILENCE_ACTIVE, false)
                 isAppendingSession = intent.getBooleanExtra(EXTRA_IS_APPENDING, false)
-                sessionStartTimeMs = System.currentTimeMillis()
-                pauseStartedAtMs = if (isPausedState) sessionStartTimeMs else 0L
+                recordingElapsedMs = intent.getLongExtra(EXTRA_RECORDING_ELAPSED_MS, 0L).coerceAtLeast(0L)
+                sessionStartTimeMs = (System.currentTimeMillis() - recordingElapsedMs).coerceAtMost(System.currentTimeMillis())
+                pauseStartedAtMs = if (isPausedState) System.currentTimeMillis() else 0L
                 accumulatedPausedMs = 0L
                 acquireWakeLock()
 
@@ -339,15 +468,28 @@ class RecordingForegroundService : Service() {
                         startForeground(
                             NOTIFICATION_ID,
                             notification,
-                            ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
+                            ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE or
+                                ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK
                         )
                     } else {
                         startForeground(NOTIFICATION_ID, notification)
                     }
                 } catch (_: Exception) {
                     try {
-                        startForeground(NOTIFICATION_ID, notification)
-                    } catch (_: Exception) {}
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                            startForeground(
+                                NOTIFICATION_ID,
+                                notification,
+                                ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
+                            )
+                        } else {
+                            startForeground(NOTIFICATION_ID, notification)
+                        }
+                    } catch (_: Exception) {
+                        try {
+                            startForeground(NOTIFICATION_ID, notification)
+                        } catch (_: Exception) {}
+                    }
                 }
                 val nm = getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager
                 nm?.notify(NOTIFICATION_ID, notification)
@@ -364,6 +506,9 @@ class RecordingForegroundService : Service() {
                 }
                 if (intent.hasExtra(EXTRA_IS_APPENDING)) {
                     isAppendingSession = intent.getBooleanExtra(EXTRA_IS_APPENDING, isAppendingSession)
+                }
+                if (intent.hasExtra(EXTRA_RECORDING_ELAPSED_MS)) {
+                    recordingElapsedMs = intent.getLongExtra(EXTRA_RECORDING_ELAPSED_MS, recordingElapsedMs).coerceAtLeast(0L)
                 }
                 val now = System.currentTimeMillis()
                 if (!previousPaused && isPausedState) {
@@ -443,31 +588,15 @@ class RecordingForegroundService : Service() {
             }
 
             ACTION_NOTIFICATION_PAUSE -> {
-                dispatchPauseAction()
+                handleRecordingPauseFromNotification()
             }
 
             ACTION_NOTIFICATION_RESUME -> {
-                dispatchResumeAction()
+                handleRecordingResumeFromNotification()
             }
 
             ACTION_NOTIFICATION_STOP_SAVE -> {
-                if (isAppendingSession) {
-                    dispatchStopSaveAction()
-                    try {
-                        val openAppIntent = Intent(this, MainActivity::class.java).apply {
-                            action = ACTION_PROMPT_APPEND_SAVE
-                            addFlags(
-                                Intent.FLAG_ACTIVITY_NEW_TASK or
-                                    Intent.FLAG_ACTIVITY_SINGLE_TOP or
-                                    Intent.FLAG_ACTIVITY_CLEAR_TOP
-                            )
-                        }
-                        startActivity(openAppIntent)
-                    } catch (_: Exception) {}
-                } else {
-                    showFinishedSavedConfirmation(getString(R.string.notification_finished_recording))
-                    dispatchStopSaveAction()
-                }
+                handleRecordingStopSaveFromNotification()
             }
 
             ACTION_SHOW_SAVED_CONFIRMATION -> {
@@ -574,7 +703,13 @@ class RecordingForegroundService : Service() {
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
 
-        val effectiveWhenMs = (sessionStartTimeMs + accumulatedPausedMs).coerceAtMost(System.currentTimeMillis())
+        val nowMs = System.currentTimeMillis()
+        val elapsedMs = computeCurrentRecordingElapsedMs()
+        val effectiveWhenMs = if (recordingElapsedMs > 0L) {
+            (nowMs - recordingElapsedMs).coerceAtMost(nowMs)
+        } else {
+            (sessionStartTimeMs + accumulatedPausedMs).coerceAtMost(nowMs)
+        }
 
         val pauseOrResumePendingIntent = if (isPaused) {
             val resumeIntent = Intent(this, RecordingForegroundService::class.java).apply {
@@ -633,9 +768,15 @@ class RecordingForegroundService : Service() {
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
 
-        val subtitle = statusText.ifBlank {
+        val baseSubtitle = statusText.ifBlank {
             if (isPaused) getString(R.string.notification_status_paused)
             else getString(R.string.notification_status_recording)
+        }
+        val formattedTimer = formatElapsedTimer(elapsedMs)
+        val subtitle = if (baseSubtitle.contains(formattedTimer)) {
+            baseSubtitle
+        } else {
+            "$baseSubtitle • $formattedTimer"
         }
 
         val builder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
@@ -649,15 +790,20 @@ class RecordingForegroundService : Service() {
             .setSmallIcon(R.drawable.ic_notif_mic)
             .setContentTitle(title)
             .setContentText(subtitle)
+            .setSubText(formattedTimer)
             .setContentIntent(pendingOpen)
             .setOngoing(true)
             .setOnlyAlertOnce(true)
             .setVisibility(Notification.VISIBILITY_PUBLIC)
-            .setCategory(Notification.CATEGORY_SERVICE)
+            .setCategory(Notification.CATEGORY_TRANSPORT)
             .setColor(0xFFF08C4B.toInt())
             .setShowWhen(true)
             .setWhen(effectiveWhenMs)
             .setUsesChronometer(!isPaused && !isAwaitingSave)
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+            builder.setChronometerCountDown(false)
+        }
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
             builder.setForegroundServiceBehavior(Notification.FOREGROUND_SERVICE_IMMEDIATE)
@@ -677,7 +823,7 @@ class RecordingForegroundService : Service() {
             ).build()
             builder.addAction(pauseResumeAction)
 
-            // Action 1: Stop and Save button
+            // Action 1: Stop and Save button (Square / Checkmark)
             val finishSaveAction = Notification.Action.Builder(
                 Icon.createWithResource(this, R.drawable.ic_notif_stop_save),
                 getString(R.string.notification_action_stop_save),
@@ -701,7 +847,7 @@ class RecordingForegroundService : Service() {
             mediaStyle.setMediaSession(token)
         }
         if (!isAwaitingSave) {
-            // Strictly the 3 essential actions (Pause/Resume, Finish & Save, Bookmark) in compact view
+            // Strictly the 3 essential actions (Pause/Resume, Stop & Save, Bookmark) in compact view
             mediaStyle.setShowActionsInCompactView(0, 1, 2)
         }
         builder.setStyle(mediaStyle)
@@ -923,6 +1069,34 @@ class RecordingForegroundService : Service() {
         stopSelf()
     }
 
+    internal fun buildGradientBlendedEnglishTitle(text: String): android.text.SpannableString {
+        val spannable = android.text.SpannableString(text)
+        val length = text.length
+        if (length == 0) return spannable
+
+        val startR = 0xE3
+        val startG = 0x88
+        val startB = 0x51
+        val endR = 0xF4
+        val endG = 0xD7
+        val endB = 0xC7
+
+        for (i in 0 until length) {
+            val fraction = if (length > 1) i.toFloat() / (length - 1).toFloat() else 0f
+            val r = (startR + ((endR - startR) * fraction).toInt()).coerceIn(0, 255)
+            val g = (startG + ((endG - startG) * fraction).toInt()).coerceIn(0, 255)
+            val b = (startB + ((endB - startB) * fraction).toInt()).coerceIn(0, 255)
+            val color = (0xFF shl 24) or (r shl 16) or (g shl 8) or b
+            spannable.setSpan(
+                android.text.style.ForegroundColorSpan(color),
+                i,
+                i + 1,
+                android.text.Spannable.SPAN_EXCLUSIVE_EXCLUSIVE
+            )
+        }
+        return spannable
+    }
+
     internal fun buildFinishedNotification(
         title: String = getString(R.string.notification_finished_recording)
     ): Notification {
@@ -939,8 +1113,9 @@ class RecordingForegroundService : Service() {
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
 
+        val blendedTitle = buildGradientBlendedEnglishTitle(title)
         val compactView = android.widget.RemoteViews(packageName, R.layout.notification_finished_compact).apply {
-            setTextViewText(R.id.notif_finished_title, title)
+            setTextViewText(R.id.notif_finished_title, blendedTitle)
             setImageViewResource(R.id.notif_finished_badge, R.drawable.ic_notif_finished_check)
         }
 
@@ -951,10 +1126,10 @@ class RecordingForegroundService : Service() {
             Notification.Builder(this)
         }
 
-        // Single-row compact notification without MediaStyle or LargeIcon (no seekbar, no 00:00, no nested circles)
+        // Minimalist single-row compact notification featuring the Greek Omega (Ω) symbol and gradient-blended English title
         builder
             .setSmallIcon(R.drawable.ic_notif_finished_check)
-            .setContentTitle(title)
+            .setContentTitle(blendedTitle)
             .setContentText("")
             .setContentIntent(pendingOpen)
             .setCustomContentView(compactView)
@@ -965,7 +1140,7 @@ class RecordingForegroundService : Service() {
             .setOnlyAlertOnce(true)
             .setVisibility(Notification.VISIBILITY_PUBLIC)
             .setCategory(Notification.CATEGORY_STATUS)
-            .setColor(0xFF00C853.toInt())
+            .setColor(0xFFE38851.toInt())
             .setShowWhen(false)
             .setUsesChronometer(false)
 
@@ -977,8 +1152,8 @@ class RecordingForegroundService : Service() {
 
         // HyperOS Dynamic Island (HyperIsland) compact capsule specification:
         // Left: Signature orange & white audio waveform icon
-        // Center: "Finished recording" single-line white text
-        // Right: Green circle ring with checkmark icon
+        // Center: "Finished recording" single-line English text
+        // Right: Borderless Greek Omega (Ω) completion emblem with warm gradient blend
         try {
             val focusPics = Bundle().apply {
                 putParcelable(
@@ -1090,6 +1265,7 @@ class RecordingForegroundService : Service() {
         const val EXTRA_IS_SKIP_SILENCE_ACTIVE = "extra_is_skip_silence_active"
         const val EXTRA_IS_APPENDING = "extra_is_appending"
         const val EXTRA_AWAITING_SAVE = "extra_awaiting_save"
+        const val EXTRA_RECORDING_ELAPSED_MS = "extra_recording_elapsed_ms"
 
         const val EXTRA_PLAYBACK_IS_PLAYING = "extra_playback_is_playing"
         const val EXTRA_PLAYBACK_POSITION_MS = "extra_playback_position_ms"
