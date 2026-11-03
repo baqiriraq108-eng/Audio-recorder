@@ -1,0 +1,29 @@
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+    <!-- Left 4 bars: warm vibrant orange (#FF5722) -->
+    <path
+        android:fillColor="#FF5722"
+        android:pathData="M3.5,10.5 A0.9,0.9 0 0,1 5.3,10.5 L5.3,13.5 A0.9,0.9 0 0,1 3.5,13.5 Z" />
+    <path
+        android:fillColor="#FF5722"
+        android:pathData="M6.5,7.5 A0.9,0.9 0 0,1 8.3,7.5 L8.3,16.5 A0.9,0.9 0 0,1 6.5,16.5 Z" />
+    <path
+        android:fillColor="#FF5722"
+        android:pathData="M9.5,4.5 A0.9,0.9 0 0,1 11.3,4.5 L11.3,19.5 A0.9,0.9 0 0,1 9.5,19.5 Z" />
+    <path
+        android:fillColor="#FF7043"
+        android:pathData="M12.5,8.5 A0.9,0.9 0 0,1 14.3,8.5 L14.3,15.5 A0.9,0.9 0 0,1 12.5,15.5 Z" />
+    <!-- Right 3 bars: crisp white/silver (#D8D8D8) -->
+    <path
+        android:fillColor="#D8D8D8"
+        android:pathData="M15.5,6.5 A0.9,0.9 0 0,1 17.3,6.5 L17.3,17.5 A0.9,0.9 0 0,1 15.5,17.5 Z" />
+    <path
+        android:fillColor="#D8D8D8"
+        android:pathData="M18.5,9.0 A0.9,0.9 0 0,1 20.3,9.0 L20.3,15.0 A0.9,0.9 0 0,1 18.5,15.0 Z" />
+    <path
+        android:fillColor="#B0B0B0"
+        android:pathData="M21.2,10.8 A0.8,0.8 0 0,1 22.8,10.8 L22.8,13.2 A0.8,0.8 0 0,1 21.2,13.2 Z" />
+</vector>

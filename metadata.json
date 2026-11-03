@@ -1,0 +1,6 @@
+{
+  "name": "Audio Recorder",
+  "description": "Advanced Material 3 Android audio studio with live PCM waveform rendering, non-destructive silence skipping, lossless session appending, multi-format conversion, and Google Drive backup.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
