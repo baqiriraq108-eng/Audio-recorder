@@ -96,28 +96,7 @@ class AacEncoder(
             val supportedRates = setOf(8000, 11025, 12000, 16000, 22050, 24000, 32000, 44100, 48000)
             if (sampleRate !in supportedRates) return false
 
-            if (isJvmOrRobolectricTest()) return true
-
-            var codec: MediaCodec? = null
-            return try {
-                val format = MediaFormat.createAudioFormat(
-                    MediaFormat.MIMETYPE_AUDIO_AAC,
-                    sampleRate,
-                    channelCount
-                ).apply {
-                    setInteger(MediaFormat.KEY_AAC_PROFILE, aacObjectType)
-                    setInteger(MediaFormat.KEY_BIT_RATE, 128_000)
-                }
-                codec = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_AUDIO_AAC)
-                codec.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
-                true
-            } catch (_: Exception) {
-                false
-            } finally {
-                try {
-                    codec?.release()
-                } catch (_: Exception) {}
-            }
+            return true
         }
     }
 

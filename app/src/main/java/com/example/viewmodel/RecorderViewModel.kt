@@ -44,6 +44,7 @@ import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.conflate
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -400,34 +401,33 @@ class RecorderViewModel(application: Application) : AndroidViewModel(application
             }
         }
 
-        // Real-time synchronization of live recording notification & MediaSession timer
-        viewModelScope.launch {
-            var lastNotifiedSecond = -1L
-            audioEngine.elapsedMs.collect { elapsed ->
+        // Real-time synchronization of live recording notification waveform & MediaSession timer
+        viewModelScope.launch(Dispatchers.Default) {
+            var lastNotifiedBucket = -1L
+            combine(
+                audioEngine.elapsedMs,
+                audioEngine.livePeaks
+            ) { elapsed, peaks ->
+                elapsed to peaks
+            }.conflate().collect { (elapsed, peaks) ->
                 val status = _recordingStatus.value
-                if ((status == RecordingStatus.RECORDING || status == RecordingStatus.PAUSED) &&
-                    !_showAppendSaveConfirmDialog.value
-                ) {
+                if (status == RecordingStatus.RECORDING && !_showAppendSaveConfirmDialog.value) {
                     val baseOffset = _appendTarget.value?.durationMs ?: 0L
                     val totalElapsedMs = (baseOffset + elapsed).coerceAtLeast(0L)
-                    val currentSecond = totalElapsedMs / 1000L
-                    if (currentSecond != lastNotifiedSecond) {
-                        lastNotifiedSecond = currentSecond
-                        val isPaused = status == RecordingStatus.PAUSED
-                        val title = if (isPaused) {
-                            "Paused"
-                        } else {
-                            _appendTarget.value?.title ?: "Recording"
-                        }
+                    val currentBucket = totalElapsedMs / 1000L
+                    if (currentBucket != lastNotifiedBucket) {
+                        lastNotifiedBucket = currentBucket
+                        val title = _appendTarget.value?.title ?: "Recording"
                         updateForegroundServiceNotification(
                             title = title,
                             status = "",
-                            isPaused = isPaused,
-                            elapsedMs = totalElapsedMs
+                            isPaused = false,
+                            elapsedMs = totalElapsedMs,
+                            waveformPeaks = peaks.takeLast(8).toFloatArray()
                         )
                     }
-                } else {
-                    lastNotifiedSecond = -1L
+                } else if (status != RecordingStatus.PAUSED) {
+                    lastNotifiedBucket = -1L
                 }
             }
         }
@@ -2820,6 +2820,7 @@ class RecorderViewModel(application: Application) : AndroidViewModel(application
             val context = getApplication<Application>()
             val baseOffset = _appendTarget.value?.durationMs ?: 0L
             val initialElapsedMs = (baseOffset + audioEngine.elapsedMs.value).coerceAtLeast(0L)
+            val initialPeaks = audioEngine.livePeaks.value.takeLast(8).toFloatArray()
             val intent = Intent(context, RecordingForegroundService::class.java).apply {
                 action = RecordingForegroundService.ACTION_START_FOREGROUND
                 putExtra(RecordingForegroundService.EXTRA_TITLE, title)
@@ -2827,6 +2828,9 @@ class RecorderViewModel(application: Application) : AndroidViewModel(application
                 putExtra(RecordingForegroundService.EXTRA_IS_PAUSED, false)
                 putExtra(RecordingForegroundService.EXTRA_IS_APPENDING, _appendTarget.value != null)
                 putExtra(RecordingForegroundService.EXTRA_RECORDING_ELAPSED_MS, initialElapsedMs)
+                if (initialPeaks.isNotEmpty()) {
+                    putExtra(RecordingForegroundService.EXTRA_WAVEFORM_PEAKS, initialPeaks)
+                }
                 putExtra(
                     RecordingForegroundService.EXTRA_IS_SKIP_SILENCE_ACTIVE,
                     _settings.value.silenceConfig.isEffectivelyEnabled
@@ -2840,7 +2844,8 @@ class RecorderViewModel(application: Application) : AndroidViewModel(application
         title: String,
         status: String,
         isPaused: Boolean = false,
-        elapsedMs: Long = ((_appendTarget.value?.durationMs ?: 0L) + audioEngine.elapsedMs.value).coerceAtLeast(0L)
+        elapsedMs: Long = ((_appendTarget.value?.durationMs ?: 0L) + audioEngine.elapsedMs.value).coerceAtLeast(0L),
+        waveformPeaks: FloatArray? = null
     ) {
         try {
             val context = getApplication<Application>()
@@ -2851,6 +2856,9 @@ class RecorderViewModel(application: Application) : AndroidViewModel(application
                 putExtra(RecordingForegroundService.EXTRA_IS_PAUSED, isPaused)
                 putExtra(RecordingForegroundService.EXTRA_IS_APPENDING, _appendTarget.value != null)
                 putExtra(RecordingForegroundService.EXTRA_RECORDING_ELAPSED_MS, elapsedMs)
+                if (!isPaused && waveformPeaks != null && waveformPeaks.isNotEmpty()) {
+                    putExtra(RecordingForegroundService.EXTRA_WAVEFORM_PEAKS, waveformPeaks)
+                }
                 putExtra(
                     RecordingForegroundService.EXTRA_IS_SKIP_SILENCE_ACTIVE,
                     _settings.value.silenceConfig.isEffectivelyEnabled

@@ -44,14 +44,272 @@ class RecordingForegroundService : Service() {
     internal var lastRecordingPlaybackState: PlaybackState? = null
         private set
 
+    internal var currentWaveformBars: FloatArray = createInitialRecordingWaveformBars()
+        private set
+
+    internal var lastRenderedWaveformBitmap: android.graphics.Bitmap? = null
+        private set
+
+    internal var lastRenderedWaveformOpacity: Float = 1.0f
+        private set
+
+    internal var lastRenderedWaveformAlpha: Int = 255
+        private set
+
+    internal var lastRenderedSplineHeights: FloatArray = FloatArray(0)
+        private set
+
+    internal var lastRenderedOscillatingDisplacements: FloatArray = FloatArray(0)
+        private set
+
+    internal var lastRenderedOscillatingYs: FloatArray = FloatArray(0)
+        private set
+
+    internal var lastRenderedColorPalette: IntArray = intArrayOf(
+        WAVEFORM_CORAL_START_COLOR,
+        WAVEFORM_CORAL_MID_COLOR,
+        WAVEFORM_CORAL_END_COLOR
+    )
+        private set
+
+    private var lastRecordedMetadataTitle: String? = null
+    private var lastRecordedMetadataSubtitle: String? = null
+
+    private var waveformAnimationStep: Int = 0
+
     internal fun isAppendSaveConfirmationVisible(): Boolean = isShowingAppendSaveConfirmation
 
     internal fun getActiveMediaSession(): MediaSession? = mediaSession
+
+    private fun createInitialRecordingWaveformBars(): FloatArray {
+        return FloatArray(WAVEFORM_BAR_COUNT) { idx ->
+            val t = idx.toFloat() / (WAVEFORM_BAR_COUNT - 1).coerceAtLeast(1).toFloat()
+            val windowEnvelope = kotlin.math.sin(t * Math.PI).toFloat().coerceIn(0.22f, 1.0f)
+            val harmonicMod = 0.52f +
+                0.24f * kotlin.math.abs(kotlin.math.sin((idx * 0.68f).toDouble()).toFloat()) +
+                0.16f * kotlin.math.abs(kotlin.math.cos((idx * 1.25f).toDouble()).toFloat())
+            (harmonicMod * (0.45f + 0.55f * windowEnvelope)).coerceIn(0.18f, 0.94f)
+        }
+    }
+
+    /**
+     * Advances the recording waveform by shifting existing control points left and appending
+     * new live microphone voice peaks on the right to drive the horizontally centered oscillating wave.
+     *
+     * CRITICAL: When [isPaused] is true, this method is a strict no-op so the oscillating wave
+     * remains frozen in place at its exact captured crests and troughs without flattening or resetting.
+     */
+    internal fun advanceRecordingWaveformBars(
+        incomingPeaks: FloatArray? = null,
+        isPaused: Boolean = isPausedState
+    ) {
+        if (isPaused) {
+            // Freeze in place: preserve exact last peaks and oscillating wave shape without mutation.
+            return
+        }
+        waveformAnimationStep++
+        val bars = currentWaveformBars.copyOf()
+        val shiftCount = if (incomingPeaks != null && incomingPeaks.size >= 2) 2 else 1
+        for (i in 0 until (WAVEFORM_BAR_COUNT - shiftCount)) {
+            bars[i] = bars[i + shiftCount]
+        }
+
+        for (s in 0 until shiftCount) {
+            val targetIdx = WAVEFORM_BAR_COUNT - shiftCount + s
+            val rawPeak = if (incomingPeaks != null && incomingPeaks.isNotEmpty()) {
+                val pickIdx = (incomingPeaks.size - shiftCount + s).coerceIn(0, incomingPeaks.size - 1)
+                incomingPeaks[pickIdx]
+            } else {
+                0f
+            }
+            val stepPhase = (waveformAnimationStep + s) * 0.52f
+            val organicMotion = 0.24f +
+                0.20f * kotlin.math.abs(kotlin.math.sin(stepPhase.toDouble()).toFloat()) +
+                0.14f * kotlin.math.abs(kotlin.math.cos((stepPhase * 1.85f).toDouble()).toFloat())
+            val combinedAmplitude = if (rawPeak > 0.02f) {
+                (rawPeak * 0.85f + organicMotion * 0.25f).coerceIn(0.18f, 1.0f)
+            } else {
+                organicMotion.coerceIn(0.18f, 0.82f)
+            }
+            bars[targetIdx] = combinedAmplitude
+        }
+        currentWaveformBars = bars
+    }
+
+    /**
+     * Computes signed vertical displacements (-1.0f..1.0f) around the horizontal midline (`centerY`)
+     * so the cubic-Bezier waveform oscillates smoothly up and down (alternating crests above the
+     * midline and troughs below the midline) across the full horizontal width.
+     */
+    internal fun computeOscillatingWaveDisplacements(bars: FloatArray = currentWaveformBars): FloatArray {
+        val count = bars.size.coerceAtLeast(2)
+        return FloatArray(count) { i ->
+            val t = i.toFloat() / (count - 1).toFloat()
+            // Smooth edge taper near 0.0 and 1.0 so the oscillating wave meets the midline cleanly at the ends,
+            // while remaining full-amplitude across the horizontal span (NOT climbing diagonally upward).
+            val edgeWindow = (0.32f + 0.68f * kotlin.math.sin(t * Math.PI).toFloat()).coerceIn(0.32f, 1.0f)
+            val normalizedAmp = bars[i].coerceIn(0.14f, 1.0f) * edgeWindow
+            val sign = if (i % 2 == 0) -1f else 1f
+            (sign * normalizedAmp).coerceIn(-0.96f, 0.96f)
+        }
+    }
+
+    /**
+     * Renders a Single Smooth Continuous Oscillating Audio Waveform centered along the horizontal
+     * midline (`centerY = heightPx / 2f`) using `Canvas.drawPath` with cubic-Bezier curves in the
+     * Studio Coral-Orange linear gradient (`#E38851` -> `#F08C4B` -> `#FFB485`) and a subtle
+     * translucent coral glow (`35%` opacity tapering to `0%` toward the center baseline).
+     *
+     * When [isPaused] is true:
+     * - Freezes the exact oscillating wave shape in place.
+     * - Dims the waveform opacity to 40% (`alpha = 102` / `opacity = 0.40f`).
+     */
+    internal fun renderRecordingWaveformBitmap(
+        bars: FloatArray = currentWaveformBars,
+        isPaused: Boolean = isPausedState
+    ): android.graphics.Bitmap {
+        val widthPx = WAVEFORM_BITMAP_WIDTH_PX
+        val heightPx = WAVEFORM_BITMAP_HEIGHT_PX
+        val bitmap = android.graphics.Bitmap.createBitmap(
+            widthPx,
+            heightPx,
+            android.graphics.Bitmap.Config.ARGB_8888
+        )
+        val canvas = android.graphics.Canvas(bitmap)
+
+        val opacityFactor = if (isPaused) PAUSED_WAVEFORM_OPACITY else ACTIVE_WAVEFORM_OPACITY
+        val targetAlpha = if (isPaused) {
+            PAUSED_WAVEFORM_ALPHA
+        } else {
+            (255f * opacityFactor).toInt().coerceIn(0, 255)
+        }
+        lastRenderedWaveformOpacity = opacityFactor
+        lastRenderedWaveformAlpha = targetAlpha
+
+        val displacements = computeOscillatingWaveDisplacements(bars)
+        lastRenderedOscillatingDisplacements = displacements.copyOf()
+        lastRenderedSplineHeights = FloatArray(displacements.size) { idx ->
+            kotlin.math.abs(displacements[idx])
+        }
+
+        val pointCount = displacements.size.coerceAtLeast(2)
+        val horizontalPadding = 6f
+        val usableWidth = (widthPx - horizontalPadding * 2f).coerceAtLeast(1f)
+        val centerY = heightPx / 2f
+        val maxHalfAmplitude = heightPx * 0.42f
+
+        val xs = FloatArray(pointCount)
+        val ys = FloatArray(pointCount)
+        for (i in 0 until pointCount) {
+            val fraction = i.toFloat() / (pointCount - 1).toFloat()
+            xs[i] = horizontalPadding + fraction * usableWidth
+            ys[i] = (centerY + displacements[i] * maxHalfAmplitude)
+                .coerceIn(heightPx * 0.06f, heightPx * 0.94f)
+        }
+        lastRenderedOscillatingYs = ys.copyOf()
+
+        // 1. Subtle horizontal center axis baseline
+        val centerBaselinePaint = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG).apply {
+            style = android.graphics.Paint.Style.STROKE
+            strokeWidth = 1.5f
+            color = WAVEFORM_CORAL_MID_COLOR
+            alpha = (42f * opacityFactor).toInt().coerceIn(8, 255)
+        }
+        canvas.drawLine(horizontalPadding, centerY, widthPx - horizontalPadding, centerY, centerBaselinePaint)
+
+        // 2. Construct smooth continuous cubic-Bezier oscillating wave path centered on centerY
+        val wavePath = android.graphics.Path()
+        val glowPath = android.graphics.Path()
+        wavePath.moveTo(xs[0], ys[0])
+        glowPath.moveTo(xs[0], centerY)
+        glowPath.lineTo(xs[0], ys[0])
+
+        val tension = 0.24f
+        for (i in 0 until pointCount - 1) {
+            val x0 = if (i > 0) xs[i - 1] else xs[i]
+            val y0 = if (i > 0) ys[i - 1] else ys[i]
+            val x1 = xs[i]
+            val y1 = ys[i]
+            val x2 = xs[i + 1]
+            val y2 = ys[i + 1]
+            val x3 = if (i + 2 < pointCount) xs[i + 2] else x2
+            val y3 = if (i + 2 < pointCount) ys[i + 2] else y2
+
+            val cp1x = x1 + (x2 - x0) * tension
+            val cp1y = (y1 + (y2 - y0) * tension).coerceIn(heightPx * 0.04f, heightPx * 0.96f)
+            val cp2x = x2 - (x3 - x1) * tension
+            val cp2y = (y2 - (y3 - y1) * tension).coerceIn(heightPx * 0.04f, heightPx * 0.96f)
+
+            wavePath.cubicTo(cp1x, cp1y, cp2x, cp2y, x2, y2)
+            glowPath.cubicTo(cp1x, cp1y, cp2x, cp2y, x2, y2)
+        }
+
+        glowPath.lineTo(xs[pointCount - 1], centerY)
+        glowPath.close()
+
+        // 3. Subtle translucent coral glow (35% opacity = alpha 89 tapering to 0% at the center baseline)
+        val crestGlowAlpha = (WAVEFORM_GLOW_MAX_ALPHA * opacityFactor).toInt().coerceIn(0, 255)
+        val crestGlowColor = (crestGlowAlpha shl 24) or (WAVEFORM_CORAL_MID_COLOR and 0x00FFFFFF)
+        val centerZeroColor = 0x00F08C4B
+        val glowPaint = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG).apply {
+            style = android.graphics.Paint.Style.FILL
+            shader = android.graphics.LinearGradient(
+                0f,
+                heightPx * 0.06f,
+                0f,
+                heightPx * 0.94f,
+                intArrayOf(crestGlowColor, centerZeroColor, crestGlowColor),
+                floatArrayOf(0f, 0.5f, 1f),
+                android.graphics.Shader.TileMode.CLAMP
+            )
+        }
+        canvas.drawPath(glowPath, glowPaint)
+
+        // 4. Primary smooth continuous oscillating wave stroke in Studio Coral-Orange Gradient (#E38851 -> #F08C4B -> #FFB485)
+        val palette = intArrayOf(
+            WAVEFORM_CORAL_START_COLOR,
+            WAVEFORM_CORAL_MID_COLOR,
+            WAVEFORM_CORAL_END_COLOR
+        )
+        lastRenderedColorPalette = palette
+        val waveStrokePaint = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG).apply {
+            style = android.graphics.Paint.Style.STROKE
+            strokeWidth = 4.5f
+            strokeCap = android.graphics.Paint.Cap.ROUND
+            strokeJoin = android.graphics.Paint.Join.ROUND
+            shader = android.graphics.LinearGradient(
+                horizontalPadding,
+                0f,
+                widthPx - horizontalPadding,
+                0f,
+                palette,
+                floatArrayOf(0f, 0.5f, 1f),
+                android.graphics.Shader.TileMode.CLAMP
+            )
+            alpha = targetAlpha
+        }
+        canvas.drawPath(wavePath, waveStrokePaint)
+
+        return bitmap
+    }
 
     override fun onCreate() {
         super.onCreate()
         createNotificationChannel()
         initMediaSession()
+        RecordingIslandOverlayManager.bindCallbacks(
+            onBookmark = { dispatchBookmarkAction() },
+            onStopSave = { handleRecordingStopSaveFromNotification() },
+            onPauseResume = {
+                if (isPausedState) {
+                    handleRecordingResumeFromNotification()
+                } else {
+                    handleRecordingPauseFromNotification()
+                }
+            },
+            onConfirmAppendSave = { handleConfirmAppendSaveFromNotification() },
+            onCancelAppendSave = { handleCancelAppendSaveFromNotification() }
+        )
     }
 
     internal fun dispatchPauseAction() {
@@ -233,6 +491,14 @@ class RecordingForegroundService : Service() {
     private fun initMediaSession() {
         try {
             mediaSession = MediaSession(this, "AudioRecorderStudioLiveSession").apply {
+                try {
+                    setPlaybackToLocal(
+                        android.media.AudioAttributes.Builder()
+                            .setUsage(android.media.AudioAttributes.USAGE_MEDIA)
+                            .setContentType(android.media.AudioAttributes.CONTENT_TYPE_SPEECH)
+                            .build()
+                    )
+                } catch (_: Exception) {}
                 setCallback(object : MediaSession.Callback() {
                     override fun onPause() {
                         if (isPlaybackMode) {
@@ -264,7 +530,7 @@ class RecordingForegroundService : Service() {
                         if (isPlaybackMode) {
                             dispatchPlaybackPrevAction()
                         } else {
-                            handleRecordingStopSaveFromNotification()
+                            dispatchBookmarkAction()
                         }
                     }
 
@@ -272,7 +538,7 @@ class RecordingForegroundService : Service() {
                         if (isPlaybackMode) {
                             dispatchPlaybackNextAction()
                         } else {
-                            dispatchBookmarkAction()
+                            handleRecordingStopSaveFromNotification()
                         }
                     }
 
@@ -322,7 +588,7 @@ class RecordingForegroundService : Service() {
                         }
                     }
                 })
-                isActive = true
+                isActive = false
             }
         } catch (_: Exception) {}
     }
@@ -377,43 +643,26 @@ class RecordingForegroundService : Service() {
             if (!isAwaitingSave) {
                 playbackStateBuilder.addCustomAction(
                     PlaybackState.CustomAction.Builder(
-                        ACTION_NOTIFICATION_STOP_SAVE,
-                        getString(R.string.notification_action_stop_save),
-                        R.drawable.ic_notif_stop_save
+                        ACTION_NOTIFICATION_BOOKMARK,
+                        getString(R.string.notification_action_bookmark),
+                        R.drawable.ic_notif_bookmark
                     ).build()
                 )
                 playbackStateBuilder.addCustomAction(
                     PlaybackState.CustomAction.Builder(
-                        ACTION_NOTIFICATION_BOOKMARK,
-                        getString(R.string.notification_action_bookmark),
-                        R.drawable.ic_notif_bookmark
+                        ACTION_NOTIFICATION_STOP_SAVE,
+                        getString(R.string.notification_action_stop_save),
+                        R.drawable.ic_notif_stop_save
                     ).build()
                 )
             }
 
             val builtState = playbackStateBuilder.build()
             lastRecordingPlaybackState = builtState
-            session.setPlaybackState(builtState)
-
-            val baseStatus = statusText.ifBlank {
-                if (isPaused) getString(R.string.notification_status_paused)
-                else getString(R.string.notification_status_recording)
-            }
-            val formattedTimer = formatElapsedTimer(elapsed)
-            val displaySubtitle = if (baseStatus.contains(formattedTimer)) {
-                baseStatus
-            } else {
-                "$baseStatus • $formattedTimer"
-            }
-            val metadata = MediaMetadata.Builder()
-                .putString(MediaMetadata.METADATA_KEY_TITLE, title)
-                .putString(MediaMetadata.METADATA_KEY_ARTIST, displaySubtitle)
-                .putString(MediaMetadata.METADATA_KEY_ALBUM, getString(R.string.app_name))
-                .build()
-            session.setMetadata(metadata)
-            if (!session.isActive) {
-                session.isActive = true
-            }
+            // CRITICAL: During Recording (`isPlaybackMode == false`), NEVER activate MediaSession or
+            // publish STATE_PLAYING to the OS MediaSessionService, because Android 13-16 and HyperOS
+            // will hijack the notification into a MediaStyle carousel (injecting the 00:00 seekbar and Cast button).
+            session.isActive = false
         } catch (_: Exception) {}
     }
 
@@ -481,6 +730,10 @@ class RecordingForegroundService : Service() {
                 sessionStartTimeMs = (System.currentTimeMillis() - recordingElapsedMs).coerceAtMost(System.currentTimeMillis())
                 pauseStartedAtMs = if (isPausedState) System.currentTimeMillis() else 0L
                 accumulatedPausedMs = 0L
+                val incomingStartPeaks = intent.getFloatArrayExtra(EXTRA_WAVEFORM_PEAKS)
+                if (!isPausedState) {
+                    advanceRecordingWaveformBars(incomingStartPeaks, isPaused = false)
+                }
                 acquireWakeLock()
 
                 val notification = buildRecordingNotification(
@@ -490,36 +743,24 @@ class RecordingForegroundService : Service() {
                     isSkipSilence = isSkipSilenceActive,
                     isAwaitingSave = false
                 )
+                if (!RecordingIslandOverlayManager.canDrawSystemOverlay(this)) {
+                    RecordingIslandOverlayManager.maybePromptOverlayPermissionOnce(this)
+                }
                 try {
                     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                         startForeground(
                             NOTIFICATION_ID,
                             notification,
-                            ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE or
-                                ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK
+                            ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
                         )
                     } else {
                         startForeground(NOTIFICATION_ID, notification)
                     }
                 } catch (_: Exception) {
                     try {
-                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                            startForeground(
-                                NOTIFICATION_ID,
-                                notification,
-                                ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
-                            )
-                        } else {
-                            startForeground(NOTIFICATION_ID, notification)
-                        }
-                    } catch (_: Exception) {
-                        try {
-                            startForeground(NOTIFICATION_ID, notification)
-                        } catch (_: Exception) {}
-                    }
+                        startForeground(NOTIFICATION_ID, notification)
+                    } catch (_: Exception) {}
                 }
-                val nm = getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager
-                nm?.notify(NOTIFICATION_ID, notification)
             }
 
             ACTION_UPDATE_NOTIFICATION -> {
@@ -539,6 +780,10 @@ class RecordingForegroundService : Service() {
                 }
                 if (intent.hasExtra(EXTRA_RECORDING_ELAPSED_MS)) {
                     recordingElapsedMs = intent.getLongExtra(EXTRA_RECORDING_ELAPSED_MS, recordingElapsedMs).coerceAtLeast(0L)
+                }
+                val incomingPeaks = intent.getFloatArrayExtra(EXTRA_WAVEFORM_PEAKS)
+                if (!isPausedState) {
+                    advanceRecordingWaveformBars(incomingPeaks, isPaused = false)
                 }
                 val now = System.currentTimeMillis()
                 if (!previousPaused && isPausedState) {
@@ -808,6 +1053,63 @@ class RecordingForegroundService : Service() {
             "$baseSubtitle • $formattedTimer"
         }
 
+        val waveformBitmap = renderRecordingWaveformBitmap(
+            bars = currentWaveformBars,
+            isPaused = isPaused
+        )
+        lastRenderedWaveformBitmap = waveformBitmap
+
+        val chronometerBaseRealtimeMs = (android.os.SystemClock.elapsedRealtime() - elapsedMs)
+            .coerceAtMost(android.os.SystemClock.elapsedRealtime())
+        val (pauseResumeIconRes, pauseResumeLabel) = if (isPaused) {
+            R.drawable.ic_notif_resume to getString(R.string.notification_action_resume)
+        } else {
+            R.drawable.ic_notif_pause to getString(R.string.notification_action_pause)
+        }
+        val headerStatusTitle = if (isPaused) {
+            getString(R.string.notification_status_paused)
+        } else {
+            title.ifBlank { getString(R.string.notification_status_recording) }
+        }
+        val blendedHeaderTitle = buildGradientBlendedEnglishTitle(headerStatusTitle)
+
+        // Single fixed-height non-expandable dark card (#1A1614, 24dp radius, zero Cast button, zero seekbar)
+        val recordingCardView = android.widget.RemoteViews(packageName, R.layout.notification_recording_live).apply {
+            setOnClickPendingIntent(R.id.notif_recording_header, pendingOpen)
+            setTextViewText(R.id.notif_recording_title, blendedHeaderTitle)
+            if (isPaused || isAwaitingSave) {
+                setViewVisibility(R.id.notif_recording_chronometer, android.view.View.GONE)
+                setViewVisibility(R.id.notif_recording_paused_timer, android.view.View.VISIBLE)
+                setTextViewText(R.id.notif_recording_paused_timer, formattedTimer)
+            } else {
+                setViewVisibility(R.id.notif_recording_paused_timer, android.view.View.GONE)
+                setViewVisibility(R.id.notif_recording_chronometer, android.view.View.VISIBLE)
+                setChronometer(R.id.notif_recording_chronometer, chronometerBaseRealtimeMs, null, true)
+            }
+            setImageViewBitmap(R.id.notif_recording_waveform, waveformBitmap)
+            // 1. Far-Left Edge: Bookmark button
+            setOnClickPendingIntent(R.id.notif_recording_btn_bookmark, pendingBookmark)
+            // 2. Center: Save (Stop & Save) button
+            setOnClickPendingIntent(R.id.notif_recording_btn_stop_save, pendingStopSave)
+            // 3. Far-Right Edge: Pause / Resume toggle button
+            setImageViewResource(R.id.notif_action_pause_resume_icon, pauseResumeIconRes)
+            setTextViewText(R.id.notif_action_pause_resume_text, pauseResumeLabel)
+            setOnClickPendingIntent(R.id.notif_recording_btn_pause_resume, pauseOrResumePendingIntent)
+        }
+
+        // Synchronize Xiaomi-Style System Overlay Dynamic Capsule (`RecordingIslandOverlayManager`)
+        if (!isPlaybackMode) {
+            RecordingIslandOverlayManager.updateRecordingOverlayState(
+                context = this,
+                title = headerStatusTitle,
+                isPaused = isPaused,
+                elapsedMs = elapsedMs,
+                waveformBitmap = waveformBitmap,
+                oscillatingDisplacements = lastRenderedOscillatingDisplacements,
+                isShowingAppendConfirmation = false
+            )
+        }
+
         val builder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             Notification.Builder(this, CHANNEL_ID)
         } else {
@@ -815,18 +1117,23 @@ class RecordingForegroundService : Service() {
             Notification.Builder(this)
         }
 
+        // CRITICAL ARCHITECTURAL RULES FOR RECORDING NOTIFICATION:
+        // 1. DO NOT attach Notification.MediaStyle() or DecoratedCustomViewStyle() (builder.setStyle is NEVER called).
+        // 2. DO NOT call setCustomBigContentView(...) (keep bigContentView = null so Android/HyperOS renders ZERO expand/collapse chevron arrows '^').
+        // 3. DO NOT attach standard builder.addAction(...) footer rows.
         builder
             .setSmallIcon(R.drawable.ic_notif_mic)
-            .setContentTitle(title)
+            .setContentTitle(headerStatusTitle)
             .setContentText(subtitle)
-            .setSubText(formattedTimer)
             .setContentIntent(pendingOpen)
+            .setCustomContentView(recordingCardView)
+            .setCustomHeadsUpContentView(recordingCardView)
             .setOngoing(true)
             .setOnlyAlertOnce(true)
             .setVisibility(Notification.VISIBILITY_PUBLIC)
-            .setCategory(Notification.CATEGORY_TRANSPORT)
+            .setCategory(Notification.CATEGORY_SERVICE)
             .setColor(0xFFF08C4B.toInt())
-            .setShowWhen(true)
+            .setShowWhen(false)
             .setWhen(effectiveWhenMs)
             .setUsesChronometer(!isPaused && !isAwaitingSave)
 
@@ -838,52 +1145,47 @@ class RecordingForegroundService : Service() {
             builder.setForegroundServiceBehavior(Notification.FOREGROUND_SERVICE_IMMEDIATE)
         }
 
-        if (!isAwaitingSave) {
-            // Action 0: Pause / Resume button
-            val (pauseResumeIcon, pauseResumeTitle) = if (isPaused) {
-                R.drawable.ic_notif_resume to getString(R.string.notification_action_resume)
-            } else {
-                R.drawable.ic_notif_pause to getString(R.string.notification_action_pause)
-            }
-            val pauseResumeAction = Notification.Action.Builder(
-                Icon.createWithResource(this, pauseResumeIcon),
-                pauseResumeTitle,
-                pauseOrResumePendingIntent
-            ).build()
-            builder.addAction(pauseResumeAction)
-
-            // Action 1: Stop and Save button (Square / Checkmark)
-            val finishSaveAction = Notification.Action.Builder(
-                Icon.createWithResource(this, R.drawable.ic_notif_stop_save),
-                getString(R.string.notification_action_stop_save),
-                pendingStopSave
-            ).build()
-            builder.addAction(finishSaveAction)
-
-            // Action 2: Bookmark button
-            val bookmarkAction = Notification.Action.Builder(
-                Icon.createWithResource(this, R.drawable.ic_notif_bookmark),
-                getString(R.string.notification_action_bookmark),
-                pendingBookmark
-            ).build()
-            builder.addAction(bookmarkAction)
-        }
-
-        // MediaStyle with MediaSession token renders native media controls in notification shade,
-        // lock screen, and Xiaomi HyperOS Dynamic Island (HyperIsland).
-        val mediaStyle = Notification.MediaStyle()
-        mediaSession?.sessionToken?.let { token ->
-            mediaStyle.setMediaSession(token)
-        }
-        if (!isAwaitingSave) {
-            // Strictly the 3 essential actions (Pause/Resume, Stop & Save, Bookmark) in compact view
-            mediaStyle.setShowActionsInCompactView(0, 1, 2)
-        }
-        builder.setStyle(mediaStyle)
-
         val notification = builder.build()
-        notification.extras.putIntArray(Notification.EXTRA_COMPACT_ACTIONS, intArrayOf(0, 1, 2))
+        @Suppress("DEPRECATION")
+        notification.bigContentView = null
+        notification.actions = arrayOf()
+        notification.extras.remove(Notification.EXTRA_MEDIA_SESSION)
+        notification.extras.remove(Notification.EXTRA_TEMPLATE)
+        notification.extras.remove(Notification.EXTRA_COMPACT_ACTIONS)
+        notification.extras.putBoolean(Notification.EXTRA_SHOW_CHRONOMETER, !isPaused && !isAwaitingSave)
+        notification.extras.putStringArray(
+            EXTRA_RECORDING_CUSTOM_ACTION_ORDER,
+            arrayOf(
+                getString(R.string.notification_action_bookmark),
+                getString(R.string.notification_action_stop_save),
+                pauseResumeLabel
+            )
+        )
         notification.extras.putBoolean("android.requestPromotedOngoing", true)
+        // Completely remove Cast / media-routing button in Recording state
+        notification.extras.putBoolean(EXTRA_HIDE_CAST_BUTTON, true)
+        notification.extras.putBoolean("android.hideMediaOutputSwitcher", true)
+        notification.extras.putBoolean("miui.media.hideCastButton", true)
+
+        // Dynamic Island / Status Bar Capsule configuration during active recording
+        try {
+            val focusPics = Bundle().apply {
+                putParcelable(
+                    "miui.focus.pic_island_left",
+                    Icon.createWithResource(this@RecordingForegroundService, R.drawable.ic_island_waveform)
+                )
+                putParcelable(
+                    "miui.focus.pic_island_right",
+                    Icon.createWithResource(this@RecordingForegroundService, R.drawable.ic_notif_mic)
+                )
+            }
+            val safeTitle = headerStatusTitle.replace("\"", "\\\"")
+            val focusParamJson = """{"protocol":1,"enableFloat":true,"updatable":true,"islandProperty":{"islandPriority":2,"islandOrder":true,"dismissIsland":false,"bigIslandArea":{"imageTextInfoLeft":{"type":1,"picInfo":{"type":1,"pic":"miui.focus.pic_island_left"}},"textInfo":{"title":"$safeTitle","showHighlightColor":false},"imageTextInfoRight":{"type":1,"picInfo":{"type":1,"pic":"miui.focus.pic_island_right"}}},"smallIslandArea":{"picInfo":{"type":1,"pic":"miui.focus.pic_island_left"}}}}"""
+            notification.extras.putBoolean("miui.focus.enable", true)
+            notification.extras.putBundle("miui.focus.pics", focusPics)
+            notification.extras.putString("miui.focus.param", focusParamJson)
+        } catch (_: Exception) {}
+
         return notification
     }
 
@@ -1074,6 +1376,16 @@ class RecordingForegroundService : Service() {
         } catch (_: Exception) {}
 
         val notif = buildAppendSaveConfirmationNotification()
+        val waveformBmp = lastRenderedWaveformBitmap ?: renderRecordingWaveformBitmap(currentWaveformBars, isPaused = true)
+        RecordingIslandOverlayManager.updateRecordingOverlayState(
+            context = this,
+            title = getString(R.string.notification_status_paused),
+            isPaused = true,
+            elapsedMs = computeCurrentRecordingElapsedMs(),
+            waveformBitmap = waveformBmp,
+            oscillatingDisplacements = lastRenderedOscillatingDisplacements,
+            isShowingAppendConfirmation = true
+        )
         val nm = getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager
         nm?.notify(NOTIFICATION_ID, notif)
     }
@@ -1149,7 +1461,6 @@ class RecordingForegroundService : Service() {
             .setContentText("")
             .setContentIntent(pendingOpen)
             .setCustomContentView(compactConfirmView)
-            .setCustomBigContentView(compactConfirmView)
             .setCustomHeadsUpContentView(compactConfirmView)
             .addAction(dontAction)
             .addAction(saveAction)
@@ -1167,13 +1478,21 @@ class RecordingForegroundService : Service() {
         }
 
         val notification = builder.build()
+        @Suppress("DEPRECATION")
+        notification.bigContentView = null
         notification.extras.putIntArray(Notification.EXTRA_COMPACT_ACTIONS, intArrayOf(0, 1))
         notification.extras.putBoolean("android.requestPromotedOngoing", true)
+        notification.extras.putBoolean("miui.focus.enable", false)
+        notification.extras.putString(
+            "miui.focus.param",
+            """{"protocol":1,"enableFloat":false,"updatable":true,"islandProperty":{"dismissIsland":true}}"""
+        )
         return notification
     }
 
     fun showFinishedSavedConfirmation(title: String = getString(R.string.notification_finished_recording)) {
         isShowingAppendSaveConfirmation = false
+        RecordingIslandOverlayManager.dismissAndReset()
         releaseWakeLock()
 
         try {
@@ -1204,7 +1523,10 @@ class RecordingForegroundService : Service() {
     }
 
     private fun stopForegroundInternal() {
+        RecordingIslandOverlayManager.dismissAndReset()
         releaseWakeLock()
+        lastRecordedMetadataTitle = null
+        lastRecordedMetadataSubtitle = null
         try {
             mediaSession?.isActive = false
         } catch (_: Exception) {}
@@ -1350,6 +1672,7 @@ class RecordingForegroundService : Service() {
     }
 
     override fun onDestroy() {
+        RecordingIslandOverlayManager.dismissAndReset()
         releaseWakeLock()
         try {
             mediaSession?.isActive = false
@@ -1416,6 +1739,23 @@ class RecordingForegroundService : Service() {
         const val EXTRA_IS_APPENDING = "extra_is_appending"
         const val EXTRA_AWAITING_SAVE = "extra_awaiting_save"
         const val EXTRA_RECORDING_ELAPSED_MS = "extra_recording_elapsed_ms"
+        const val EXTRA_WAVEFORM_PEAKS = "extra_waveform_peaks"
+        const val EXTRA_HIDE_CAST_BUTTON = "android.media.extra.HIDE_CAST_BUTTON"
+        const val EXTRA_RECORDING_CUSTOM_ACTION_ORDER = "com.example.extra.RECORDING_CUSTOM_ACTION_ORDER"
+
+        const val WAVEFORM_BAR_COUNT = 32
+        const val WAVEFORM_BITMAP_WIDTH_PX = 640
+        const val WAVEFORM_BITMAP_HEIGHT_PX = 96
+
+        const val WAVEFORM_CORAL_START_COLOR = 0xFFE38851.toInt()
+        const val WAVEFORM_CORAL_MID_COLOR = 0xFFF08C4B.toInt()
+        const val WAVEFORM_CORAL_END_COLOR = 0xFFFFB485.toInt()
+        const val WAVEFORM_CORAL_HIGHLIGHT_COLOR = 0xFFF4D7C7.toInt()
+
+        const val ACTIVE_WAVEFORM_OPACITY = 1.0f
+        const val PAUSED_WAVEFORM_OPACITY = 0.40f
+        const val PAUSED_WAVEFORM_ALPHA = 102
+        const val WAVEFORM_GLOW_MAX_ALPHA = 89f // 35% opacity tapering to 0% toward center baseline
 
         const val EXTRA_PLAYBACK_IS_PLAYING = "extra_playback_is_playing"
         const val EXTRA_PLAYBACK_POSITION_MS = "extra_playback_position_ms"

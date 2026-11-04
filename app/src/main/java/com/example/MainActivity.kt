@@ -135,6 +135,23 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    override fun onStart() {
+        super.onStart()
+        com.example.service.RecordingIslandOverlayManager.onAppForegroundChanged(this, true)
+    }
+
+    override fun onResume() {
+        super.onResume()
+        com.example.service.RecordingIslandOverlayManager.onAppForegroundChanged(this, true)
+    }
+
+    override fun onStop() {
+        if (!isChangingConfigurations) {
+            com.example.service.RecordingIslandOverlayManager.onAppForegroundChanged(this, false)
+        }
+        super.onStop()
+    }
+
     override fun onNewIntent(intent: android.content.Intent) {
         super.onNewIntent(intent)
         setIntent(intent)

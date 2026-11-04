@@ -751,6 +751,56 @@ fun SettingsScreen(
                         modifier = Modifier.testTag("toggle_pause_external_media")
                     )
                 }
+
+                Spacer(modifier = Modifier.height(10.dp))
+
+                // Item 4: Dynamic Island Capsule Overlay (System Overlay Permission Toggle)
+                val settingsContext = androidx.compose.ui.platform.LocalContext.current
+                var canDrawOverlayState by remember {
+                    mutableStateOf(com.example.service.RecordingIslandOverlayManager.canDrawSystemOverlay(settingsContext))
+                }
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(14.dp))
+                        .background(if (canDrawOverlayState) PeachAccent.copy(alpha = 0.14f) else ObsidianBackground)
+                        .padding(horizontal = 14.dp, vertical = 12.dp)
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = "Dynamic Island Capsule",
+                            style = MaterialTheme.typography.titleSmall.copy(fontWeight = FontWeight.Bold),
+                            color = PrimaryText,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                        Spacer(modifier = Modifier.height(2.dp))
+                        Text(
+                            text = if (canDrawOverlayState) "Overlay active on Home Screen" else "Tap to grant overlay permission",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = SecondaryText,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
+                    Spacer(modifier = Modifier.width(10.dp))
+                    Switch(
+                        checked = canDrawOverlayState,
+                        onCheckedChange = {
+                            com.example.service.RecordingIslandOverlayManager.launchOverlayPermissionSettings(settingsContext)
+                            canDrawOverlayState = com.example.service.RecordingIslandOverlayManager.canDrawSystemOverlay(settingsContext)
+                        },
+                        colors = SwitchDefaults.colors(
+                            checkedThumbColor = OnPeachAccent,
+                            checkedTrackColor = PeachAccent,
+                            uncheckedThumbColor = SecondaryText,
+                            uncheckedTrackColor = ElevatedSurface
+                        ),
+                        modifier = Modifier.testTag("toggle_dynamic_island_overlay")
+                    )
+                }
             }
         }
     }

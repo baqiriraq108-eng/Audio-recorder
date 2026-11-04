@@ -531,11 +531,12 @@ class ExampleRobolectricTest {
             com.example.ui.theme.StorageLocationOptionLabelStyle.fontFamily
         )
 
-        // 2. HyperOS Dynamic Island / Lock Screen / Notification Shade MediaStyle recording notification:
-        //    - Uses Notification.MediaStyle + MediaSession token + VISIBILITY_PUBLIC
-        //    - Exactly 3 essential actions: Pause/Resume, Stop & Save, Bookmark
-        //    - Silence Skip button is completely removed
-        //    - Finished recording confirmation capsule transitions with green checkmark and zero action buttons
+        // 2. Unified Foreground Service + Non-Expandable Custom Recording Card + RecordingIslandOverlayManager:
+        //    - Uses single unified RecordingForegroundService (Playback keeps MediaStyle untouched; Recording strips MediaStyle)
+        //    - Recording state removes Cast button, bigContentView = null (zero chevron arrow ^), zero standard footer actions
+        //    - Renders horizontally centered oscillating coral-orange cubic-Bezier waveform
+        //    - Recording controls beneath waveform: [0] Far-Left Bookmark, [1] Center Save, [2] Far-Right Pause/Resume
+        //    - Paused state freezes exact oscillating wave shape and dims opacity to 40% (alpha = 102)
         val serviceController = org.robolectric.Robolectric.buildService(
             com.example.service.RecordingForegroundService::class.java
         ).create()
@@ -548,29 +549,127 @@ class ExampleRobolectricTest {
             isSkipSilence = false,
             isAwaitingSave = false
         )
-        assertEquals(3, activeNotif.actions.size)
-        assertEquals("Pause", activeNotif.actions[0].title.toString())
-        assertEquals("Stop & Save", activeNotif.actions[1].title.toString())
-        assertEquals("Bookmark", activeNotif.actions[2].title.toString())
-        assertTrue(activeNotif.actions.none { it.title.toString().contains("Silence", ignoreCase = true) })
+        // No standard builder.addAction rows on Recording notification (prevents expand chevron and duplicate buttons)
+        assertTrue(activeNotif.actions.isNullOrEmpty())
+        val customActionOrder = activeNotif.extras.getStringArray(
+            com.example.service.RecordingForegroundService.EXTRA_RECORDING_CUSTOM_ACTION_ORDER
+        )
+        org.junit.Assert.assertArrayEquals(
+            arrayOf("Bookmark", "Stop & Save", "Pause"),
+            customActionOrder
+        )
         assertEquals(android.app.Notification.VISIBILITY_PUBLIC, activeNotif.visibility)
-        assertEquals(android.app.Notification.CATEGORY_TRANSPORT, activeNotif.category)
+        assertEquals(android.app.Notification.CATEGORY_SERVICE, activeNotif.category)
         assertTrue((activeNotif.flags and android.app.Notification.FLAG_ONGOING_EVENT) != 0)
         assertTrue(activeNotif.extras.getBoolean(android.app.Notification.EXTRA_SHOW_CHRONOMETER))
-        org.junit.Assert.assertFalse(activeNotif.extras.getBoolean("miui.focus.enable", false))
+        assertTrue(activeNotif.extras.getBoolean("miui.focus.enable", false))
+        val activeFocusParam = activeNotif.extras.getString("miui.focus.param").orEmpty()
+        assertTrue(activeFocusParam.contains("miui.focus.pic_island_left"))
+        assertTrue(activeFocusParam.contains("\"dismissIsland\":false"))
         assertTrue(activeNotif.extras.getBoolean("android.requestPromotedOngoing"))
-        org.junit.Assert.assertNotNull(activeNotif.extras.getParcelable(android.app.Notification.EXTRA_MEDIA_SESSION))
-        org.junit.Assert.assertArrayEquals(
-            intArrayOf(0, 1, 2),
-            activeNotif.extras.getIntArray(android.app.Notification.EXTRA_COMPACT_ACTIONS)
-        )
+        // Cast button, MediaStyle, and bigContentView completely removed in Recording state
+        assertTrue(activeNotif.extras.getBoolean(com.example.service.RecordingForegroundService.EXTRA_HIDE_CAST_BUTTON))
+        assertTrue(activeNotif.extras.getBoolean("android.hideMediaOutputSwitcher"))
+        assertTrue(activeNotif.extras.getBoolean("miui.media.hideCastButton"))
+        @Suppress("DEPRECATION")
+        org.junit.Assert.assertNull(activeNotif.extras.getParcelable(android.app.Notification.EXTRA_MEDIA_SESSION))
+        org.junit.Assert.assertNull(activeNotif.extras.getString(android.app.Notification.EXTRA_TEMPLATE))
+        org.junit.Assert.assertNull(activeNotif.extras.getIntArray(android.app.Notification.EXTRA_COMPACT_ACTIONS))
+        @Suppress("DEPRECATION")
+        org.junit.Assert.assertNull("bigContentView must be null to prevent expand chevron arrow", activeNotif.bigContentView)
+        org.junit.Assert.assertFalse("MediaSession must remain inactive during Recording", service.getActiveMediaSession()?.isActive == true)
 
         val activePlaybackState = service.lastRecordingPlaybackState
         org.junit.Assert.assertNotNull(activePlaybackState)
         assertEquals(android.media.session.PlaybackState.STATE_PLAYING, activePlaybackState?.state)
         val customActionIds = activePlaybackState?.customActions?.map { it.action }.orEmpty()
-        assertTrue(customActionIds.contains(com.example.service.RecordingForegroundService.ACTION_NOTIFICATION_STOP_SAVE))
         assertTrue(customActionIds.contains(com.example.service.RecordingForegroundService.ACTION_NOTIFICATION_BOOKMARK))
+        assertTrue(customActionIds.contains(com.example.service.RecordingForegroundService.ACTION_NOTIFICATION_STOP_SAVE))
+
+        // Verify custom non-expandable Recording card inflates cleanly with centered oscillating waveform + 3 buttons
+        @Suppress("DEPRECATION")
+        org.junit.Assert.assertNotNull(activeNotif.contentView)
+        @Suppress("DEPRECATION")
+        val inflatedCard = activeNotif.contentView.apply(context, android.widget.FrameLayout(context))
+
+        val waveformView = inflatedCard.findViewById<android.widget.ImageView>(R.id.notif_recording_waveform)
+        org.junit.Assert.assertNotNull(waveformView?.drawable)
+        assertTrue(waveformView.paddingStart > 0 && waveformView.paddingEnd > 0)
+
+        val bookmarkBtn = inflatedCard.findViewById<android.view.View>(R.id.notif_recording_btn_bookmark)
+        val saveBtn = inflatedCard.findViewById<android.view.View>(R.id.notif_recording_btn_stop_save)
+        val pauseResumeBtn = inflatedCard.findViewById<android.view.View>(R.id.notif_recording_btn_pause_resume)
+        val bookmarkLabelView = inflatedCard.findViewById<android.widget.TextView>(R.id.notif_action_bookmark_text)
+        val saveLabelView = inflatedCard.findViewById<android.widget.TextView>(R.id.notif_action_stop_save_text)
+        val pauseResumeLabelView = inflatedCard.findViewById<android.widget.TextView>(R.id.notif_action_pause_resume_text)
+        org.junit.Assert.assertNotNull(bookmarkBtn)
+        org.junit.Assert.assertNotNull(saveBtn)
+        org.junit.Assert.assertNotNull(pauseResumeBtn)
+        assertEquals("Pause", pauseResumeLabelView?.text?.toString())
+        // Verify all 3 button text labels are hidden (icon-only buttons without text labels)
+        assertEquals(android.view.View.GONE, bookmarkLabelView?.visibility)
+        assertEquals(android.view.View.GONE, saveLabelView?.visibility)
+        assertEquals(android.view.View.GONE, pauseResumeLabelView?.visibility)
+        val bookmarkLp = bookmarkBtn.layoutParams as android.widget.RelativeLayout.LayoutParams
+        val saveLp = saveBtn.layoutParams as android.widget.RelativeLayout.LayoutParams
+        val pauseResumeLp = pauseResumeBtn.layoutParams as android.widget.RelativeLayout.LayoutParams
+        // Verify all 3 button containers have identical width and height
+        assertTrue(bookmarkLp.width > 0 && bookmarkLp.width == saveLp.width && saveLp.width == pauseResumeLp.width)
+        assertTrue(bookmarkLp.height > 0 && bookmarkLp.height == saveLp.height && saveLp.height == pauseResumeLp.height)
+        assertTrue(bookmarkLp.getRule(android.widget.RelativeLayout.ALIGN_PARENT_LEFT) != 0)
+        assertTrue(saveLp.getRule(android.widget.RelativeLayout.CENTER_IN_PARENT) != 0)
+        assertTrue(pauseResumeLp.getRule(android.widget.RelativeLayout.ALIGN_PARENT_RIGHT) != 0)
+
+        val initialBitmap = service.lastRenderedWaveformBitmap
+        org.junit.Assert.assertNotNull(initialBitmap)
+        assertEquals(
+            com.example.service.RecordingForegroundService.WAVEFORM_BITMAP_WIDTH_PX,
+            initialBitmap?.width
+        )
+        assertEquals(
+            com.example.service.RecordingForegroundService.WAVEFORM_BAR_COUNT,
+            service.currentWaveformBars.size
+        )
+        assertEquals(1.0f, service.lastRenderedWaveformOpacity, 0.001f)
+        assertEquals(255, service.lastRenderedWaveformAlpha)
+        org.junit.Assert.assertArrayEquals(
+            intArrayOf(
+                com.example.service.RecordingForegroundService.WAVEFORM_CORAL_START_COLOR,
+                com.example.service.RecordingForegroundService.WAVEFORM_CORAL_MID_COLOR,
+                com.example.service.RecordingForegroundService.WAVEFORM_CORAL_END_COLOR
+            ),
+            service.lastRenderedColorPalette
+        )
+
+        // Verify horizontally centered oscillating wave geometry (alternating crests above centerY and troughs below centerY)
+        val centerY = com.example.service.RecordingForegroundService.WAVEFORM_BITMAP_HEIGHT_PX / 2f
+        val oscillatingDisplacements = service.lastRenderedOscillatingDisplacements
+        val oscillatingYs = service.lastRenderedOscillatingYs
+        assertEquals(com.example.service.RecordingForegroundService.WAVEFORM_BAR_COUNT, oscillatingDisplacements.size)
+        assertTrue("Expected crests above horizontal midline (displacement < 0)", oscillatingDisplacements.any { it < -0.10f })
+        assertTrue("Expected troughs below horizontal midline (displacement > 0)", oscillatingDisplacements.any { it > 0.10f })
+        assertTrue("Expected wave points above centerY", oscillatingYs.any { it < centerY })
+        assertTrue("Expected wave points below centerY", oscillatingYs.any { it > centerY })
+        for (i in 0 until oscillatingDisplacements.size - 1) {
+            assertTrue(
+                "Adjacent control points must alternate above and below centerY",
+                oscillatingDisplacements[i] * oscillatingDisplacements[i + 1] < 0f
+            )
+        }
+
+        // Advance active recording waveform with live microphone peaks and snapshot before pause
+        service.advanceRecordingWaveformBars(floatArrayOf(0.72f, 0.88f), isPaused = false)
+        val barsSnapshotBeforePause = service.currentWaveformBars.copyOf()
+        val displacementsBeforePause = service.computeOscillatingWaveDisplacements(barsSnapshotBeforePause)
+        assertTrue(barsSnapshotBeforePause.all { it > 0.10f })
+
+        // Attempt to advance while paused (must be a strict no-op, freezing exact oscillating wave shape)
+        service.advanceRecordingWaveformBars(floatArrayOf(0.0f, 0.0f), isPaused = true)
+        org.junit.Assert.assertArrayEquals(
+            barsSnapshotBeforePause,
+            service.currentWaveformBars,
+            0.0001f
+        )
 
         val pausedNotif = service.buildNotification(
             title = "Paused",
@@ -579,14 +678,104 @@ class ExampleRobolectricTest {
             isSkipSilence = false,
             isAwaitingSave = false
         )
-        assertEquals(3, pausedNotif.actions.size)
-        assertEquals("Resume", pausedNotif.actions[0].title.toString())
-        assertEquals("Stop & Save", pausedNotif.actions[1].title.toString())
-        assertEquals("Bookmark", pausedNotif.actions[2].title.toString())
-        assertTrue(pausedNotif.actions.none { it.title.toString().contains("Silence", ignoreCase = true) })
+        // Verify oscillating waveform remains 100% frozen in place upon pause and opacity dims to 40% (alpha = 102)
+        org.junit.Assert.assertArrayEquals(
+            barsSnapshotBeforePause,
+            service.currentWaveformBars,
+            0.0001f
+        )
+        org.junit.Assert.assertArrayEquals(
+            displacementsBeforePause,
+            service.lastRenderedOscillatingDisplacements,
+            0.0001f
+        )
+        assertEquals(
+            com.example.service.RecordingForegroundService.PAUSED_WAVEFORM_OPACITY,
+            service.lastRenderedWaveformOpacity,
+            0.001f
+        )
+        assertEquals(
+            com.example.service.RecordingForegroundService.PAUSED_WAVEFORM_ALPHA,
+            service.lastRenderedWaveformAlpha
+        )
+        assertTrue(pausedNotif.actions.isNullOrEmpty())
+        @Suppress("DEPRECATION")
+        org.junit.Assert.assertNull(pausedNotif.bigContentView)
+        @Suppress("DEPRECATION")
+        val inflatedPausedCard = pausedNotif.contentView.apply(context, android.widget.FrameLayout(context))
+        val pausedButtonLabel = inflatedPausedCard.findViewById<android.widget.TextView>(R.id.notif_action_pause_resume_text)
+        assertEquals("Resume", pausedButtonLabel?.text?.toString())
+        assertEquals(android.view.View.GONE, pausedButtonLabel?.visibility)
         org.junit.Assert.assertFalse(pausedNotif.extras.getBoolean(android.app.Notification.EXTRA_SHOW_CHRONOMETER))
         val pausedPlaybackState = service.lastRecordingPlaybackState
         assertEquals(android.media.session.PlaybackState.STATE_PAUSED, pausedPlaybackState?.state)
+
+        // Verify RecordingIslandOverlayManager foreground/background visibility & interactive mode transitions
+        com.example.service.RecordingIslandOverlayManager.onAppForegroundChanged(context, true)
+        org.junit.Assert.assertFalse(
+            "Overlay must be hidden while MainActivity is in foreground",
+            com.example.service.RecordingIslandOverlayManager.shouldDisplayOverlay()
+        )
+        com.example.service.RecordingIslandOverlayManager.onAppForegroundChanged(context, false)
+        assertTrue(
+            "Overlay must activate in Docked Pill mode when app moves to background",
+            com.example.service.RecordingIslandOverlayManager.shouldDisplayOverlay()
+        )
+        assertEquals(
+            com.example.service.RecordingIslandOverlayManager.OverlayMode.DOCKED_PILL,
+            com.example.service.RecordingIslandOverlayManager.currentMode
+        )
+        // Verify tapping the docked pill view expands it to EXPANDED_CARD
+        val dockedPillView = com.example.service.RecordingIslandOverlayManager.currentOverlayRootView
+        org.junit.Assert.assertNotNull(dockedPillView)
+        dockedPillView?.performClick()
+        assertEquals(
+            com.example.service.RecordingIslandOverlayManager.OverlayMode.EXPANDED_CARD,
+            com.example.service.RecordingIslandOverlayManager.currentMode
+        )
+        // Verify tapping outside the expanded card collapses it back to DOCKED_PILL
+        val expandedWrapperView = com.example.service.RecordingIslandOverlayManager.currentOverlayRootView
+        org.junit.Assert.assertNotNull(expandedWrapperView)
+        expandedWrapperView?.performClick()
+        assertEquals(
+            com.example.service.RecordingIslandOverlayManager.OverlayMode.DOCKED_PILL,
+            com.example.service.RecordingIslandOverlayManager.currentMode
+        )
+        com.example.service.RecordingIslandOverlayManager.handleHeaderTapOpenApp(context)
+        org.junit.Assert.assertFalse(com.example.service.RecordingIslandOverlayManager.shouldDisplayOverlay())
+
+        // Verify pressing Save dismisses the recording capsule completely and shows Save/Cancel confirmation
+        com.example.service.RecordingIslandOverlayManager.onAppForegroundChanged(context, false)
+        service.showAppendSaveConfirmation()
+        assertTrue(
+            "Confirmation state must be active when Save is pressed",
+            com.example.service.RecordingIslandOverlayManager.lastIsShowingAppendConfirm
+        )
+        val confirmOverlayRoot = com.example.service.RecordingIslandOverlayManager.currentOverlayRootView
+        org.junit.Assert.assertNotNull(confirmOverlayRoot)
+        org.junit.Assert.assertNull(
+            "Recording capsule waveform must disappear completely when Save is pressed",
+            confirmOverlayRoot?.findViewById<android.view.View>(R.id.notif_recording_waveform)
+        )
+        org.junit.Assert.assertNotNull(
+            "Cancel (Don't) button must be displayed in confirmation message",
+            confirmOverlayRoot?.findViewById<android.view.View>(R.id.notif_append_dont_button)
+        )
+        org.junit.Assert.assertNotNull(
+            "Save button must be displayed in confirmation message",
+            confirmOverlayRoot?.findViewById<android.view.View>(R.id.notif_append_save_button)
+        )
+        val appendConfirmNotif = service.buildAppendSaveConfirmationNotification()
+        org.junit.Assert.assertFalse(appendConfirmNotif.extras.getBoolean("miui.focus.enable", true))
+        assertTrue(appendConfirmNotif.extras.getString("miui.focus.param").orEmpty().contains("\"dismissIsland\":true"))
+
+        // Verify resuming recording continues smoothly from the frozen state without resetting prior bars
+        service.advanceRecordingWaveformBars(floatArrayOf(0.64f), isPaused = false)
+        assertEquals(
+            barsSnapshotBeforePause[1],
+            service.currentWaveformBars[0],
+            0.0001f
+        )
 
         // Verify Finished Recording Confirmation Capsule (Dynamic Island & Notification Shade):
         // Minimalist capsule displaying gradient-blended "Finished recording", Greek Omega (Ω) symbol, warm peach-orange theme color, and 0 action buttons
@@ -782,6 +971,9 @@ class ExampleRobolectricTest {
         // Verify HyperIsland compact actions array contains all 5 indices [0, 1, 2, 3, 4]
         val compactActions = playbackNotif.extras.getIntArray(android.app.Notification.EXTRA_COMPACT_ACTIONS)
         org.junit.Assert.assertArrayEquals(intArrayOf(0, 1, 2, 3, 4), compactActions)
+        // Verify MediaSession token is strictly preserved for playback notification (MediaStyle)
+        @Suppress("DEPRECATION")
+        org.junit.Assert.assertNotNull(playbackNotif.extras.getParcelable(android.app.Notification.EXTRA_MEDIA_SESSION))
 
         // 2. Verify Finished Confirmation notification is single-row compact (no MediaStyle seekbar), dismissible, and persistent
         val finishedNotif = service.buildFinishedNotification("Finished recording")

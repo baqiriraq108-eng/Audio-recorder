@@ -3,12 +3,13 @@
     android:id="@+id/notif_append_confirm_root"
     android:layout_width="match_parent"
     android:layout_height="wrap_content"
+    android:background="@drawable/bg_notif_recording_card"
     android:gravity="center_vertical"
     android:orientation="horizontal"
-    android:paddingStart="10dp"
-    android:paddingTop="6dp"
-    android:paddingEnd="10dp"
-    android:paddingBottom="6dp">
+    android:paddingStart="14dp"
+    android:paddingTop="12dp"
+    android:paddingEnd="14dp"
+    android:paddingBottom="12dp">
 
     <LinearLayout
         android:id="@+id/notif_append_dont_button"

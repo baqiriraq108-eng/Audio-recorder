@@ -1,6 +1,6 @@
 {
-  "summary": "خطة تعميم إشعار تأكيد الحفظ أو الرفض التفاعلي ليشمل التسجيلات الجديدة بالإضافة إلى استكمال التسجيلات، مع تغيير رمز زر الحفظ إلى رمز سيغما الإغريقي (Σ Save) بجانب رمز ثيتا للرفض (Θ Don't)، والحفاظ على رمز أوميغا (Ω) حصرياً لإشعار اكتمال الحفظ النهائي (Finished recording).",
-  "updatedAt": "2026-11-03T19:51:26.601610632Z",
+  "summary": "Revised implementation plan incorporating: (1) omitting setCustomBigContentView (keeping bigContentView = null) and standard builder.addAction rows so Android/HyperOS renders zero expand/collapse chevron arrows (^); (2) showing RecordingIslandOverlayManager exclusively when MainActivity moves to the background/Home Screen and hiding it when MainActivity is in the foreground; and (3) proactively prompting once for Settings.ACTION_MANAGE_OVERLAY_PERMISSION on first recording/backgrounding when overlay permission is not yet granted.",
+  "updatedAt": "2026-11-04T10:53:05.074430564Z",
   "requestFeedback": true,
   "userFacing": true
 }
