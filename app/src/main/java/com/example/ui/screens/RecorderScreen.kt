@@ -225,7 +225,8 @@ fun RecorderScreen(
     onToggleSkipSilence: (Boolean) -> Unit = {},
     onNavigateToSettings: () -> Unit = {},
     onRefreshAudioDevices: () -> Unit = {},
-    onPostMessage: (String) -> Unit
+    onPostMessage: (String) -> Unit,
+    statusBannerContent: @Composable () -> Unit = {}
 ) {
     val context = LocalContext.current
     var showResetConfirmDialog by remember { mutableStateOf(false) }
@@ -523,14 +524,27 @@ fun RecorderScreen(
             }
         }
 
-        // 3. Main Recording Controls Row (5 Action Buttons matching exact container sizes and state colors)
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(bottom = 12.dp),
-            horizontalArrangement = Arrangement.SpaceEvenly,
-            verticalAlignment = Alignment.CenterVertically
+        Column(
+            modifier = Modifier.fillMaxWidth()
         ) {
+            // Status Banner anchored strictly ABOVE the recording action controls (Zero overlap)
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .testTag("recorder_status_banner_anchor")
+            ) {
+                statusBannerContent()
+            }
+
+            // 3. Main Recording Controls Row (5 Action Buttons matching exact container sizes and state colors)
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(bottom = 12.dp)
+                    .testTag("controls_card_container"),
+                horizontalArrangement = Arrangement.SpaceEvenly,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
             // Button 1: Skip Silence Toggle Button (Far Left)
             // Disabled and grayed out when Silence Skip (both Smart & Manual) is turned OFF in Settings
             val canUseSilenceSkip = settings.silenceConfig.isConfiguredInSettings
@@ -705,6 +719,7 @@ fun RecorderScreen(
                     modifier = Modifier.size(22.dp)
                 )
             }
+            }
         }
     }
 
@@ -712,7 +727,7 @@ fun RecorderScreen(
         UnifiedTrashConfirmDialog(
             title = "Discard Recording?",
             message = "Are you sure you want to discard this active recording? All unsaved audio will be lost.",
-            confirmText = "Discard",
+            confirmText = "Confirm",
             onConfirm = {
                 onResetRecording()
                 showResetConfirmDialog = false

@@ -1128,7 +1128,7 @@ fun LibraryScreen(
             } else {
                 "Move '${target.title}' to the Trash? You can restore it later at any time from the Trash tab."
             },
-            confirmText = if (isTrash) "Delete Forever" else "Move to Trash",
+            confirmText = "Confirm",
             onConfirm = {
                 onDeleteRecording(target)
                 pendingDeleteRecording = null
@@ -1148,7 +1148,7 @@ fun LibraryScreen(
             } else {
                 "Move ${selectedIds.size} recording(s) to the Trash? You can restore them later from the Trash tab."
             },
-            confirmText = if (isTrash) "Delete Forever" else "Move to Trash",
+            confirmText = "Confirm",
             onConfirm = {
                 onDeleteSelected()
                 showDeleteSelectedConfirm = false
@@ -1163,7 +1163,7 @@ fun LibraryScreen(
         UnifiedTrashConfirmDialog(
             title = "Empty Trash?",
             message = "Are you sure you want to permanently delete all recordings in the Trash? This cannot be undone.",
-            confirmText = "Empty Trash",
+            confirmText = "Confirm",
             onConfirm = {
                 onEmptyTrash()
                 showEmptyTrashConfirm = false

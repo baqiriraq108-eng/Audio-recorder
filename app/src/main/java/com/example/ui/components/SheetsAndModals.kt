@@ -247,8 +247,8 @@ fun ExportWithoutSilenceDialog(
 ) {
     Dialog(onDismissRequest = onDismiss) {
         Surface(
-            shape = RoundedCornerShape(20.dp),
-            color = ElevatedSurface,
+            shape = RoundedCornerShape(24.dp),
+            color = WarmSecondarySurface,
             tonalElevation = 0.dp,
             modifier = Modifier
                 .fillMaxWidth()
@@ -270,7 +270,7 @@ fun ExportWithoutSilenceDialog(
                     Icon(
                         imageVector = if (state.isRunning) Icons.Default.IosShare else Icons.Default.CheckCircle,
                         contentDescription = "Silence export status",
-                        tint = if (state.isRunning) PeachAccent else SuccessSage,
+                        tint = if (state.isRunning) PrimaryText else SuccessSage,
                         modifier = Modifier.size(24.dp)
                     )
                 }
@@ -279,7 +279,10 @@ fun ExportWithoutSilenceDialog(
 
                 Text(
                     text = if (state.isRunning) "Exporting Without Silence…" else "Export Complete",
-                    style = MaterialTheme.typography.titleLarge,
+                    style = MaterialTheme.typography.titleLarge.copy(
+                        fontWeight = FontWeight.Bold,
+                        fontSize = 20.sp
+                    ),
                     color = PrimaryText,
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis
@@ -301,7 +304,7 @@ fun ExportWithoutSilenceDialog(
 
                 LinearProgressIndicator(
                     progress = { state.progress.coerceIn(0f, 1f) },
-                    color = if (state.isRunning) PeachAccent else SuccessSage,
+                    color = if (state.isRunning) PrimaryText else SuccessSage,
                     trackColor = ObsidianBackground,
                     strokeCap = StrokeCap.Round,
                     modifier = Modifier
@@ -315,26 +318,62 @@ fun ExportWithoutSilenceDialog(
                 Text(
                     text = "${(state.progress * 100).toInt()}%",
                     style = MaterialTheme.typography.labelSmall,
-                    color = PeachAccent,
+                    color = PrimaryText,
                     maxLines = 1
                 )
 
-                Spacer(modifier = Modifier.height(18.dp))
+                Spacer(modifier = Modifier.height(22.dp))
 
-                Button(
-                    onClick = onDismiss,
-                    shape = CircleShape,
-                    elevation = ButtonDefaults.buttonElevation(0.dp, 0.dp, 0.dp),
-                    colors = ButtonDefaults.buttonColors(
-                        containerColor = if (state.isRunning) ElevatedSurface else PeachAccent,
-                        contentColor = if (state.isRunning) PrimaryText else OnPeachAccent
-                    ),
-                    modifier = Modifier.fillMaxWidth().height(46.dp)
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(12.dp),
+                    verticalAlignment = Alignment.CenterVertically
                 ) {
-                    Text(
-                        text = if (state.isRunning) "Cancel" else "Done",
-                        maxLines = 1
-                    )
+                    Button(
+                        onClick = onDismiss,
+                        shape = CircleShape,
+                        elevation = ButtonDefaults.buttonElevation(0.dp, 0.dp, 0.dp),
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = TonalDarkBrown,
+                            contentColor = PrimaryText
+                        ),
+                        modifier = Modifier
+                            .weight(1f)
+                            .height(48.dp)
+                    ) {
+                        Text(
+                            text = "Cancel",
+                            style = MaterialTheme.typography.labelLarge.copy(
+                                fontWeight = FontWeight.SemiBold,
+                                fontSize = 15.sp
+                            ),
+                            color = PrimaryText,
+                            maxLines = 1
+                        )
+                    }
+
+                    Button(
+                        onClick = onDismiss,
+                        shape = CircleShape,
+                        elevation = ButtonDefaults.buttonElevation(0.dp, 0.dp, 0.dp),
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = TonalDarkBrown,
+                            contentColor = PrimaryText
+                        ),
+                        modifier = Modifier
+                            .weight(1f)
+                            .height(48.dp)
+                    ) {
+                        Text(
+                            text = "Confirm",
+                            style = MaterialTheme.typography.labelLarge.copy(
+                                fontWeight = FontWeight.SemiBold,
+                                fontSize = 15.sp
+                            ),
+                            color = PrimaryText,
+                            maxLines = 1
+                        )
+                    }
                 }
             }
         }
@@ -912,27 +951,44 @@ fun FormatConversionSheet(
                     ),
                     modifier = Modifier
                         .weight(1f)
-                        .height(50.dp)
+                        .height(48.dp)
                 ) {
-                    Text(if (state.isRunning) "Cancel Job" else "Close", maxLines = 1)
+                    Text(
+                        text = "Cancel",
+                        style = MaterialTheme.typography.labelLarge.copy(
+                            fontWeight = FontWeight.SemiBold,
+                            fontSize = 15.sp
+                        ),
+                        color = PrimaryText,
+                        maxLines = 1
+                    )
                 }
 
-                if (!state.isRunning) {
-                    Button(
-                        onClick = onStartConversion,
-                        shape = CircleShape,
-                        elevation = ButtonDefaults.buttonElevation(0.dp, 0.dp, 0.dp),
-                        colors = ButtonDefaults.buttonColors(
-                            containerColor = TonalDarkBrown,
-                            contentColor = PrimaryText
+                Button(
+                    onClick = { if (!state.isRunning) onStartConversion() },
+                    enabled = !state.isRunning,
+                    shape = CircleShape,
+                    elevation = ButtonDefaults.buttonElevation(0.dp, 0.dp, 0.dp),
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = TonalDarkBrown,
+                        contentColor = PrimaryText,
+                        disabledContainerColor = TonalDarkBrown.copy(alpha = 0.6f),
+                        disabledContentColor = PrimaryText.copy(alpha = 0.6f)
+                    ),
+                    modifier = Modifier
+                        .weight(1f)
+                        .height(48.dp)
+                        .testTag("start_conversion_button")
+                ) {
+                    Text(
+                        text = "Confirm",
+                        style = MaterialTheme.typography.labelLarge.copy(
+                            fontWeight = FontWeight.SemiBold,
+                            fontSize = 15.sp
                         ),
-                        modifier = Modifier
-                            .weight(1f)
-                            .height(50.dp)
-                            .testTag("start_conversion_button")
-                    ) {
-                        Text("Export Audio", maxLines = 1)
-                    }
+                        color = PrimaryText,
+                        maxLines = 1
+                    )
                 }
             }
             Spacer(modifier = Modifier.height(16.dp))
@@ -950,16 +1006,26 @@ fun EditRecordingDialog(
     var tags by remember(recording) { mutableStateOf(recording.tags) }
     var notes by remember(recording) { mutableStateOf(recording.notes) }
 
-    Dialog(onDismissRequest = onDismiss) {
+    Dialog(
+        onDismissRequest = onDismiss,
+        properties = DialogProperties(usePlatformDefaultWidth = false)
+    ) {
         Surface(
-            shape = RoundedCornerShape(20.dp),
-            color = ElevatedSurface,
-            modifier = Modifier.fillMaxWidth().graphicsLayer()
+            shape = RoundedCornerShape(24.dp),
+            color = WarmSecondarySurface,
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 24.dp)
+                .clip(RoundedCornerShape(24.dp))
+                .graphicsLayer()
         ) {
-            Column(modifier = Modifier.padding(24.dp)) {
+            Column(modifier = Modifier.padding(horizontal = 24.dp, vertical = 22.dp)) {
                 Text(
                     text = "Edit Recording Details",
-                    style = MaterialTheme.typography.titleLarge,
+                    style = MaterialTheme.typography.titleLarge.copy(
+                        fontWeight = FontWeight.Bold,
+                        fontSize = 20.sp
+                    ),
                     color = PrimaryText,
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis
@@ -972,8 +1038,10 @@ fun EditRecordingDialog(
                     singleLine = true,
                     shape = RoundedCornerShape(12.dp),
                     colors = OutlinedTextFieldDefaults.colors(
-                        focusedBorderColor = PeachAccent,
+                        focusedBorderColor = PrimaryText,
                         unfocusedBorderColor = androidx.compose.ui.graphics.Color.Transparent,
+                        focusedLabelColor = PrimaryText,
+                        unfocusedLabelColor = SecondaryText,
                         focusedTextColor = PrimaryText,
                         unfocusedTextColor = PrimaryText,
                         focusedContainerColor = ObsidianBackground,
@@ -989,8 +1057,10 @@ fun EditRecordingDialog(
                     singleLine = true,
                     shape = RoundedCornerShape(12.dp),
                     colors = OutlinedTextFieldDefaults.colors(
-                        focusedBorderColor = PeachAccent,
+                        focusedBorderColor = PrimaryText,
                         unfocusedBorderColor = androidx.compose.ui.graphics.Color.Transparent,
+                        focusedLabelColor = PrimaryText,
+                        unfocusedLabelColor = SecondaryText,
                         focusedTextColor = PrimaryText,
                         unfocusedTextColor = PrimaryText,
                         focusedContainerColor = ObsidianBackground,
@@ -1007,8 +1077,10 @@ fun EditRecordingDialog(
                     maxLines = 3,
                     shape = RoundedCornerShape(12.dp),
                     colors = OutlinedTextFieldDefaults.colors(
-                        focusedBorderColor = PeachAccent,
+                        focusedBorderColor = PrimaryText,
                         unfocusedBorderColor = androidx.compose.ui.graphics.Color.Transparent,
+                        focusedLabelColor = PrimaryText,
+                        unfocusedLabelColor = SecondaryText,
                         focusedTextColor = PrimaryText,
                         unfocusedTextColor = PrimaryText,
                         focusedContainerColor = ObsidianBackground,
@@ -1016,31 +1088,55 @@ fun EditRecordingDialog(
                     ),
                     modifier = Modifier.fillMaxWidth()
                 )
-                Spacer(modifier = Modifier.height(18.dp))
-                Row(horizontalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.fillMaxWidth()) {
+                Spacer(modifier = Modifier.height(22.dp))
+                Row(
+                    horizontalArrangement = Arrangement.spacedBy(12.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    modifier = Modifier.fillMaxWidth()
+                ) {
                     Button(
                         onClick = onDismiss,
                         shape = CircleShape,
                         elevation = ButtonDefaults.buttonElevation(0.dp, 0.dp, 0.dp),
                         colors = ButtonDefaults.buttonColors(
-                            containerColor = ObsidianBackground,
-                            contentColor = SecondaryText
+                            containerColor = TonalDarkBrown,
+                            contentColor = PrimaryText
                         ),
-                        modifier = Modifier.weight(1f).height(46.dp)
+                        modifier = Modifier
+                            .weight(1f)
+                            .height(48.dp)
                     ) {
-                        Text("Cancel", maxLines = 1)
+                        Text(
+                            text = "Cancel",
+                            style = MaterialTheme.typography.labelLarge.copy(
+                                fontWeight = FontWeight.SemiBold,
+                                fontSize = 15.sp
+                            ),
+                            color = PrimaryText,
+                            maxLines = 1
+                        )
                     }
                     Button(
                         onClick = { onConfirm(title, tags, notes) },
                         shape = CircleShape,
                         elevation = ButtonDefaults.buttonElevation(0.dp, 0.dp, 0.dp),
                         colors = ButtonDefaults.buttonColors(
-                            containerColor = PeachAccent,
-                            contentColor = OnPeachAccent
+                            containerColor = TonalDarkBrown,
+                            contentColor = PrimaryText
                         ),
-                        modifier = Modifier.weight(1f).height(46.dp)
+                        modifier = Modifier
+                            .weight(1f)
+                            .height(48.dp)
                     ) {
-                        Text("Save", maxLines = 1)
+                        Text(
+                            text = "Confirm",
+                            style = MaterialTheme.typography.labelLarge.copy(
+                                fontWeight = FontWeight.SemiBold,
+                                fontSize = 15.sp
+                            ),
+                            color = PrimaryText,
+                            maxLines = 1
+                        )
                     }
                 }
             }
@@ -1218,13 +1314,13 @@ val OutlinedDeleteSweepIcon: ImageVector by lazy {
 fun UnifiedTrashConfirmDialog(
     title: String,
     message: String,
-    confirmText: String,
+    confirmText: String = "Confirm",
     onConfirm: () -> Unit,
     onDismiss: () -> Unit,
     icon: ImageVector = Icons.Default.DeleteOutline,
     dialogTestTag: String? = null
 ) {
-    val resolvedIconTint = if (icon === OutlinedDeleteSweepIcon) Color.Unspecified else PeachAccent
+    val resolvedIconTint = if (icon === OutlinedDeleteSweepIcon) Color.Unspecified else PrimaryText
     Dialog(
         onDismissRequest = onDismiss,
         properties = DialogProperties(usePlatformDefaultWidth = false)
@@ -1297,19 +1393,22 @@ fun UnifiedTrashConfirmDialog(
                             .weight(1f)
                             .height(48.dp)
                             .clip(CircleShape)
-                            .background(ElevatedSurface)
+                            .background(TonalDarkBrown)
                             .m3PressScale(
                                 shape = CircleShape,
                                 onClick = onDismiss
                             )
+                            .testTag("unified_dialog_cancel_button")
                     ) {
                         Text(
                             text = "Cancel",
                             style = MaterialTheme.typography.labelLarge.copy(
-                                fontWeight = FontWeight.Medium,
+                                fontWeight = FontWeight.SemiBold,
                                 fontSize = 15.sp
                             ),
-                            color = PrimaryText
+                            color = PrimaryText,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
                         )
                     }
 
@@ -1319,35 +1418,23 @@ fun UnifiedTrashConfirmDialog(
                             .weight(1f)
                             .height(48.dp)
                             .clip(CircleShape)
-                            .background(ElevatedSurface)
+                            .background(TonalDarkBrown)
                             .m3PressScale(
                                 shape = CircleShape,
                                 onClick = onConfirm
                             )
+                            .testTag("unified_dialog_confirm_button")
                     ) {
-                        Row(
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.Center,
-                            modifier = Modifier.padding(horizontal = 10.dp)
-                        ) {
-                            Icon(
-                                imageVector = icon,
-                                contentDescription = null,
-                                tint = resolvedIconTint,
-                                modifier = Modifier.size(18.dp)
-                            )
-                            Spacer(modifier = Modifier.width(6.dp))
-                            Text(
-                                text = confirmText,
-                                style = MaterialTheme.typography.labelLarge.copy(
-                                    fontWeight = FontWeight.Bold,
-                                    fontSize = 15.sp
-                                ),
-                                color = PeachAccent,
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis
-                            )
-                        }
+                        Text(
+                            text = "Confirm",
+                            style = MaterialTheme.typography.labelLarge.copy(
+                                fontWeight = FontWeight.SemiBold,
+                                fontSize = 15.sp
+                            ),
+                            color = PrimaryText,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
                     }
                 }
             }

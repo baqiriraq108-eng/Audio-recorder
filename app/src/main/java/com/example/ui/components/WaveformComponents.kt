@@ -34,6 +34,7 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.PathEffect
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.style.TextOverflow
@@ -155,22 +156,26 @@ fun StudioInteractiveWaveform(
             .fillMaxWidth()
             .clip(RoundedCornerShape(16.dp))
             .background(WarmSecondarySurface)
-            .padding(16.dp)
+            .padding(horizontal = 16.dp, vertical = 16.dp)
+            .graphicsLayer { clip = false }
     ) {
         // Seamless borderless waveform viewport merging directly into Surface Container (#221B17)
+        // Unclipped so the circular thumb handle (9dp outer radius) remains 100% visible at 0% and 100% edges
         Box(
             modifier = Modifier
                 .fillMaxWidth()
                 .height(136.dp)
-                .clip(RoundedCornerShape(12.dp))
                 .background(WarmSecondarySurface)
+                .graphicsLayer { clip = false }
                 .testTag("waveform_canvas_viewport")
                 .pointerInput(isRecording, totalDur, isTrimMode) {
                     if (!isRecording && totalDur > 0L) {
                         detectTapGestures { offset ->
-                            val fraction = (offset.x / size.width.toFloat()).coerceIn(0f, 1f)
+                            val thumbInsetPx = 12.dp.toPx()
+                            val usableTrackWidth = (size.width.toFloat() - thumbInsetPx * 2f).coerceAtLeast(1f)
+                            val fraction = ((offset.x - thumbInsetPx) / usableTrackWidth).coerceIn(0f, 1f)
                             if (isTrimMode && currentTrimCallback != null) {
-                                val handleTolerance = (24.dp.toPx() / size.width.toFloat()).coerceIn(0.04f, 0.12f)
+                                val handleTolerance = (24.dp.toPx() / usableTrackWidth).coerceIn(0.04f, 0.12f)
                                 val distToStart = kotlin.math.abs(fraction - currentTrimStart)
                                 val distToEnd = kotlin.math.abs(fraction - currentTrimEnd)
                                 if (distToStart <= handleTolerance || distToEnd <= handleTolerance) {
@@ -198,9 +203,11 @@ fun StudioInteractiveWaveform(
                         var dragMode = 0 // 0 = playhead cursor, 1 = start handle, 2 = end handle
                         detectHorizontalDragGestures(
                             onDragStart = { startOffset ->
-                                val fraction = (startOffset.x / size.width.toFloat()).coerceIn(0f, 1f)
+                                val thumbInsetPx = 12.dp.toPx()
+                                val usableTrackWidth = (size.width.toFloat() - thumbInsetPx * 2f).coerceAtLeast(1f)
+                                val fraction = ((startOffset.x - thumbInsetPx) / usableTrackWidth).coerceIn(0f, 1f)
                                 if (isTrimMode && currentTrimCallback != null) {
-                                    val handleTolerance = (24.dp.toPx() / size.width.toFloat()).coerceIn(0.04f, 0.12f)
+                                    val handleTolerance = (24.dp.toPx() / usableTrackWidth).coerceIn(0.04f, 0.12f)
                                     val distStart = kotlin.math.abs(fraction - currentTrimStart)
                                     val distEnd = kotlin.math.abs(fraction - currentTrimEnd)
                                     dragMode = when {
@@ -214,7 +221,9 @@ fun StudioInteractiveWaveform(
                             },
                             onHorizontalDrag = { change, _ ->
                                 change.consume()
-                                val fraction = (change.position.x / size.width.toFloat()).coerceIn(0f, 1f)
+                                val thumbInsetPx = 12.dp.toPx()
+                                val usableTrackWidth = (size.width.toFloat() - thumbInsetPx * 2f).coerceAtLeast(1f)
+                                val fraction = ((change.position.x - thumbInsetPx) / usableTrackWidth).coerceIn(0f, 1f)
                                 if (isTrimMode && currentTrimCallback != null) {
                                     when (dragMode) {
                                         1 -> {
@@ -240,16 +249,32 @@ fun StudioInteractiveWaveform(
                     }
                 }
         ) {
-            Canvas(modifier = Modifier.fillMaxSize().padding(horizontal = 4.dp, vertical = 10.dp)) {
+            Canvas(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .padding(vertical = 10.dp)
+                    .graphicsLayer { clip = false }
+            ) {
                 val canvasWidth = size.width
                 val canvasHeight = size.height
                 val centerY = canvasHeight / 2f
 
+                // Reserve full horizontal clearance (12dp >= 9dp outer thumb radius) at both start and end edges
+                val horizontalThumbInset = 12.dp.toPx()
+                val availableTrackWidth = (canvasWidth - horizontalThumbInset * 2f).coerceAtLeast(1f)
+                val barWidth = 3.dp.toPx()
+                val barSpacing = 2.dp.toPx()
+                val step = barWidth + barSpacing
+                val barCount = (availableTrackWidth / step).toInt().coerceIn(20, 96)
+                val totalOccupiedWidth = (barCount * barWidth + (barCount - 1) * barSpacing).coerceAtLeast(1f)
+                val startOffsetX = ((canvasWidth - totalOccupiedWidth) / 2f).coerceAtLeast(horizontalThumbInset)
+                val trackEndX = startOffsetX + totalOccupiedWidth
+
                 // Subtle center baseline guide in muted bar color (#382B24)
                 drawLine(
                     color = WaveformInactiveBar,
-                    start = Offset(0f, centerY),
-                    end = Offset(canvasWidth, centerY),
+                    start = Offset(startOffsetX, centerY),
+                    end = Offset(trackEndX, centerY),
                     strokeWidth = 1.dp.toPx()
                 )
 
@@ -259,33 +284,27 @@ fun StudioInteractiveWaveform(
                     val dashEffect = PathEffect.dashPathEffect(floatArrayOf(8f, 8f), 0f)
                     drawLine(
                         color = WaveformPlayhead.copy(alpha = 0.35f),
-                        start = Offset(0f, centerY - threshOffset),
-                        end = Offset(canvasWidth, centerY - threshOffset),
+                        start = Offset(startOffsetX, centerY - threshOffset),
+                        end = Offset(trackEndX, centerY - threshOffset),
                         strokeWidth = 1.dp.toPx(),
                         pathEffect = dashEffect
                     )
                     drawLine(
                         color = WaveformPlayhead.copy(alpha = 0.35f),
-                        start = Offset(0f, centerY + threshOffset),
-                        end = Offset(canvasWidth, centerY + threshOffset),
+                        start = Offset(startOffsetX, centerY + threshOffset),
+                        end = Offset(trackEndX, centerY + threshOffset),
                         strokeWidth = 1.dp.toPx(),
                         pathEffect = dashEffect
                     )
                 }
 
-                val barWidth = 3.dp.toPx()
-                val barSpacing = 2.dp.toPx()
-                val step = barWidth + barSpacing
-                val barCount = (canvasWidth / step).toInt().coerceIn(24, 96)
-                val totalOccupiedWidth = (barCount * barWidth + (barCount - 1) * barSpacing).coerceAtLeast(1f)
-                val startOffsetX = ((canvasWidth - totalOccupiedWidth) / 2f).coerceAtLeast(0f)
                 val cursorX = (startOffsetX + animatedProgress * totalOccupiedWidth)
-                    .coerceIn(startOffsetX, startOffsetX + totalOccupiedWidth)
+                    .coerceIn(startOffsetX, trackEndX)
 
                 val trimStartX = (startOffsetX + currentTrimStart * totalOccupiedWidth)
-                    .coerceIn(startOffsetX, startOffsetX + totalOccupiedWidth)
+                    .coerceIn(startOffsetX, trackEndX)
                 val trimEndX = (startOffsetX + currentTrimEnd * totalOccupiedWidth)
-                    .coerceIn(trimStartX, startOffsetX + totalOccupiedWidth)
+                    .coerceIn(trimStartX, trackEndX)
 
                 for (i in 0 until barCount) {
                     val hasRecordedData = if (isRecording) {
@@ -411,7 +430,7 @@ fun StudioInteractiveWaveform(
                 }
 
                 // Primary Playhead / Scrubbing Cursor & Knob
-                val activeCursorX = if (isRecording) canvasWidth - 4.dp.toPx() else cursorX
+                val activeCursorX = if (isRecording) trackEndX else cursorX
                 drawLine(
                     brush = Brush.verticalGradient(
                         colors = listOf(

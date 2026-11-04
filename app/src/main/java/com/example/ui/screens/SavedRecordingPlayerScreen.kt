@@ -116,7 +116,8 @@ fun SavedRecordingPlayerScreen(
     onToggleSkipSilence: (Boolean) -> Unit,
     onExportWithoutSilence: (RecordingEntity) -> Unit,
     onTrimRecording: (RecordingEntity, Long, Long, Boolean) -> Unit = { _, _, _, _ -> },
-    onOpenExportConversion: (RecordingEntity) -> Unit = {}
+    onOpenExportConversion: (RecordingEntity) -> Unit = {},
+    statusBannerContent: @Composable () -> Unit = {}
 ) {
     BackHandler(onBack = onClosePlayer)
 
@@ -357,14 +358,27 @@ fun SavedRecordingPlayerScreen(
 
         Spacer(modifier = Modifier.height(14.dp))
 
-        // 3. Dedicated Player Controls Card (Borderless 16.dp Surface Container #221B17)
         Column(
-            modifier = Modifier
-                .fillMaxWidth()
-                .clip(RoundedCornerShape(16.dp))
-                .background(WarmSecondarySurface)
-                .padding(16.dp)
+            modifier = Modifier.fillMaxWidth()
         ) {
+            // Status Banner anchored strictly ABOVE the controls card container (Zero overlap)
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .testTag("player_status_banner_anchor")
+            ) {
+                statusBannerContent()
+            }
+
+            // 3. Dedicated Player Controls Card (Borderless 16.dp Surface Container #221B17)
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(16.dp))
+                    .background(WarmSecondarySurface)
+                    .padding(16.dp)
+                    .testTag("controls_card_container")
+            ) {
             // Primary Transport & Action Row (5 controls)
             Row(
                 modifier = Modifier.fillMaxWidth(),
@@ -759,6 +773,7 @@ fun SavedRecordingPlayerScreen(
                     }
                 }
             }
+        }
         }
     }
 

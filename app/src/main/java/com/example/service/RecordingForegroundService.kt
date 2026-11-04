@@ -29,6 +29,7 @@ class RecordingForegroundService : Service() {
     private var isSkipSilenceActive: Boolean = false
     private var isAppendingSession: Boolean = false
     private var isShowingAppendSaveConfirmation: Boolean = false
+    private var hasEmittedFinishedConfirmation: Boolean = false
     private var sessionStartTimeMs: Long = System.currentTimeMillis()
     private var pauseStartedAtMs: Long = 0L
     private var accumulatedPausedMs: Long = 0L
@@ -373,6 +374,8 @@ class RecordingForegroundService : Service() {
 
     internal fun handleRecordingResumeFromNotification() {
         val now = System.currentTimeMillis()
+        isShowingAppendSaveConfirmation = false
+        hasEmittedFinishedConfirmation = false
         if (isPausedState) {
             isPausedState = false
             if (pauseStartedAtMs > 0L) {
@@ -721,6 +724,7 @@ class RecordingForegroundService : Service() {
             ACTION_START_FOREGROUND -> {
                 isPlaybackMode = false
                 isShowingAppendSaveConfirmation = false
+                hasEmittedFinishedConfirmation = false
                 currentTitle = intent.getStringExtra(EXTRA_TITLE)?.takeIf { it.isNotBlank() } ?: "Recording"
                 currentStatus = intent.getStringExtra(EXTRA_STATUS).orEmpty()
                 isPausedState = intent.getBooleanExtra(EXTRA_IS_PAUSED, false)
@@ -765,12 +769,15 @@ class RecordingForegroundService : Service() {
 
             ACTION_UPDATE_NOTIFICATION -> {
                 isPlaybackMode = false
+                val clearConfirm = intent.getBooleanExtra(EXTRA_CLEAR_APPEND_CONFIRMATION, false)
+                if (clearConfirm) {
+                    isShowingAppendSaveConfirmation = false
+                }
                 val previousPaused = isPausedState
                 currentTitle = intent.getStringExtra(EXTRA_TITLE)?.takeIf { it.isNotBlank() } ?: currentTitle
                 currentStatus = intent.getStringExtra(EXTRA_STATUS) ?: currentStatus
-                isPausedState = intent.getBooleanExtra(EXTRA_IS_PAUSED, isPausedState)
-                if (!isPausedState) {
-                    isShowingAppendSaveConfirmation = false
+                if (!isShowingAppendSaveConfirmation) {
+                    isPausedState = intent.getBooleanExtra(EXTRA_IS_PAUSED, isPausedState)
                 }
                 if (intent.hasExtra(EXTRA_IS_SKIP_SILENCE_ACTIVE)) {
                     isSkipSilenceActive = intent.getBooleanExtra(EXTRA_IS_SKIP_SILENCE_ACTIVE, isSkipSilenceActive)
@@ -1361,6 +1368,7 @@ class RecordingForegroundService : Service() {
      */
     fun showAppendSaveConfirmation() {
         isShowingAppendSaveConfirmation = true
+        hasEmittedFinishedConfirmation = false
         isPausedState = true
 
         try {
@@ -1457,7 +1465,7 @@ class RecordingForegroundService : Service() {
         ).build()
 
         builder
-            .setSmallIcon(R.drawable.ic_notif_greek_sigma)
+            .setSmallIcon(R.drawable.ic_notif_finished_check)
             .setContentTitle(blendedSaveLabel)
             .setContentText("")
             .setContentIntent(pendingOpen)
@@ -1493,7 +1501,11 @@ class RecordingForegroundService : Service() {
 
     fun showFinishedSavedConfirmation(title: String = getString(R.string.notification_finished_recording)) {
         isShowingAppendSaveConfirmation = false
-        RecordingIslandOverlayManager.dismissAndReset()
+        RecordingIslandOverlayManager.showFinishedCompletionOverlay(this, title)
+        if (hasEmittedFinishedConfirmation) {
+            return
+        }
+        hasEmittedFinishedConfirmation = true
         releaseWakeLock()
 
         try {
@@ -1673,7 +1685,9 @@ class RecordingForegroundService : Service() {
     }
 
     override fun onDestroy() {
-        RecordingIslandOverlayManager.dismissAndReset()
+        if (!RecordingIslandOverlayManager.lastIsShowingFinishedCompletion) {
+            RecordingIslandOverlayManager.dismissAndReset()
+        }
         releaseWakeLock()
         try {
             mediaSession?.isActive = false
@@ -1739,6 +1753,7 @@ class RecordingForegroundService : Service() {
         const val EXTRA_IS_SKIP_SILENCE_ACTIVE = "extra_is_skip_silence_active"
         const val EXTRA_IS_APPENDING = "extra_is_appending"
         const val EXTRA_AWAITING_SAVE = "extra_awaiting_save"
+        const val EXTRA_CLEAR_APPEND_CONFIRMATION = "extra_clear_append_confirmation"
         const val EXTRA_RECORDING_ELAPSED_MS = "extra_recording_elapsed_ms"
         const val EXTRA_WAVEFORM_PEAKS = "extra_waveform_peaks"
         const val EXTRA_HIDE_CAST_BUTTON = "android.media.extra.HIDE_CAST_BUTTON"

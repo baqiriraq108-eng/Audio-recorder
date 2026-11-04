@@ -97,6 +97,7 @@ import com.example.data.DriveFolderItem
 import com.example.data.DriveQuotaInfo
 import com.example.data.GoogleDriveAuthStepResult
 import com.example.ui.components.ImportCloudWithArrowIcon
+import com.example.ui.components.UnifiedTrashConfirmDialog
 import com.example.ui.components.UploadCloudWithArrowIcon
 import com.example.data.RecorderSettings
 import com.example.data.RecordingEntity
@@ -1371,48 +1372,17 @@ fun StorageScreen(
 
     // Confirmation Dialog before Disconnecting
     if (showDisconnectConfirmDialog) {
-        AlertDialog(
-            onDismissRequest = { showDisconnectConfirmDialog = false },
-            containerColor = ElevatedSurface,
-            shape = RoundedCornerShape(20.dp),
-            title = {
-                Text(
-                    text = "Disconnect Account",
-                    style = MaterialTheme.typography.titleLarge.copy(fontWeight = FontWeight.Bold),
-                    color = PrimaryText
-                )
+        UnifiedTrashConfirmDialog(
+            title = "Disconnect Account?",
+            message = "Are you sure you want to disconnect ${settings.driveAccountEmail}? Your local recordings will remain on this device, and you can reconnect or switch accounts at any time.",
+            confirmText = "Confirm",
+            onConfirm = {
+                showDisconnectConfirmDialog = false
+                showAccountSheet = false
+                onDisconnectDrive()
             },
-            text = {
-                Text(
-                    text = "Are you sure you want to disconnect ${settings.driveAccountEmail}? Your local recordings will remain on this device, and you can reconnect or switch accounts at any time.",
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = SecondaryText
-                )
-            },
-            confirmButton = {
-                TextButton(
-                    onClick = {
-                        showDisconnectConfirmDialog = false
-                        showAccountSheet = false
-                        onDisconnectDrive()
-                    }
-                ) {
-                    Text(
-                        text = "Disconnect",
-                        style = MaterialTheme.typography.labelLarge.copy(fontWeight = FontWeight.Bold),
-                        color = DestructiveCrimson
-                    )
-                }
-            },
-            dismissButton = {
-                TextButton(onClick = { showDisconnectConfirmDialog = false }) {
-                    Text(
-                        text = "Cancel",
-                        style = MaterialTheme.typography.labelLarge,
-                        color = PrimaryText
-                    )
-                }
-            }
+            onDismiss = { showDisconnectConfirmDialog = false },
+            icon = Icons.Default.CloudOff
         )
     }
 

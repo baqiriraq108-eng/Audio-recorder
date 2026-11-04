@@ -997,7 +997,7 @@ private fun RecordingEncoderModalDialog(
 
             Spacer(modifier = Modifier.height(20.dp))
 
-            // Internal Reset & OK Action Buttons (Matched to Export & Convert Audio sheet buttons)
+            // Unified Cancel & Confirm Action Buttons (48.dp, TonalDarkBrown, PrimaryText)
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.spacedBy(12.dp),
@@ -1023,12 +1023,16 @@ private fun RecordingEncoderModalDialog(
                     ),
                     modifier = Modifier
                         .weight(1f)
-                        .height(50.dp)
+                        .height(48.dp)
                         .testTag("encoder_modal_reset_button")
                 ) {
                     Text(
-                        text = "Reset",
-                        style = MaterialTheme.typography.labelLarge.copy(fontWeight = FontWeight.Bold),
+                        text = "Cancel",
+                        style = MaterialTheme.typography.labelLarge.copy(
+                            fontWeight = FontWeight.SemiBold,
+                            fontSize = 15.sp
+                        ),
+                        color = PrimaryText,
                         maxLines = 1
                     )
                 }
@@ -1043,12 +1047,16 @@ private fun RecordingEncoderModalDialog(
                     ),
                     modifier = Modifier
                         .weight(1f)
-                        .height(50.dp)
+                        .height(48.dp)
                         .testTag("encoder_modal_ok_button")
                 ) {
                     Text(
-                        text = "OK",
-                        style = MaterialTheme.typography.labelLarge.copy(fontWeight = FontWeight.Bold),
+                        text = "Confirm",
+                        style = MaterialTheme.typography.labelLarge.copy(
+                            fontWeight = FontWeight.SemiBold,
+                            fontSize = 15.sp
+                        ),
+                        color = PrimaryText,
                         maxLines = 1
                     )
                 }

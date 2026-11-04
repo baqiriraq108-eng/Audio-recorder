@@ -1,6 +1,6 @@
 {
-  "summary": "Architectural implementation plan to refine the notification shade recording card (3 identical buttons, timer, Recording word, mic icon, zero waveform), preserve the Dynamic Island overlay completely without touching its waveform, ensure seamless transition to Save/Cancel confirmation card, and open app on tapping expanded capsule.",
-  "updatedAt": "2026-11-04T12:22:34.540450634Z",
+  "summary": "Implementation plan to fix (1) completion capsule flickering on the home screen by updating the existing WindowManager overlay view in-place with a smooth crossfade and deduplicating completion emissions, and (2) status banner overlap by anchoring the status banner strictly above the controls card container with a 12dp bottom separation margin across playback, trim, and recording screens.",
+  "updatedAt": "2026-11-04T22:13:18.570790507Z",
   "requestFeedback": true,
   "userFacing": true
 }

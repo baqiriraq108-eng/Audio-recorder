@@ -776,6 +776,8 @@ class ExampleRobolectricTest {
             confirmOverlayRoot?.findViewById<android.view.View>(R.id.notif_append_save_button)
         )
         val appendConfirmNotif = service.buildAppendSaveConfirmationNotification()
+        assertEquals(R.drawable.ic_notif_finished_check, appendConfirmNotif.smallIcon.resId)
+        assertEquals("Σ Save", appendConfirmNotif.actions[1].title.toString())
         org.junit.Assert.assertFalse(appendConfirmNotif.extras.getBoolean("miui.focus.enable", true))
         assertTrue(appendConfirmNotif.extras.getString("miui.focus.param").orEmpty().contains("\"dismissIsland\":true"))
 
@@ -789,6 +791,21 @@ class ExampleRobolectricTest {
 
         // Verify Finished Recording Confirmation Capsule (Dynamic Island & Notification Shade):
         // Minimalist capsule displaying gradient-blended "Finished recording", Greek Omega (Ω) symbol, warm peach-orange theme color, and 0 action buttons
+        service.showFinishedSavedConfirmation("Finished recording")
+        assertTrue(
+            "Finished completion capsule must appear on active screen simultaneously with notification",
+            com.example.service.RecordingIslandOverlayManager.lastIsShowingFinishedCompletion
+        )
+        val finishedOverlayRoot = com.example.service.RecordingIslandOverlayManager.currentOverlayRootView
+        org.junit.Assert.assertNotNull(finishedOverlayRoot)
+        assertEquals(
+            "Finished recording",
+            finishedOverlayRoot?.findViewById<android.widget.TextView>(R.id.notif_finished_title)?.text?.toString()
+        )
+        // Verify tapping outside dismisses the finished completion capsule
+        finishedOverlayRoot?.performClick()
+        org.junit.Assert.assertFalse(com.example.service.RecordingIslandOverlayManager.lastIsShowingFinishedCompletion)
+
         val finishedNotif = service.buildFinishedNotification("Finished recording")
         assertEquals("Finished recording", finishedNotif.extras.getCharSequence(android.app.Notification.EXTRA_TITLE)?.toString())
         org.junit.Assert.assertNull(finishedNotif.actions)

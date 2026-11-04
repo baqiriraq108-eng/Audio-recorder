@@ -565,12 +565,14 @@ class RecorderViewModel(application: Application) : AndroidViewModel(application
 
     fun resumeRecording() {
         if (_recordingStatus.value == RecordingStatus.PAUSED) {
+            _showAppendSaveConfirmDialog.value = false
             audioEngine.resumeRecording()
             _recordingStatus.value = RecordingStatus.RECORDING
             updateForegroundServiceNotification(
                 title = "Recording",
                 status = "",
-                isPaused = false
+                isPaused = false,
+                clearAppendConfirmation = true
             )
         }
     }
@@ -611,7 +613,7 @@ class RecorderViewModel(application: Application) : AndroidViewModel(application
 
     fun dismissAppendSaveConfirmDialog() {
         _showAppendSaveConfirmDialog.value = false
-        syncForegroundNotificationIfRecording()
+        syncForegroundNotificationIfRecording(clearAppendConfirmation = true)
     }
 
     fun confirmAppendAndMergeRecording() {
@@ -2798,7 +2800,7 @@ class RecorderViewModel(application: Application) : AndroidViewModel(application
         }
     }
 
-    private fun syncForegroundNotificationIfRecording() {
+    private fun syncForegroundNotificationIfRecording(clearAppendConfirmation: Boolean = false) {
         val currentStatus = _recordingStatus.value
         if (currentStatus == RecordingStatus.RECORDING || currentStatus == RecordingStatus.PAUSED) {
             val isPaused = currentStatus == RecordingStatus.PAUSED
@@ -2810,7 +2812,8 @@ class RecorderViewModel(application: Application) : AndroidViewModel(application
             updateForegroundServiceNotification(
                 title = title,
                 status = "",
-                isPaused = isPaused
+                isPaused = isPaused,
+                clearAppendConfirmation = clearAppendConfirmation
             )
         }
     }
@@ -2845,7 +2848,8 @@ class RecorderViewModel(application: Application) : AndroidViewModel(application
         status: String,
         isPaused: Boolean = false,
         elapsedMs: Long = ((_appendTarget.value?.durationMs ?: 0L) + audioEngine.elapsedMs.value).coerceAtLeast(0L),
-        waveformPeaks: FloatArray? = null
+        waveformPeaks: FloatArray? = null,
+        clearAppendConfirmation: Boolean = false
     ) {
         try {
             val context = getApplication<Application>()
@@ -2856,6 +2860,7 @@ class RecorderViewModel(application: Application) : AndroidViewModel(application
                 putExtra(RecordingForegroundService.EXTRA_IS_PAUSED, isPaused)
                 putExtra(RecordingForegroundService.EXTRA_IS_APPENDING, _appendTarget.value != null)
                 putExtra(RecordingForegroundService.EXTRA_RECORDING_ELAPSED_MS, elapsedMs)
+                putExtra(RecordingForegroundService.EXTRA_CLEAR_APPEND_CONFIRMATION, clearAppendConfirmation)
                 if (!isPaused && waveformPeaks != null && waveformPeaks.isNotEmpty()) {
                     putExtra(RecordingForegroundService.EXTRA_WAVEFORM_PEAKS, waveformPeaks)
                 }
@@ -2881,6 +2886,14 @@ class RecorderViewModel(application: Application) : AndroidViewModel(application
     private fun showSavedConfirmationNotification(title: String = "Finished recording") {
         try {
             val context = getApplication<Application>()
+            if (com.example.service.RecordingIslandOverlayManager.lastIsShowingFinishedCompletion) {
+                return
+            }
+            if (com.example.service.RecordingIslandOverlayManager.isRecordingSessionActive ||
+                com.example.service.RecordingIslandOverlayManager.lastIsShowingAppendConfirm
+            ) {
+                com.example.service.RecordingIslandOverlayManager.showFinishedCompletionOverlay(context, title)
+            }
             val intent = Intent(context, RecordingForegroundService::class.java).apply {
                 action = RecordingForegroundService.ACTION_SHOW_SAVED_CONFIRMATION
                 putExtra(RecordingForegroundService.EXTRA_TITLE, title)

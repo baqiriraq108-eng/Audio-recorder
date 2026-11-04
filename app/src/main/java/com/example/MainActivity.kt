@@ -281,21 +281,13 @@ fun AudioRecorderStudioApp(viewModel: RecorderViewModel) {
             contentWindowInsets = WindowInsets.safeDrawing,
             containerColor = ObsidianBackground,
             snackbarHost = {
-                SnackbarHost(hostState = snackbarHostState) { data ->
-                    Snackbar(
-                        shape = RoundedCornerShape(14.dp),
-                        containerColor = ElevatedSurface,
-                        contentColor = PrimaryText,
-                        actionContentColor = PeachAccent,
-                        modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp)
-                    ) {
-                        Text(
-                            text = data.visuals.message,
-                            style = MaterialTheme.typography.bodyMedium,
-                            maxLines = 2,
-                            overflow = TextOverflow.Ellipsis
-                        )
-                    }
+                if (openedPlayerRecording == null && currentDestination != AppDestination.RECORDER) {
+                    StudioAnchoredStatusBanner(
+                        snackbarHostState = snackbarHostState,
+                        modifier = Modifier
+                            .padding(horizontal = 16.dp, vertical = 12.dp)
+                            .testTag("studio_status_snackbar_host")
+                    )
                 }
             },
             bottomBar = {
@@ -355,7 +347,18 @@ fun AudioRecorderStudioApp(viewModel: RecorderViewModel) {
                             AppDestination.RECORDER -> {
                                 RecorderDestination(
                                     viewModel = viewModel,
-                                    onNavigateToSettings = { viewModel.navigateTo(AppDestination.SETTINGS) }
+                                    onNavigateToSettings = { viewModel.navigateTo(AppDestination.SETTINGS) },
+                                    statusBannerContent = {
+                                        if (openedPlayerRecording == null) {
+                                            StudioAnchoredStatusBanner(
+                                                snackbarHostState = snackbarHostState,
+                                                modifier = Modifier
+                                                    .fillMaxWidth()
+                                                    .padding(bottom = 12.dp)
+                                                    .testTag("studio_status_snackbar_host")
+                                            )
+                                        }
+                                    }
                                 )
                             }
                             AppDestination.LIBRARY -> {
@@ -381,7 +384,16 @@ fun AudioRecorderStudioApp(viewModel: RecorderViewModel) {
                         openedPlayerRecording?.let { playerRec ->
                             PlayerDestination(
                                 viewModel = viewModel,
-                                recording = playerRec
+                                recording = playerRec,
+                                statusBannerContent = {
+                                    StudioAnchoredStatusBanner(
+                                        snackbarHostState = snackbarHostState,
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .padding(bottom = 12.dp)
+                                            .testTag("studio_status_snackbar_host")
+                                    )
+                                }
                             )
                         }
                     }
@@ -431,9 +443,36 @@ fun AudioRecorderStudioApp(viewModel: RecorderViewModel) {
 }
 
 @Composable
+private fun StudioAnchoredStatusBanner(
+    snackbarHostState: SnackbarHostState,
+    modifier: Modifier = Modifier
+) {
+    SnackbarHost(
+        hostState = snackbarHostState,
+        modifier = modifier
+    ) { data ->
+        Snackbar(
+            shape = RoundedCornerShape(14.dp),
+            containerColor = ElevatedSurface,
+            contentColor = PrimaryText,
+            actionContentColor = PeachAccent,
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Text(
+                text = data.visuals.message,
+                style = MaterialTheme.typography.bodyMedium,
+                maxLines = 2,
+                overflow = TextOverflow.Ellipsis
+            )
+        }
+    }
+}
+
+@Composable
 private fun RecorderDestination(
     viewModel: RecorderViewModel,
-    onNavigateToSettings: () -> Unit
+    onNavigateToSettings: () -> Unit,
+    statusBannerContent: @Composable () -> Unit = {}
 ) {
     val recordingStatus by viewModel.recordingStatus.collectAsStateWithLifecycle()
     val settings by viewModel.settings.collectAsStateWithLifecycle()
@@ -469,7 +508,8 @@ private fun RecorderDestination(
         onToggleSkipSilence = { viewModel.toggleSkipSilence(it) },
         onNavigateToSettings = onNavigateToSettings,
         onRefreshAudioDevices = { viewModel.refreshConnectedAudioDevices() },
-        onPostMessage = { viewModel.postSnackbar(it) }
+        onPostMessage = { viewModel.postSnackbar(it) },
+        statusBannerContent = statusBannerContent
     )
 }
 
@@ -682,7 +722,8 @@ private fun SettingsDestination(viewModel: RecorderViewModel) {
 @Composable
 private fun PlayerDestination(
     viewModel: RecorderViewModel,
-    recording: RecordingEntity
+    recording: RecordingEntity,
+    statusBannerContent: @Composable () -> Unit = {}
 ) {
     val settings by viewModel.settings.collectAsStateWithLifecycle()
     val isPlaying by viewModel.audioEngine.isPlaying.collectAsStateWithLifecycle()
@@ -717,7 +758,8 @@ private fun PlayerDestination(
             onTrimRecording = { rec, startMs, endMs, overwrite ->
                 viewModel.trimRecording(rec, startMs, endMs, overwrite)
             },
-            onOpenExportConversion = { viewModel.openConversionSheet(it) }
+            onOpenExportConversion = { viewModel.openConversionSheet(it) },
+            statusBannerContent = statusBannerContent
         )
     }
 }
