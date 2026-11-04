@@ -374,9 +374,11 @@ object RecordingIslandOverlayManager {
         }
 
         val cardView = inflater.inflate(R.layout.notification_recording_live, outerWrapper, false)
-        // Consume touches on the card itself so tapping inside the card does not trigger outerWrapper collapse
+        // Second tap on the expanded capsule opens the app to the currently active recording window
         cardView.isClickable = true
-        cardView.setOnClickListener { /* consume inside card */ }
+        cardView.setOnClickListener {
+            handleHeaderTapOpenApp(context)
+        }
 
         val headerView = cardView.findViewById<View>(R.id.notif_recording_header)
         headerView?.isClickable = true
@@ -437,6 +439,8 @@ object RecordingIslandOverlayManager {
         }
 
         val waveformView = root.findViewById<ImageView>(R.id.notif_recording_waveform)
+        // Keep the waveform strictly visible in the Dynamic Island expanded card
+        waveformView?.visibility = View.VISIBLE
         lastWaveformBitmap?.let { bmp ->
             waveformView?.setImageBitmap(bmp)
         }

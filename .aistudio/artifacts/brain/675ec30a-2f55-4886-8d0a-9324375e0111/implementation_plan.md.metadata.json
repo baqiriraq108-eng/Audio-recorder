@@ -1,6 +1,6 @@
 {
-  "summary": "Revised implementation plan incorporating: (1) omitting setCustomBigContentView (keeping bigContentView = null) and standard builder.addAction rows so Android/HyperOS renders zero expand/collapse chevron arrows (^); (2) showing RecordingIslandOverlayManager exclusively when MainActivity moves to the background/Home Screen and hiding it when MainActivity is in the foreground; and (3) proactively prompting once for Settings.ACTION_MANAGE_OVERLAY_PERMISSION on first recording/backgrounding when overlay permission is not yet granted.",
-  "updatedAt": "2026-11-04T10:53:05.074430564Z",
+  "summary": "Architectural implementation plan to refine the notification shade recording card (3 identical buttons, timer, Recording word, mic icon, zero waveform), preserve the Dynamic Island overlay completely without touching its waveform, ensure seamless transition to Save/Cancel confirmation card, and open app on tapping expanded capsule.",
+  "updatedAt": "2026-11-04T12:22:34.540450634Z",
   "requestFeedback": true,
   "userFacing": true
 }

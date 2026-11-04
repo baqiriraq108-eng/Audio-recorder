@@ -86,7 +86,13 @@ import com.example.ui.theme.SuccessSage
 import com.example.ui.theme.TonalDarkBrown
 import com.example.ui.theme.WarmSecondarySurface
 import com.example.ui.theme.m3PressScale
+import androidx.compose.runtime.rememberCoroutineScope
+import android.content.pm.PackageManager
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.io.File
+import java.util.Locale
 
 @Composable
 fun SavedRecordingPlayerScreen(
@@ -233,6 +239,28 @@ fun SavedRecordingPlayerScreen(
                     config = settings.silenceConfig
                 )
             }
+            val effectiveSeekTo: (Long) -> Unit = { rawMs ->
+                if (isTrimMode) {
+                    onSeekToMs(rawMs.coerceIn(trimStartMs, trimEndMs))
+                } else {
+                    onSeekToMs(rawMs.coerceIn(0L, effectiveDuration))
+                }
+            }
+
+            // When isTrimMode is active, strictly confine playback and scrub position within selected trim boundaries
+            LaunchedEffect(isTrimMode, playbackPositionMs, trimStartMs, trimEndMs, isPlaying) {
+                if (isTrimMode) {
+                    if (playbackPositionMs < trimStartMs) {
+                        onSeekToMs(trimStartMs)
+                    } else if (playbackPositionMs >= trimEndMs) {
+                        if (isPlaying) {
+                            onTogglePlayPause() // Pause playback at trimEndMs boundary
+                        }
+                        onSeekToMs(trimEndMs)
+                    }
+                }
+            }
+
             StudioInteractiveWaveform(
                 peaks = recording.peakList,
                 isRecording = false,
@@ -251,7 +279,7 @@ fun SavedRecordingPlayerScreen(
                     trimStartFraction = newStart
                     trimEndFraction = newEnd
                 },
-                onSeekToMs = onSeekToMs
+                onSeekToMs = effectiveSeekTo
             )
 
             // Saved Bookmarks Bar (tap to seek, tap X to remove)
@@ -373,7 +401,14 @@ fun SavedRecordingPlayerScreen(
                         .background(ElevatedSurface)
                         .m3PressScale(
                             shape = RoundedCornerShape(12.dp),
-                            onClick = { onSeekRelativeMs(-3_000L) }
+                            onClick = {
+                                if (isTrimMode) {
+                                    val target = (playbackPositionMs - 3_000L).coerceIn(trimStartMs, trimEndMs)
+                                    onSeekToMs(target)
+                                } else {
+                                    onSeekRelativeMs(-3_000L)
+                                }
+                            }
                         )
                         .testTag("player_rewind_button")
                 ) {
@@ -394,7 +429,14 @@ fun SavedRecordingPlayerScreen(
                         .background(PeachAccent)
                         .m3PressScale(
                             shape = CircleShape,
-                            onClick = onTogglePlayPause
+                            onClick = {
+                                if (isTrimMode && !isPlaying) {
+                                    if (playbackPositionMs < trimStartMs || playbackPositionMs >= trimEndMs - 50L) {
+                                        onSeekToMs(trimStartMs)
+                                    }
+                                }
+                                onTogglePlayPause()
+                            }
                         )
                         .testTag("player_play_pause_button")
                 ) {
@@ -415,7 +457,14 @@ fun SavedRecordingPlayerScreen(
                         .background(ElevatedSurface)
                         .m3PressScale(
                             shape = RoundedCornerShape(12.dp),
-                            onClick = { onSeekRelativeMs(3_000L) }
+                            onClick = {
+                                if (isTrimMode) {
+                                    val target = (playbackPositionMs + 3_000L).coerceIn(trimStartMs, trimEndMs)
+                                    onSeekToMs(target)
+                                } else {
+                                    onSeekRelativeMs(3_000L)
+                                }
+                            }
                         )
                         .testTag("player_forward_button")
                 ) {
@@ -713,38 +762,92 @@ fun SavedRecordingPlayerScreen(
         }
     }
 
+    val coroutineScope = rememberCoroutineScope()
+    var isSharingInProgress by remember { mutableStateOf(false) }
+
+    val shareAudioFile: (File, String) -> Unit = { fileToShare, subjectTitle ->
+        runCatching {
+            val shareUri = FileProvider.getUriForFile(
+                context,
+                "${context.packageName}.fileprovider",
+                fileToShare
+            )
+            val ext = fileToShare.extension.lowercase(Locale.ROOT)
+            val mimeType = when (ext) {
+                "m4a", "mp4" -> "audio/mp4"
+                "flac" -> "audio/flac"
+                else -> "audio/wav"
+            }
+            val sendIntent = Intent(Intent.ACTION_SEND).apply {
+                type = mimeType
+                putExtra(Intent.EXTRA_STREAM, shareUri)
+                putExtra(Intent.EXTRA_SUBJECT, subjectTitle)
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            }
+            val chooser = Intent.createChooser(sendIntent, "Share \"$subjectTitle\"").apply {
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+            val resInfoList = context.packageManager.queryIntentActivities(chooser, PackageManager.MATCH_DEFAULT_ONLY)
+            for (resolveInfo in resInfoList) {
+                val packageName = resolveInfo.activityInfo.packageName
+                context.grantUriPermission(packageName, shareUri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            }
+            context.startActivity(chooser)
+        }
+    }
+
     if (showShareExportSheet) {
         ShareExportActionSheet(
             recording = recording,
-            onShareViaApps = {
+            isTrimMode = isTrimMode,
+            trimStartMs = trimStartMs,
+            trimEndMs = trimEndMs,
+            onShareOriginal = {
                 showShareExportSheet = false
-                runCatching {
-                    val audioFile = File(recording.filePath)
-                    if (!audioFile.exists()) {
-                        audioFile.parentFile?.mkdirs()
-                        audioFile.writeBytes(ByteArray(1024))
-                    }
-                    val shareUri = FileProvider.getUriForFile(
-                        context,
-                        "${context.packageName}.fileprovider",
-                        audioFile
-                    )
-                    val mimeType = when (recording.format.uppercase()) {
-                        "M4A" -> "audio/mp4"
-                        "FLAC" -> "audio/flac"
-                        else -> "audio/wav"
-                    }
-                    val sendIntent = Intent(Intent.ACTION_SEND).apply {
-                        type = mimeType
-                        putExtra(Intent.EXTRA_STREAM, shareUri)
-                        putExtra(Intent.EXTRA_SUBJECT, recording.title)
-                        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-                    }
-                    context.startActivity(
-                        Intent.createChooser(sendIntent, "Share \"${recording.title}\"")
-                    )
-                }
+                shareAudioFile(File(recording.filePath), recording.title)
             },
+            onShareTrimmed = if (isTrimMode) {
+                {
+                    showShareExportSheet = false
+                    if (!isSharingInProgress) {
+                        isSharingInProgress = true
+                        coroutineScope.launch(Dispatchers.IO) {
+                            try {
+                                val sourceFile = File(recording.filePath)
+                                val trimmedShareFile = File(
+                                    context.cacheDir,
+                                    "share_trimmed_${recording.id}_${trimStartMs}_${trimEndMs}.${sourceFile.extension.ifBlank { recording.format.lowercase(Locale.ROOT) }}"
+                                )
+                                val (trimmedDur, _) = com.example.audio.WavFileTools.trimWavToRange(
+                                    sourceFile = sourceFile,
+                                    targetFile = trimmedShareFile,
+                                    startMs = trimStartMs,
+                                    endMs = trimEndMs,
+                                    fallbackSampleRate = recording.sampleRate,
+                                    fallbackChannels = recording.channels,
+                                    fallbackBitsPerSample = recording.bitDepth
+                                )
+                                withContext(Dispatchers.Main) {
+                                    isSharingInProgress = false
+                                    if (trimmedShareFile.exists() && trimmedShareFile.length() > 44L) {
+                                        val subjectTitle = "${recording.title} (Trimmed)"
+                                        shareAudioFile(trimmedShareFile, subjectTitle)
+                                    } else {
+                                        // Fallback to sharing original if trimming failed
+                                        shareAudioFile(sourceFile, recording.title)
+                                    }
+                                }
+                            } catch (_: Exception) {
+                                withContext(Dispatchers.Main) {
+                                    isSharingInProgress = false
+                                    shareAudioFile(File(recording.filePath), recording.title)
+                                }
+                            }
+                        }
+                    }
+                }
+            } else null,
             onExportAudio = {
                 showShareExportSheet = false
                 onOpenExportConversion(recording)

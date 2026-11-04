@@ -54,6 +54,8 @@ import com.example.ui.theme.WarmSecondarySurface
 import com.example.ui.theme.WarningAmber
 import com.example.ui.theme.WaveformActiveBar
 import com.example.ui.theme.WaveformInactiveBar
+import com.example.ui.theme.NavPillIndicator
+import com.example.ui.theme.PeachAccentSoft
 import com.example.ui.theme.WaveformPlayhead
 import kotlin.math.pow
 
@@ -168,15 +170,22 @@ fun StudioInteractiveWaveform(
                         detectTapGestures { offset ->
                             val fraction = (offset.x / size.width.toFloat()).coerceIn(0f, 1f)
                             if (isTrimMode && currentTrimCallback != null) {
+                                val handleTolerance = (24.dp.toPx() / size.width.toFloat()).coerceIn(0.04f, 0.12f)
                                 val distToStart = kotlin.math.abs(fraction - currentTrimStart)
                                 val distToEnd = kotlin.math.abs(fraction - currentTrimEnd)
-                                if (distToStart <= distToEnd) {
-                                    val newStart = fraction.coerceIn(0f, (currentTrimEnd - 0.05f).coerceAtLeast(0f))
-                                    currentTrimCallback?.invoke(newStart, currentTrimEnd)
-                                    onSeekToMs((newStart * totalDur).toLong())
+                                if (distToStart <= handleTolerance || distToEnd <= handleTolerance) {
+                                    if (distToStart <= distToEnd) {
+                                        val newStart = fraction.coerceIn(0f, (currentTrimEnd - 0.05f).coerceAtLeast(0f))
+                                        currentTrimCallback?.invoke(newStart, currentTrimEnd)
+                                        onSeekToMs((newStart * totalDur).toLong())
+                                    } else {
+                                        val newEnd = fraction.coerceIn((currentTrimStart + 0.05f).coerceAtMost(1f), 1f)
+                                        currentTrimCallback?.invoke(currentTrimStart, newEnd)
+                                    }
                                 } else {
-                                    val newEnd = fraction.coerceIn((currentTrimStart + 0.05f).coerceAtMost(1f), 1f)
-                                    currentTrimCallback?.invoke(currentTrimStart, newEnd)
+                                    // User tapped waveform in trim mode: clamp cursor strictly between trim boundaries
+                                    val clampedFrac = fraction.coerceIn(currentTrimStart, currentTrimEnd)
+                                    onSeekToMs((clampedFrac * totalDur).toLong())
                                 }
                             } else {
                                 onSeekToMs((fraction * totalDur).toLong())
@@ -186,25 +195,42 @@ fun StudioInteractiveWaveform(
                 }
                 .pointerInput(isRecording, totalDur, isTrimMode) {
                     if (!isRecording && totalDur > 0L) {
-                        var draggingStartHandle = true
+                        var dragMode = 0 // 0 = playhead cursor, 1 = start handle, 2 = end handle
                         detectHorizontalDragGestures(
                             onDragStart = { startOffset ->
                                 val fraction = (startOffset.x / size.width.toFloat()).coerceIn(0f, 1f)
-                                val distStart = kotlin.math.abs(fraction - currentTrimStart)
-                                val distEnd = kotlin.math.abs(fraction - currentTrimEnd)
-                                draggingStartHandle = distStart <= distEnd
+                                if (isTrimMode && currentTrimCallback != null) {
+                                    val handleTolerance = (24.dp.toPx() / size.width.toFloat()).coerceIn(0.04f, 0.12f)
+                                    val distStart = kotlin.math.abs(fraction - currentTrimStart)
+                                    val distEnd = kotlin.math.abs(fraction - currentTrimEnd)
+                                    dragMode = when {
+                                        distStart <= handleTolerance && distStart <= distEnd -> 1
+                                        distEnd <= handleTolerance -> 2
+                                        else -> 0
+                                    }
+                                } else {
+                                    dragMode = 0
+                                }
                             },
                             onHorizontalDrag = { change, _ ->
                                 change.consume()
                                 val fraction = (change.position.x / size.width.toFloat()).coerceIn(0f, 1f)
                                 if (isTrimMode && currentTrimCallback != null) {
-                                    if (draggingStartHandle) {
-                                        val newStart = fraction.coerceIn(0f, (currentTrimEnd - 0.04f).coerceAtLeast(0f))
-                                        currentTrimCallback?.invoke(newStart, currentTrimEnd)
-                                        onSeekToMs((newStart * totalDur).toLong())
-                                    } else {
-                                        val newEnd = fraction.coerceIn((currentTrimStart + 0.04f).coerceAtMost(1f), 1f)
-                                        currentTrimCallback?.invoke(currentTrimStart, newEnd)
+                                    when (dragMode) {
+                                        1 -> {
+                                            val newStart = fraction.coerceIn(0f, (currentTrimEnd - 0.04f).coerceAtLeast(0f))
+                                            currentTrimCallback?.invoke(newStart, currentTrimEnd)
+                                            onSeekToMs((newStart * totalDur).toLong())
+                                        }
+                                        2 -> {
+                                            val newEnd = fraction.coerceIn((currentTrimStart + 0.04f).coerceAtMost(1f), 1f)
+                                            currentTrimCallback?.invoke(currentTrimStart, newEnd)
+                                        }
+                                        else -> {
+                                            // Scrubbing playhead cursor strictly bounded between currentTrimStart and currentTrimEnd
+                                            val clampedFrac = fraction.coerceIn(currentTrimStart, currentTrimEnd)
+                                            onSeekToMs((clampedFrac * totalDur).toLong())
+                                        }
                                     }
                                 } else {
                                     onSeekToMs((fraction * totalDur).toLong())
@@ -384,23 +410,38 @@ fun StudioInteractiveWaveform(
                     )
                 }
 
-                // Primary Playhead / Scrubbing Cursor in #E38851
+                // Primary Playhead / Scrubbing Cursor & Knob
                 val activeCursorX = if (isRecording) canvasWidth - 4.dp.toPx() else cursorX
                 drawLine(
                     brush = Brush.verticalGradient(
                         colors = listOf(
-                            WaveformPlayhead.copy(alpha = 0.2f),
-                            WaveformPlayhead,
-                            WaveformPlayhead.copy(alpha = 0.2f)
+                            PeachAccentSoft.copy(alpha = 0.25f),
+                            PeachAccentSoft,
+                            PeachAccentSoft.copy(alpha = 0.25f)
                         )
                     ),
                     start = Offset(activeCursorX, 0f),
                     end = Offset(activeCursorX, canvasHeight),
                     strokeWidth = 2.5.dp.toPx()
                 )
+                // Enhanced, larger playhead handle/knob (7.5dp radius) in warm ivory PeachAccentSoft with subtle border
+                val playheadRadius = 7.5.dp.toPx()
+                // Outer subtle dark contour for sharp contrast over both light and dark bars
                 drawCircle(
-                    color = WaveformPlayhead,
-                    radius = 5.dp.toPx(),
+                    color = ObsidianBackground,
+                    radius = playheadRadius + 1.5.dp.toPx(),
+                    center = Offset(activeCursorX, centerY)
+                )
+                // Main playhead knob in distinct warm ivory tone (#F4D7C7)
+                drawCircle(
+                    color = PeachAccentSoft,
+                    radius = playheadRadius,
+                    center = Offset(activeCursorX, centerY)
+                )
+                // Center accent core in NavPillIndicator
+                drawCircle(
+                    color = NavPillIndicator,
+                    radius = 3.dp.toPx(),
                     center = Offset(activeCursorX, centerY)
                 )
             }

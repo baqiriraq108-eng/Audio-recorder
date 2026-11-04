@@ -4,180 +4,46 @@
     android:layout_width="match_parent"
     android:layout_height="wrap_content"
     android:background="@drawable/bg_notif_recording_card"
-    android:orientation="vertical"
-    android:paddingTop="12dp"
-    android:paddingBottom="12dp">
+    android:gravity="center_vertical"
+    android:orientation="horizontal"
+    android:paddingStart="14dp"
+    android:paddingTop="10dp"
+    android:paddingEnd="14dp"
+    android:paddingBottom="10dp">
 
-    <!-- Top Row (Edge-to-Edge Header): Far-Left Mic + Status, Far-Right Live Timer (No Cast Button) -->
-    <LinearLayout
-        android:id="@+id/notif_recording_header"
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:gravity="center_vertical"
-        android:orientation="horizontal"
-        android:paddingStart="16dp"
-        android:paddingEnd="16dp">
-
-        <ImageView
-            android:id="@+id/notif_recording_icon"
-            android:layout_width="18dp"
-            android:layout_height="18dp"
-            android:contentDescription="@string/notification_status_recording"
-            android:scaleType="fitCenter"
-            android:src="@drawable/ic_notif_mic"
-            android:tint="#F08C4B" />
-
-        <TextView
-            android:id="@+id/notif_recording_title"
-            android:layout_width="0dp"
-            android:layout_height="wrap_content"
-            android:layout_marginStart="8dp"
-            android:layout_weight="1"
-            android:ellipsize="end"
-            android:fontFamily="sans-serif-medium"
-            android:includeFontPadding="false"
-            android:maxLines="1"
-            android:singleLine="true"
-            android:text="@string/notification_status_recording"
-            android:textColor="#F4D7C7"
-            android:textSize="14sp" />
-
-        <!-- Active live chronometer on Far-Right (Zero Cast / routing icons) -->
-        <Chronometer
-            android:id="@+id/notif_recording_chronometer"
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:fontFamily="monospace"
-            android:includeFontPadding="false"
-            android:singleLine="true"
-            android:textColor="#F08C4B"
-            android:textSize="13sp"
-            android:textStyle="bold" />
-
-        <!-- Frozen timer label when recording is paused -->
-        <TextView
-            android:id="@+id/notif_recording_paused_timer"
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:fontFamily="monospace"
-            android:includeFontPadding="false"
-            android:singleLine="true"
-            android:textColor="#99F4D7C7"
-            android:textSize="13sp"
-            android:textStyle="bold"
-            android:visibility="gone" />
-    </LinearLayout>
-
-    <!-- Middle Row: Full-Width Centered Oscillating Audio Waveform (Replacing Seekbar, 16dp Start/End Padding) -->
     <ImageView
-        android:id="@+id/notif_recording_waveform"
-        android:layout_width="match_parent"
-        android:layout_height="46dp"
-        android:layout_marginTop="8dp"
-        android:layout_marginBottom="8dp"
+        android:id="@+id/notif_recording_compact_icon"
+        android:layout_width="18dp"
+        android:layout_height="18dp"
         android:contentDescription="@string/notification_status_recording"
-        android:paddingStart="16dp"
-        android:paddingEnd="16dp"
-        android:scaleType="fitXY" />
+        android:scaleType="fitCenter"
+        android:src="@drawable/ic_notif_mic"
+        android:tint="#F08C4B" />
 
-    <!-- Bottom Row: 3 Identical-Sized Icon-Only Buttons Directly Below Waveform -->
-    <RelativeLayout
-        android:id="@+id/notif_recording_actions"
-        android:layout_width="match_parent"
-        android:layout_height="38dp"
-        android:paddingStart="16dp"
-        android:paddingEnd="16dp">
+    <TextView
+        android:id="@+id/notif_recording_compact_title"
+        android:layout_width="0dp"
+        android:layout_height="wrap_content"
+        android:layout_marginStart="8dp"
+        android:layout_weight="1"
+        android:ellipsize="end"
+        android:fontFamily="sans-serif-medium"
+        android:includeFontPadding="false"
+        android:maxLines="1"
+        android:singleLine="true"
+        android:text="@string/notification_status_recording"
+        android:textColor="#F4D7C7"
+        android:textSize="14sp" />
 
-        <!-- 1. Far-Left Edge: Bookmark Icon Button (76dp x 38dp, icon only) -->
-        <LinearLayout
-            android:id="@+id/notif_recording_btn_bookmark"
-            android:layout_width="76dp"
-            android:layout_height="38dp"
-            android:layout_alignParentLeft="true"
-            android:layout_alignParentStart="true"
-            android:layout_centerVertical="true"
-            android:background="@drawable/bg_notif_append_button"
-            android:clickable="true"
-            android:focusable="true"
-            android:gravity="center"
-            android:minWidth="76dp"
-            android:orientation="horizontal">
-
-            <ImageView
-                android:id="@+id/notif_action_bookmark_icon"
-                android:layout_width="20dp"
-                android:layout_height="20dp"
-                android:contentDescription="@string/notification_action_bookmark"
-                android:scaleType="fitCenter"
-                android:src="@drawable/ic_notif_bookmark" />
-
-            <TextView
-                android:id="@+id/notif_action_bookmark_text"
-                android:layout_width="0dp"
-                android:layout_height="0dp"
-                android:text="@string/notification_action_bookmark"
-                android:visibility="gone" />
-        </LinearLayout>
-
-        <!-- 2. Center: Save (Stop & Save) Icon Button (76dp x 38dp, icon only) -->
-        <LinearLayout
-            android:id="@+id/notif_recording_btn_stop_save"
-            android:layout_width="76dp"
-            android:layout_height="38dp"
-            android:layout_centerInParent="true"
-            android:background="@drawable/bg_notif_append_button"
-            android:clickable="true"
-            android:focusable="true"
-            android:gravity="center"
-            android:minWidth="76dp"
-            android:orientation="horizontal">
-
-            <ImageView
-                android:id="@+id/notif_action_stop_save_icon"
-                android:layout_width="20dp"
-                android:layout_height="20dp"
-                android:contentDescription="@string/notification_action_stop_save"
-                android:scaleType="fitCenter"
-                android:src="@drawable/ic_notif_stop_save" />
-
-            <TextView
-                android:id="@+id/notif_action_stop_save_text"
-                android:layout_width="0dp"
-                android:layout_height="0dp"
-                android:text="@string/btn_save"
-                android:visibility="gone" />
-        </LinearLayout>
-
-        <!-- 3. Far-Right Edge: Pause / Resume Toggle Icon Button (76dp x 38dp, icon only) -->
-        <LinearLayout
-            android:id="@+id/notif_recording_btn_pause_resume"
-            android:layout_width="76dp"
-            android:layout_height="38dp"
-            android:layout_alignParentRight="true"
-            android:layout_alignParentEnd="true"
-            android:layout_centerVertical="true"
-            android:background="@drawable/bg_notif_append_button"
-            android:clickable="true"
-            android:focusable="true"
-            android:gravity="center"
-            android:minWidth="76dp"
-            android:orientation="horizontal">
-
-            <ImageView
-                android:id="@+id/notif_action_pause_resume_icon"
-                android:layout_width="20dp"
-                android:layout_height="20dp"
-                android:contentDescription="@string/notification_action_pause"
-                android:scaleType="fitCenter"
-                android:src="@drawable/ic_notif_pause" />
-
-            <TextView
-                android:id="@+id/notif_action_pause_resume_text"
-                android:layout_width="0dp"
-                android:layout_height="0dp"
-                android:text="@string/notification_action_pause"
-                android:visibility="gone" />
-        </LinearLayout>
-    </RelativeLayout>
+    <Chronometer
+        android:id="@+id/notif_recording_compact_chronometer"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:fontFamily="monospace"
+        android:includeFontPadding="false"
+        android:singleLine="true"
+        android:textColor="#F08C4B"
+        android:textSize="13sp"
+        android:textStyle="bold" />
 
 </LinearLayout>

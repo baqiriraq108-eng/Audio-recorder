@@ -25,6 +25,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.CheckCircle
+import androidx.compose.material.icons.filled.ContentCut
 import androidx.compose.material.icons.filled.DeleteOutline
 import androidx.compose.material.icons.filled.FolderOpen
 import androidx.compose.material.icons.filled.GraphicEq
@@ -344,7 +345,11 @@ fun ExportWithoutSilenceDialog(
 @Composable
 fun ShareExportActionSheet(
     recording: RecordingEntity,
-    onShareViaApps: () -> Unit,
+    isTrimMode: Boolean = false,
+    trimStartMs: Long = 0L,
+    trimEndMs: Long = 0L,
+    onShareOriginal: () -> Unit,
+    onShareTrimmed: (() -> Unit)? = null,
     onExportAudio: () -> Unit,
     onDismiss: () -> Unit
 ) {
@@ -362,14 +367,14 @@ fun ShareExportActionSheet(
                 .fillMaxWidth()
                 .graphicsLayer()
                 .navigationBarsPadding()
-                .padding(horizontal = 24.dp, vertical = 12.dp)
+                .padding(horizontal = 20.dp, vertical = 12.dp)
                 .testTag("share_export_action_sheet"),
-            verticalArrangement = Arrangement.spacedBy(12.dp)
+            verticalArrangement = Arrangement.spacedBy(10.dp)
         ) {
             Column {
                 Text(
-                    text = "Share or Export Audio",
-                    style = MaterialTheme.typography.headlineSmall,
+                    text = "Share Recording",
+                    style = MaterialTheme.typography.titleLarge,
                     color = PrimaryText,
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis
@@ -386,45 +391,95 @@ fun ShareExportActionSheet(
 
             Spacer(modifier = Modifier.height(4.dp))
 
-            // Option 1: Share via Apps (Triggers native Android Sharesheet Intent.ACTION_SEND)
+            // Option: Trimmed Audio (Shown when trim mode is active or trim range specified)
+            if (isTrimMode && onShareTrimmed != null) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(14.dp))
+                        .background(ElevatedSurface)
+                        .m3PressScale(
+                            shape = RoundedCornerShape(14.dp),
+                            onClick = onShareTrimmed
+                        )
+                        .padding(horizontal = 14.dp, vertical = 12.dp)
+                        .testTag("action_share_trimmed")
+                ) {
+                    Box(
+                        contentAlignment = Alignment.Center,
+                        modifier = Modifier
+                            .size(40.dp)
+                            .clip(CircleShape)
+                            .background(ObsidianBackground)
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.ContentCut,
+                            contentDescription = "Share Trimmed",
+                            tint = PeachAccent,
+                            modifier = Modifier.size(20.dp)
+                        )
+                    }
+                    Spacer(modifier = Modifier.width(12.dp))
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = "Trimmed",
+                            style = MaterialTheme.typography.titleMedium,
+                            color = PrimaryText,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                        val trimmedSpan = (trimEndMs - trimStartMs).coerceAtLeast(0L)
+                        Text(
+                            text = "${AudioFormatUtils.formatDurationCompact(trimStartMs)} – ${AudioFormatUtils.formatDurationCompact(trimEndMs)} (${AudioFormatUtils.formatDurationCompact(trimmedSpan)})",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = SecondaryText,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
+                }
+            }
+
+            // Option: Original Audio
             Row(
                 verticalAlignment = Alignment.CenterVertically,
                 modifier = Modifier
                     .fillMaxWidth()
-                    .clip(RoundedCornerShape(16.dp))
+                    .clip(RoundedCornerShape(14.dp))
                     .background(ElevatedSurface)
                     .m3PressScale(
-                        shape = RoundedCornerShape(16.dp),
-                        onClick = onShareViaApps
+                        shape = RoundedCornerShape(14.dp),
+                        onClick = onShareOriginal
                     )
-                    .padding(horizontal = 16.dp, vertical = 16.dp)
+                    .padding(horizontal = 14.dp, vertical = 12.dp)
                     .testTag("action_share_via_apps")
             ) {
                 Box(
                     contentAlignment = Alignment.Center,
                     modifier = Modifier
-                        .size(44.dp)
+                        .size(40.dp)
                         .clip(CircleShape)
                         .background(ObsidianBackground)
                 ) {
                     Icon(
                         imageVector = Icons.Default.IosShare,
-                        contentDescription = "Share via Apps",
+                        contentDescription = "Share Original",
                         tint = PeachAccent,
-                        modifier = Modifier.size(22.dp)
+                        modifier = Modifier.size(20.dp)
                     )
                 }
-                Spacer(modifier = Modifier.width(14.dp))
+                Spacer(modifier = Modifier.width(12.dp))
                 Column(modifier = Modifier.weight(1f)) {
                     Text(
-                        text = "Share via Apps",
+                        text = if (isTrimMode) "Original" else "Share via Apps",
                         style = MaterialTheme.typography.titleMedium,
                         color = PrimaryText,
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis
                     )
                     Text(
-                        text = "Send audio file directly to installed apps via Android Sharesheet",
+                        text = if (isTrimMode) "Full original file (${AudioFormatUtils.formatDurationHMS(recording.durationMs)})" else "Send audio directly via Android Sharesheet",
                         style = MaterialTheme.typography.bodySmall,
                         color = SecondaryText,
                         maxLines = 1,

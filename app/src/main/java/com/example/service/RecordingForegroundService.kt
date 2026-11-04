@@ -1086,7 +1086,8 @@ class RecordingForegroundService : Service() {
                 setViewVisibility(R.id.notif_recording_chronometer, android.view.View.VISIBLE)
                 setChronometer(R.id.notif_recording_chronometer, chronometerBaseRealtimeMs, null, true)
             }
-            setImageViewBitmap(R.id.notif_recording_waveform, waveformBitmap)
+            // In the notification shade, the waveform is hidden (zero waveform) while keeping the header and 3 action buttons
+            setViewVisibility(R.id.notif_recording_waveform, android.view.View.GONE)
             // 1. Far-Left Edge: Bookmark button
             setOnClickPendingIntent(R.id.notif_recording_btn_bookmark, pendingBookmark)
             // 2. Center: Save (Stop & Save) button

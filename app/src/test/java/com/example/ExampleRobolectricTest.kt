@@ -586,15 +586,14 @@ class ExampleRobolectricTest {
         assertTrue(customActionIds.contains(com.example.service.RecordingForegroundService.ACTION_NOTIFICATION_BOOKMARK))
         assertTrue(customActionIds.contains(com.example.service.RecordingForegroundService.ACTION_NOTIFICATION_STOP_SAVE))
 
-        // Verify custom non-expandable Recording card inflates cleanly with centered oscillating waveform + 3 buttons
+        // Verify custom non-expandable Recording card inflates cleanly without waveform in notification shade + 3 buttons
         @Suppress("DEPRECATION")
         org.junit.Assert.assertNotNull(activeNotif.contentView)
         @Suppress("DEPRECATION")
         val inflatedCard = activeNotif.contentView.apply(context, android.widget.FrameLayout(context))
 
         val waveformView = inflatedCard.findViewById<android.widget.ImageView>(R.id.notif_recording_waveform)
-        org.junit.Assert.assertNotNull(waveformView?.drawable)
-        assertTrue(waveformView.paddingStart > 0 && waveformView.paddingEnd > 0)
+        assertEquals("Waveform must be hidden (GONE) in notification shade card", android.view.View.GONE, waveformView?.visibility)
 
         val bookmarkBtn = inflatedCard.findViewById<android.view.View>(R.id.notif_recording_btn_bookmark)
         val saveBtn = inflatedCard.findViewById<android.view.View>(R.id.notif_recording_btn_stop_save)
@@ -733,6 +732,12 @@ class ExampleRobolectricTest {
             com.example.service.RecordingIslandOverlayManager.OverlayMode.EXPANDED_CARD,
             com.example.service.RecordingIslandOverlayManager.currentMode
         )
+        // Verify waveform remains strictly VISIBLE in the expanded capsule
+        val expandedCardWaveform = com.example.service.RecordingIslandOverlayManager.currentOverlayRootView
+            ?.findViewById<android.widget.ImageView>(R.id.notif_recording_waveform)
+        org.junit.Assert.assertNotNull(expandedCardWaveform)
+        assertEquals(android.view.View.VISIBLE, expandedCardWaveform?.visibility)
+
         // Verify tapping outside the expanded card collapses it back to DOCKED_PILL
         val expandedWrapperView = com.example.service.RecordingIslandOverlayManager.currentOverlayRootView
         org.junit.Assert.assertNotNull(expandedWrapperView)
@@ -741,6 +746,11 @@ class ExampleRobolectricTest {
             com.example.service.RecordingIslandOverlayManager.OverlayMode.DOCKED_PILL,
             com.example.service.RecordingIslandOverlayManager.currentMode
         )
+        // Verify waveform remains present in docked pill mode
+        val dockedWaveform = com.example.service.RecordingIslandOverlayManager.currentOverlayRootView
+            ?.findViewById<android.widget.ImageView>(R.id.notif_recording_waveform)
+        org.junit.Assert.assertNotNull(dockedWaveform)
+
         com.example.service.RecordingIslandOverlayManager.handleHeaderTapOpenApp(context)
         org.junit.Assert.assertFalse(com.example.service.RecordingIslandOverlayManager.shouldDisplayOverlay())
 

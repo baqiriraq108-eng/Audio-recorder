@@ -1266,6 +1266,60 @@ object WavFileTools {
         val safeEndMs = endMs.coerceAtLeast(safeStartMs + 100L)
 
         if (!isRiffWaveFile(sourceFile)) {
+            // Non-WAV file (M4A, FLAC, etc.): Decode to temporary WAV, perform exact trim, and write output
+            val tempDecodedWav = File(
+                targetFile.parentFile ?: sourceFile.parentFile,
+                "${targetFile.name}.temp_dec.wav"
+            )
+            val decodedOk = decodeAudioToWav(
+                sourceFile = sourceFile,
+                outputWavFile = tempDecodedWav,
+                targetSampleRate = fallbackSampleRate,
+                targetChannels = fallbackChannels,
+                bitsPerSample = fallbackBitsPerSample
+            )
+            if (decodedOk && tempDecodedWav.exists() && tempDecodedWav.length() > 44L) {
+                try {
+                    val isTargetM4a = targetFile.extension.equals("m4a", ignoreCase = true)
+                    val trimmedWavTarget = if (isTargetM4a) {
+                        File(targetFile.parentFile ?: sourceFile.parentFile, "${targetFile.name}.trimmed.wav")
+                    } else {
+                        targetFile
+                    }
+                    val (trimmedDur, peaks) = trimWavToRange(
+                        sourceFile = tempDecodedWav,
+                        targetFile = trimmedWavTarget,
+                        startMs = safeStartMs,
+                        endMs = safeEndMs,
+                        fallbackSampleRate = fallbackSampleRate,
+                        fallbackChannels = fallbackChannels,
+                        fallbackBitsPerSample = fallbackBitsPerSample
+                    )
+                    if (isTargetM4a && trimmedWavTarget.exists()) {
+                        // Re-encode trimmed WAV to standalone M4A
+                        val aacEncoder = AacEncoder(
+                            sampleRate = fallbackSampleRate,
+                            channelCount = fallbackChannels,
+                            bitrate = 192_000,
+                            skipPrimingFrame = false
+                        )
+                        val rawAacTemp = File(targetFile.parentFile ?: sourceFile.parentFile, "${targetFile.name}.raw.aac")
+                        val seg = aacEncoder.encodeWavFileToSegment(trimmedWavTarget, rawAacTemp)
+                        if (seg != null) {
+                            aacEncoder.writeStandaloneM4aFile(seg, targetFile)
+                        }
+                        rawAacTemp.delete()
+                        trimmedWavTarget.delete()
+                    }
+                    if (targetFile.exists() && targetFile.length() > 44L) {
+                        return trimmedDur to (peaks.ifEmpty { extractWaveformFromFile(targetFile) })
+                    }
+                } finally {
+                    tempDecodedWav.delete()
+                }
+            }
+
+            // Fallback if decoding not supported: keep copy
             if (sourceFile.absolutePath != targetFile.absolutePath) {
                 sourceFile.copyTo(targetFile, overwrite = true)
             }
