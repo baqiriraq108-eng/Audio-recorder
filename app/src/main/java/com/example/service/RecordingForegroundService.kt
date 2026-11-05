@@ -901,6 +901,11 @@ class RecordingForegroundService : Service() {
                 showFinishedSavedConfirmation(title)
             }
 
+            ACTION_DISMISS_FINISHED_NOTIFICATION -> {
+                RecordingIslandOverlayManager.dismissBothFinishedNotificationAndOverlay(this)
+                stopSelf()
+            }
+
             ACTION_NOTIFICATION_BOOKMARK -> {
                 dispatchBookmarkAction()
             }
@@ -1470,7 +1475,6 @@ class RecordingForegroundService : Service() {
             .setContentText("")
             .setContentIntent(pendingOpen)
             .setCustomContentView(compactConfirmView)
-            .setCustomHeadsUpContentView(compactConfirmView)
             .addAction(dontAction)
             .addAction(saveAction)
             .setOngoing(true)
@@ -1481,6 +1485,10 @@ class RecordingForegroundService : Service() {
             .setColor(0xFFE38851.toInt())
             .setShowWhen(false)
             .setUsesChronometer(false)
+
+        if (!RecordingIslandOverlayManager.canDrawSystemOverlay(this)) {
+            builder.setCustomHeadsUpContentView(compactConfirmView)
+        }
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
             builder.setForegroundServiceBehavior(Notification.FOREGROUND_SERVICE_IMMEDIATE)
@@ -1523,10 +1531,10 @@ class RecordingForegroundService : Service() {
         val notif = buildFinishedNotification(title)
         try {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
-                stopForeground(STOP_FOREGROUND_DETACH)
+                stopForeground(STOP_FOREGROUND_REMOVE)
             } else {
                 @Suppress("DEPRECATION")
-                stopForeground(false)
+                stopForeground(true)
             }
         } catch (_: Exception) {}
 
@@ -1593,6 +1601,16 @@ class RecordingForegroundService : Service() {
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
 
+        val dismissIntent = Intent(this, RecordingForegroundService::class.java).apply {
+            action = ACTION_DISMISS_FINISHED_NOTIFICATION
+        }
+        val pendingDismiss = PendingIntent.getService(
+            this,
+            109,
+            dismissIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+
         val blendedTitle = buildGradientBlendedEnglishTitle(title)
         val compactView = android.widget.RemoteViews(packageName, R.layout.notification_finished_compact).apply {
             setTextViewText(R.id.notif_finished_title, blendedTitle)
@@ -1600,21 +1618,21 @@ class RecordingForegroundService : Service() {
         }
 
         val builder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            Notification.Builder(this, CHANNEL_ID)
+            Notification.Builder(this, FINISHED_CHANNEL_ID)
         } else {
             @Suppress("DEPRECATION")
             Notification.Builder(this)
         }
 
-        // Minimalist single-row compact notification featuring the Greek Omega (Ω) symbol and gradient-blended English title
+        // Minimalist single-row compact notification in the shade (no Heads-Up Notification banner)
         builder
             .setSmallIcon(R.drawable.ic_notif_finished_check)
             .setContentTitle(blendedTitle)
             .setContentText("")
             .setContentIntent(pendingOpen)
+            .setDeleteIntent(pendingDismiss)
             .setCustomContentView(compactView)
             .setCustomBigContentView(compactView)
-            .setCustomHeadsUpContentView(compactView)
             .setOngoing(false)
             .setAutoCancel(true)
             .setOnlyAlertOnce(true)
@@ -1624,11 +1642,18 @@ class RecordingForegroundService : Service() {
             .setShowWhen(false)
             .setUsesChronometer(false)
 
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            builder.setForegroundServiceBehavior(Notification.FOREGROUND_SERVICE_IMMEDIATE)
+        @Suppress("DEPRECATION")
+        builder.setPriority(Notification.PRIORITY_DEFAULT)
+        @Suppress("DEPRECATION")
+        builder.setDefaults(0)
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            builder.setGroupAlertBehavior(Notification.GROUP_ALERT_SUMMARY)
         }
 
         val notification = builder.build()
+        @Suppress("DEPRECATION")
+        notification.headsUpContentView = null
 
         // HyperOS Dynamic Island (HyperIsland) compact capsule specification:
         // Left: Signature orange & white audio waveform icon
@@ -1652,13 +1677,14 @@ class RecordingForegroundService : Service() {
         } catch (_: Exception) {}
 
         notification.extras.putIntArray(Notification.EXTRA_COMPACT_ACTIONS, intArrayOf())
-        notification.extras.putBoolean("android.requestPromotedOngoing", true)
+        notification.extras.putBoolean("android.requestPromotedOngoing", false)
         return notification
     }
 
     private fun createNotificationChannel() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val channel = NotificationChannel(
+            val nm = getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager
+            val liveChannel = NotificationChannel(
                 CHANNEL_ID,
                 getString(R.string.notification_channel_name),
                 NotificationManager.IMPORTANCE_HIGH
@@ -1669,8 +1695,20 @@ class RecordingForegroundService : Service() {
                 enableVibration(false)
                 lockscreenVisibility = Notification.VISIBILITY_PUBLIC
             }
-            val nm = getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager
-            nm?.createNotificationChannel(channel)
+            nm?.createNotificationChannel(liveChannel)
+
+            val finishedChannel = NotificationChannel(
+                FINISHED_CHANNEL_ID,
+                getString(R.string.notification_channel_name),
+                NotificationManager.IMPORTANCE_DEFAULT
+            ).apply {
+                description = getString(R.string.notification_channel_desc)
+                setShowBadge(false)
+                setSound(null, null)
+                enableVibration(false)
+                lockscreenVisibility = Notification.VISIBILITY_PUBLIC
+            }
+            nm?.createNotificationChannel(finishedChannel)
         }
     }
 
@@ -1699,13 +1737,16 @@ class RecordingForegroundService : Service() {
 
     companion object {
         const val CHANNEL_ID = "audio_recorder_studio_live_channel_v3"
+        const val FINISHED_CHANNEL_ID = "audio_recorder_studio_finished_channel_v1"
         const val NOTIFICATION_ID = 4102
+        const val FINISHED_NOTIFICATION_ID = 4103
 
         // Recording actions
         const val ACTION_START_FOREGROUND = "com.example.action.START_FOREGROUND"
         const val ACTION_UPDATE_NOTIFICATION = "com.example.action.UPDATE_NOTIFICATION"
         const val ACTION_STOP_FOREGROUND = "com.example.action.STOP_FOREGROUND"
         const val ACTION_SHOW_SAVED_CONFIRMATION = "com.example.action.SHOW_SAVED_CONFIRMATION"
+        const val ACTION_DISMISS_FINISHED_NOTIFICATION = "com.example.action.DISMISS_FINISHED_NOTIFICATION"
         const val ACTION_SHOW_APPEND_SAVE_CONFIRMATION = "com.example.action.SHOW_APPEND_SAVE_CONFIRMATION"
         const val ACTION_OPEN_LAST_SAVED_RECORDING = "com.example.action.OPEN_LAST_SAVED_RECORDING"
         const val ACTION_PROMPT_APPEND_SAVE = "com.example.action.PROMPT_APPEND_SAVE"

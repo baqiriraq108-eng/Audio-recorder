@@ -1018,9 +1018,14 @@ class ExampleRobolectricTest {
         assertTrue(focusParam.contains("\"dismissIsland\":false"))
         val focusPics = finishedNotif.extras.getBundle("miui.focus.pics")
         org.junit.Assert.assertNotNull(focusPics)
-        // Swipe to dismiss enabled (not ongoing, auto-cancel true)
+        // Swipe to dismiss enabled (not ongoing, auto-cancel true, deleteIntent attached, requestPromotedOngoing false)
         org.junit.Assert.assertFalse((finishedNotif.flags and android.app.Notification.FLAG_ONGOING_EVENT) != 0)
         assertTrue((finishedNotif.flags and android.app.Notification.FLAG_AUTO_CANCEL) != 0)
+        org.junit.Assert.assertNotNull(finishedNotif.deleteIntent)
+        org.junit.Assert.assertFalse(finishedNotif.extras.getBoolean("android.requestPromotedOngoing", true))
+        @Suppress("DEPRECATION")
+        org.junit.Assert.assertNull(finishedNotif.headsUpContentView)
+        assertEquals(com.example.service.RecordingForegroundService.FINISHED_CHANNEL_ID, finishedNotif.channelId)
 
         // 3. Verify showing confirmation notification does not vanish automatically via timer
         service.showFinishedSavedConfirmation("Saved Lecture")

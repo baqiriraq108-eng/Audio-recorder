@@ -115,7 +115,8 @@ fun PostRecordingSaveSheet(
         },
         properties = DialogProperties(
             dismissOnBackPress = false,
-            dismissOnClickOutside = false
+            dismissOnClickOutside = false,
+            usePlatformDefaultWidth = false
         )
     ) {
         Surface(
@@ -125,6 +126,8 @@ fun PostRecordingSaveSheet(
             tonalElevation = 0.dp,
             modifier = Modifier
                 .fillMaxWidth()
+                .padding(horizontal = 24.dp)
+                .clip(RoundedCornerShape(24.dp))
                 .graphicsLayer()
                 .testTag("post_recording_save_sheet")
         ) {
@@ -136,20 +139,22 @@ fun PostRecordingSaveSheet(
             ) {
                 Text(
                     text = "Save Recording",
-                    style = MaterialTheme.typography.headlineSmall,
+                    style = MaterialTheme.typography.titleLarge.copy(
+                        fontWeight = FontWeight.Bold,
+                        fontSize = 20.sp
+                    ),
                     color = PrimaryText,
-                    fontWeight = FontWeight.Bold,
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis
                 )
 
-                Spacer(modifier = Modifier.height(4.dp))
+                Spacer(modifier = Modifier.height(6.dp))
 
                 Text(
                     text = "Duration: ${AudioFormatUtils.formatDurationHMS(pending.durationMs)}" +
                         if (pending.bookmarks.isNotEmpty()) " • ${pending.bookmarks.size} Bookmark(s)" else "",
                     style = MaterialTheme.typography.bodyMedium,
-                    color = PeachAccent,
+                    color = SecondaryText,
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis
                 )
@@ -171,9 +176,9 @@ fun PostRecordingSaveSheet(
                     singleLine = true,
                     shape = RoundedCornerShape(12.dp),
                     colors = OutlinedTextFieldDefaults.colors(
-                        focusedBorderColor = PeachAccent,
+                        focusedBorderColor = PrimaryText,
                         unfocusedBorderColor = androidx.compose.ui.graphics.Color.Transparent,
-                        focusedLabelColor = PeachAccent,
+                        focusedLabelColor = PrimaryText,
                         unfocusedLabelColor = SecondaryText,
                         focusedTextColor = PrimaryText,
                         unfocusedTextColor = PrimaryText,
@@ -189,28 +194,31 @@ fun PostRecordingSaveSheet(
 
                 Row(
                     modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(12.dp)
+                    horizontalArrangement = Arrangement.spacedBy(12.dp),
+                    verticalAlignment = Alignment.CenterVertically
                 ) {
                     Button(
                         onClick = onDiscard,
                         shape = CircleShape,
                         elevation = ButtonDefaults.buttonElevation(0.dp, 0.dp, 0.dp),
                         colors = ButtonDefaults.buttonColors(
-                            containerColor = ElevatedSurface,
-                            contentColor = PeachAccent
+                            containerColor = TonalDarkBrown,
+                            contentColor = PrimaryText
                         ),
                         modifier = Modifier
                             .weight(1f)
                             .height(48.dp)
                             .testTag("save_sheet_discard_button")
                     ) {
-                        Icon(
-                            imageVector = Icons.Default.DeleteOutline,
-                            contentDescription = "Don't Save recording",
-                            modifier = Modifier.size(18.dp)
+                        Text(
+                            text = "Cancel",
+                            style = MaterialTheme.typography.labelLarge.copy(
+                                fontWeight = FontWeight.SemiBold,
+                                fontSize = 15.sp
+                            ),
+                            color = PrimaryText,
+                            maxLines = 1
                         )
-                        Spacer(modifier = Modifier.width(6.dp))
-                        Text("Don't Save", maxLines = 1)
                     }
 
                     Button(
@@ -218,21 +226,23 @@ fun PostRecordingSaveSheet(
                         shape = CircleShape,
                         elevation = ButtonDefaults.buttonElevation(0.dp, 0.dp, 0.dp),
                         colors = ButtonDefaults.buttonColors(
-                            containerColor = PeachAccent,
-                            contentColor = OnPeachAccent
+                            containerColor = TonalDarkBrown,
+                            contentColor = PrimaryText
                         ),
                         modifier = Modifier
-                            .weight(1.2f)
+                            .weight(1f)
                             .height(48.dp)
                             .testTag("save_sheet_confirm_button")
                     ) {
-                        Icon(
-                            imageVector = Icons.Default.Save,
-                            contentDescription = "Save recording",
-                            modifier = Modifier.size(18.dp)
+                        Text(
+                            text = "Confirm",
+                            style = MaterialTheme.typography.labelLarge.copy(
+                                fontWeight = FontWeight.SemiBold,
+                                fontSize = 15.sp
+                            ),
+                            color = PrimaryText,
+                            maxLines = 1
                         )
-                        Spacer(modifier = Modifier.width(8.dp))
-                        Text("Save", maxLines = 1)
                     }
                 }
             }
@@ -1013,6 +1023,7 @@ fun EditRecordingDialog(
         Surface(
             shape = RoundedCornerShape(24.dp),
             color = WarmSecondarySurface,
+            tonalElevation = 0.dp,
             modifier = Modifier
                 .fillMaxWidth()
                 .padding(horizontal = 24.dp)
@@ -1333,7 +1344,7 @@ fun UnifiedTrashConfirmDialog(
                 .let { mod -> if (dialogTestTag != null) mod.testTag(dialogTestTag) else mod },
             color = WarmSecondarySurface,
             shape = RoundedCornerShape(24.dp),
-            tonalElevation = 6.dp
+            tonalElevation = 0.dp
         ) {
             Column(
                 modifier = Modifier

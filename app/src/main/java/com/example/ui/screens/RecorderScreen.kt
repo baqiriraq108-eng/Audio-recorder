@@ -84,6 +84,7 @@ import com.example.ui.theme.PeachAccent
 import com.example.ui.theme.PrimaryText
 import com.example.ui.theme.SecondaryText
 import com.example.ui.theme.TabularMonoStyle
+import com.example.ui.theme.TonalDarkBrown
 import com.example.ui.theme.WarmSecondarySurface
 import com.example.ui.theme.m3PressScale
 import java.util.Locale
@@ -750,7 +751,7 @@ fun RecorderScreen(
                     .testTag("append_confirm_dialog"),
                 color = WarmSecondarySurface,
                 shape = RoundedCornerShape(24.dp),
-                tonalElevation = 6.dp
+                tonalElevation = 0.dp
             ) {
                 Column(
                     modifier = Modifier
@@ -798,7 +799,7 @@ fun RecorderScreen(
                                 .weight(1f)
                                 .height(48.dp)
                                 .clip(CircleShape)
-                                .background(ElevatedSurface)
+                                .background(TonalDarkBrown)
                                 .m3PressScale(
                                     shape = CircleShape,
                                     onClick = onDismissAppendSaveConfirmDialog
@@ -808,7 +809,7 @@ fun RecorderScreen(
                             Text(
                                 text = "Cancel",
                                 style = MaterialTheme.typography.labelLarge.copy(
-                                    fontWeight = FontWeight.Medium,
+                                    fontWeight = FontWeight.SemiBold,
                                     fontSize = 15.sp
                                 ),
                                 color = PrimaryText
@@ -822,7 +823,7 @@ fun RecorderScreen(
                                 .weight(1f)
                                 .height(48.dp)
                                 .clip(CircleShape)
-                                .background(ElevatedSurface)
+                                .background(TonalDarkBrown)
                                 .m3PressScale(
                                     shape = CircleShape,
                                     onClick = onConfirmAppendSave
@@ -830,12 +831,12 @@ fun RecorderScreen(
                                 .testTag("append_confirm_yes_save_button")
                         ) {
                             Text(
-                                text = "Save",
+                                text = "Confirm",
                                 style = MaterialTheme.typography.labelLarge.copy(
-                                    fontWeight = FontWeight.Bold,
+                                    fontWeight = FontWeight.SemiBold,
                                     fontSize = 15.sp
                                 ),
-                                color = PeachAccent
+                                color = PrimaryText
                             )
                         }
                     }

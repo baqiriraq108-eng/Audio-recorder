@@ -1,6 +1,6 @@
 {
-  "summary": "Implementation plan to fix (1) completion capsule flickering on the home screen by updating the existing WindowManager overlay view in-place with a smooth crossfade and deduplicating completion emissions, and (2) status banner overlap by anchoring the status banner strictly above the controls card container with a 12dp bottom separation margin across playback, trim, and recording screens.",
-  "updatedAt": "2026-11-04T22:13:18.570790507Z",
+  "summary": "Updated implementation plan unifying all procedural dialogs to the exact zero-elevation deep dark surface of Edit Recording Details, styling selected audio setting chips with a tonal dark fill and coral-orange border and text, and refining the recording completion flow so only the Dynamic Island overlay capsule transitions in-place on the home screen while the notification shade updates silently without a duplicate heads-up popup.",
+  "updatedAt": "2026-11-05T08:49:57.260292308Z",
   "requestFeedback": true,
   "userFacing": true
 }

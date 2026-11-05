@@ -8,6 +8,7 @@ import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.shrinkVertically
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -38,6 +39,7 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Slider
 import androidx.compose.material3.SliderDefaults
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
 import androidx.compose.material3.SwitchDefaults
 import androidx.compose.material3.Text
@@ -821,6 +823,11 @@ private fun RecordingEncoderModalDialog(
     onUpdateSettings: ((RecorderSettings) -> RecorderSettings) -> Unit,
     onDismiss: () -> Unit
 ) {
+    var draftFormat by remember(settings) { mutableStateOf(settings.defaultFormat) }
+    var draftSampleRate by remember(settings) { mutableStateOf(settings.sampleRate) }
+    var draftChannels by remember(settings) { mutableStateOf(settings.channels) }
+    var draftBitDepth by remember(settings) { mutableStateOf(settings.bitDepth) }
+
     Dialog(
         onDismissRequest = onDismiss,
         properties = DialogProperties(
@@ -829,236 +836,266 @@ private fun RecordingEncoderModalDialog(
             usePlatformDefaultWidth = false
         )
     ) {
-        Column(
+        Surface(
+            shape = RoundedCornerShape(24.dp),
+            color = WarmSecondarySurface,
+            tonalElevation = 0.dp,
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(horizontal = 14.dp)
-                .clip(RoundedCornerShape(22.dp))
-                .background(WarmSecondarySurface)
-                .padding(horizontal = 16.dp, vertical = 20.dp)
+                .padding(horizontal = 24.dp)
+                .clip(RoundedCornerShape(24.dp))
                 .testTag("recording_encoder_modal_dialog")
         ) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Icon(
-                    imageVector = Icons.Default.Mic,
-                    contentDescription = "Recording & Encoder",
-                    tint = PeachAccent,
-                    modifier = Modifier.size(22.dp)
-                )
-                Spacer(modifier = Modifier.width(8.dp))
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 24.dp, vertical = 22.dp)
+            ) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Icon(
+                        imageVector = Icons.Default.Mic,
+                        contentDescription = "Recording & Encoder",
+                        tint = PrimaryText,
+                        modifier = Modifier.size(22.dp)
+                    )
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Text(
+                        text = "Recording & Encoder",
+                        style = MaterialTheme.typography.titleLarge.copy(
+                            fontWeight = FontWeight.Bold,
+                            fontSize = 20.sp
+                        ),
+                        color = PrimaryText,
+                        maxLines = 1
+                    )
+                }
+
+                Spacer(modifier = Modifier.height(14.dp))
+
+                // Default Format
                 Text(
-                    text = "Recording & Encoder",
-                    style = MaterialTheme.typography.titleLarge,
-                    color = PrimaryText,
+                    text = "Default Audio Format",
+                    style = MaterialTheme.typography.labelLarge,
+                    color = SecondaryText,
                     maxLines = 1
                 )
-            }
-
-            Spacer(modifier = Modifier.height(14.dp))
-
-            // Default Format
-            Text(
-                text = "Default Audio Format",
-                style = MaterialTheme.typography.labelLarge,
-                color = SecondaryText,
-                maxLines = 1
-            )
-            Spacer(modifier = Modifier.height(8.dp))
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(8.dp)
-            ) {
-                AudioFormatOption.entries.forEach { fmt ->
-                    val selected = settings.defaultFormat == fmt
-                    Box(
-                        contentAlignment = Alignment.Center,
-                        modifier = Modifier
-                            .weight(1f)
-                            .height(42.dp)
-                            .clip(CircleShape)
-                            .background(if (selected) PeachAccent else ElevatedSurface)
-                            .m3PressScale(
-                                shape = CircleShape,
-                                onClick = {
-                                    onUpdateSettings {
-                                        it.copy(
-                                            defaultFormat = fmt,
-                                            bitrate = fmt.defaultBitrate
-                                        )
+                Spacer(modifier = Modifier.height(8.dp))
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    AudioFormatOption.entries.forEach { fmt ->
+                        val selected = draftFormat == fmt
+                        Box(
+                            contentAlignment = Alignment.Center,
+                            modifier = Modifier
+                                .weight(1f)
+                                .height(42.dp)
+                                .clip(CircleShape)
+                                .background(if (selected) TonalDarkBrown else ObsidianBackground)
+                                .let { mod ->
+                                    if (selected) {
+                                        mod.border(1.5.dp, PeachAccent, CircleShape)
+                                    } else {
+                                        mod
                                     }
                                 }
+                                .m3PressScale(
+                                    shape = CircleShape,
+                                    onClick = {
+                                        draftFormat = fmt
+                                    }
+                                )
+                                .testTag("settings_format_${fmt.id}")
+                        ) {
+                            Text(
+                                text = fmt.label,
+                                style = MaterialTheme.typography.labelLarge.copy(
+                                    fontWeight = if (selected) FontWeight.Bold else FontWeight.Medium
+                                ),
+                                color = if (selected) PeachAccent else PrimaryText,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
                             )
-                            .testTag("settings_format_${fmt.id}")
-                    ) {
-                        Text(
-                            text = fmt.label,
-                            style = MaterialTheme.typography.labelLarge,
-                            color = if (selected) OnPeachAccent else PrimaryText,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis
-                        )
+                        }
                     }
                 }
-            }
 
-            Spacer(modifier = Modifier.height(14.dp))
+                Spacer(modifier = Modifier.height(14.dp))
 
-            // Sample Rate
-            Text(
-                text = "Sample Rate",
-                style = MaterialTheme.typography.labelLarge,
-                color = SecondaryText,
-                maxLines = 1
-            )
-            Spacer(modifier = Modifier.height(8.dp))
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(8.dp)
-            ) {
-                listOf(16000 to "16 kHz", 22050 to "22.05 kHz", 44100 to "44.1 kHz", 48000 to "48 kHz").forEach { (sr, label) ->
-                    val selected = settings.sampleRate == sr
-                    Box(
-                        contentAlignment = Alignment.Center,
+                // Sample Rate
+                Text(
+                    text = "Sample Rate",
+                    style = MaterialTheme.typography.labelLarge,
+                    color = SecondaryText,
+                    maxLines = 1
+                )
+                Spacer(modifier = Modifier.height(8.dp))
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    listOf(16000 to "16 kHz", 22050 to "22.05 kHz", 44100 to "44.1 kHz", 48000 to "48 kHz").forEach { (sr, label) ->
+                        val selected = draftSampleRate == sr
+                        Box(
+                            contentAlignment = Alignment.Center,
+                            modifier = Modifier
+                                .weight(1f)
+                                .height(38.dp)
+                                .clip(CircleShape)
+                                .background(if (selected) TonalDarkBrown else ObsidianBackground)
+                                .let { mod ->
+                                    if (selected) {
+                                        mod.border(1.5.dp, PeachAccent, CircleShape)
+                                    } else {
+                                        mod
+                                    }
+                                }
+                                .m3PressScale(
+                                    shape = CircleShape,
+                                    onClick = {
+                                        draftSampleRate = sr
+                                    }
+                                )
+                                .testTag("settings_sr_$sr")
+                        ) {
+                            Text(
+                                text = label,
+                                style = TabularMonoStyle.copy(
+                                    fontSize = 11.sp,
+                                    fontWeight = if (selected) FontWeight.Bold else FontWeight.Medium
+                                ),
+                                color = if (selected) PeachAccent else PrimaryText,
+                                maxLines = 1
+                            )
+                        }
+                    }
+                }
+
+                Spacer(modifier = Modifier.height(14.dp))
+
+                // Channels & Bit Depth
+                Text(
+                    text = "Channels & Bit Depth",
+                    style = MaterialTheme.typography.labelLarge,
+                    color = SecondaryText,
+                    maxLines = 1
+                )
+                Spacer(modifier = Modifier.height(8.dp))
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    listOf(
+                        Triple(1, 16, "Mono 16-bit"),
+                        Triple(2, 16, "Stereo 16-bit"),
+                        Triple(2, 24, "Studio 24-bit")
+                    ).forEach { (ch, bd, label) ->
+                        val selected = draftChannels == ch && draftBitDepth == bd
+                        Box(
+                            contentAlignment = Alignment.Center,
+                            modifier = Modifier
+                                .weight(1f)
+                                .height(42.dp)
+                                .clip(CircleShape)
+                                .background(if (selected) TonalDarkBrown else ObsidianBackground)
+                                .let { mod ->
+                                    if (selected) {
+                                        mod.border(1.5.dp, PeachAccent, CircleShape)
+                                    } else {
+                                        mod
+                                    }
+                                }
+                                .m3PressScale(
+                                    shape = CircleShape,
+                                    onClick = {
+                                        draftChannels = ch
+                                        draftBitDepth = bd
+                                    }
+                                )
+                                .padding(horizontal = 2.dp)
+                        ) {
+                            Text(
+                                text = label,
+                                style = MaterialTheme.typography.labelMedium.copy(
+                                    fontSize = 11.5.sp,
+                                    letterSpacing = (-0.3).sp,
+                                    fontWeight = if (selected) FontWeight.Bold else FontWeight.Medium
+                                ),
+                                color = if (selected) PeachAccent else PrimaryText,
+                                maxLines = 1,
+                                softWrap = false
+                            )
+                        }
+                    }
+                }
+
+                Spacer(modifier = Modifier.height(20.dp))
+
+                // Unified Cancel & Confirm Action Buttons (48.dp, TonalDarkBrown, PrimaryText)
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(12.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Button(
+                        onClick = onDismiss,
+                        shape = CircleShape,
+                        elevation = ButtonDefaults.buttonElevation(0.dp, 0.dp, 0.dp),
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = TonalDarkBrown,
+                            contentColor = PrimaryText
+                        ),
                         modifier = Modifier
                             .weight(1f)
-                            .height(38.dp)
-                            .clip(CircleShape)
-                            .background(if (selected) PeachAccent else ElevatedSurface)
-                            .m3PressScale(
-                                shape = CircleShape,
-                                onClick = {
-                                    onUpdateSettings { it.copy(sampleRate = sr) }
-                                }
-                            )
-                            .testTag("settings_sr_$sr")
+                            .height(48.dp)
+                            .testTag("encoder_modal_reset_button")
                     ) {
                         Text(
-                            text = label,
-                            style = TabularMonoStyle.copy(
-                                fontSize = 11.sp,
-                                fontWeight = if (selected) FontWeight.Bold else FontWeight.Medium
+                            text = "Cancel",
+                            style = MaterialTheme.typography.labelLarge.copy(
+                                fontWeight = FontWeight.SemiBold,
+                                fontSize = 15.sp
                             ),
-                            color = if (selected) OnPeachAccent else PrimaryText,
+                            color = PrimaryText,
                             maxLines = 1
                         )
                     }
-                }
-            }
 
-            Spacer(modifier = Modifier.height(14.dp))
-
-            // Channels & Bit Depth
-            Text(
-                text = "Channels & Bit Depth",
-                style = MaterialTheme.typography.labelLarge,
-                color = SecondaryText,
-                maxLines = 1
-            )
-            Spacer(modifier = Modifier.height(8.dp))
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(6.dp)
-            ) {
-                listOf(
-                    Triple(1, 16, "Mono 16-bit"),
-                    Triple(2, 16, "Stereo 16-bit"),
-                    Triple(2, 24, "Studio 24-bit")
-                ).forEach { (ch, bd, label) ->
-                    val selected = settings.channels == ch && settings.bitDepth == bd
-                    Box(
-                        contentAlignment = Alignment.Center,
+                    Button(
+                        onClick = {
+                            onUpdateSettings {
+                                it.copy(
+                                    defaultFormat = draftFormat,
+                                    sampleRate = draftSampleRate,
+                                    channels = draftChannels,
+                                    bitDepth = draftBitDepth,
+                                    bitrate = draftFormat.defaultBitrate
+                                )
+                            }
+                            onDismiss()
+                        },
+                        shape = CircleShape,
+                        elevation = ButtonDefaults.buttonElevation(0.dp, 0.dp, 0.dp),
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = TonalDarkBrown,
+                            contentColor = PrimaryText
+                        ),
                         modifier = Modifier
                             .weight(1f)
-                            .height(42.dp)
-                            .clip(CircleShape)
-                            .background(if (selected) PeachAccent else ElevatedSurface)
-                            .m3PressScale(
-                                shape = CircleShape,
-                                onClick = {
-                                    onUpdateSettings { it.copy(channels = ch, bitDepth = bd) }
-                                }
-                            )
-                            .padding(horizontal = 2.dp)
+                            .height(48.dp)
+                            .testTag("encoder_modal_ok_button")
                     ) {
                         Text(
-                            text = label,
-                            style = MaterialTheme.typography.labelMedium.copy(
-                                fontSize = 11.5.sp,
-                                letterSpacing = (-0.3).sp,
-                                fontWeight = if (selected) FontWeight.Bold else FontWeight.Medium
+                            text = "Confirm",
+                            style = MaterialTheme.typography.labelLarge.copy(
+                                fontWeight = FontWeight.SemiBold,
+                                fontSize = 15.sp
                             ),
-                            color = if (selected) OnPeachAccent else PrimaryText,
-                            maxLines = 1,
-                            softWrap = false
+                            color = PrimaryText,
+                            maxLines = 1
                         )
                     }
-                }
-            }
-
-            Spacer(modifier = Modifier.height(20.dp))
-
-            // Unified Cancel & Confirm Action Buttons (48.dp, TonalDarkBrown, PrimaryText)
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(12.dp),
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Button(
-                    onClick = {
-                        onUpdateSettings {
-                            it.copy(
-                                defaultFormat = AudioFormatOption.M4A,
-                                sampleRate = 44100,
-                                bitDepth = 16,
-                                channels = 1,
-                                bitrate = AudioFormatOption.M4A.defaultBitrate
-                            )
-                        }
-                    },
-                    shape = CircleShape,
-                    elevation = ButtonDefaults.buttonElevation(0.dp, 0.dp, 0.dp),
-                    colors = ButtonDefaults.buttonColors(
-                        containerColor = TonalDarkBrown,
-                        contentColor = PrimaryText
-                    ),
-                    modifier = Modifier
-                        .weight(1f)
-                        .height(48.dp)
-                        .testTag("encoder_modal_reset_button")
-                ) {
-                    Text(
-                        text = "Cancel",
-                        style = MaterialTheme.typography.labelLarge.copy(
-                            fontWeight = FontWeight.SemiBold,
-                            fontSize = 15.sp
-                        ),
-                        color = PrimaryText,
-                        maxLines = 1
-                    )
-                }
-
-                Button(
-                    onClick = onDismiss,
-                    shape = CircleShape,
-                    elevation = ButtonDefaults.buttonElevation(0.dp, 0.dp, 0.dp),
-                    colors = ButtonDefaults.buttonColors(
-                        containerColor = TonalDarkBrown,
-                        contentColor = PrimaryText
-                    ),
-                    modifier = Modifier
-                        .weight(1f)
-                        .height(48.dp)
-                        .testTag("encoder_modal_ok_button")
-                ) {
-                    Text(
-                        text = "Confirm",
-                        style = MaterialTheme.typography.labelLarge.copy(
-                            fontWeight = FontWeight.SemiBold,
-                            fontSize = 15.sp
-                        ),
-                        color = PrimaryText,
-                        maxLines = 1
-                    )
                 }
             }
         }

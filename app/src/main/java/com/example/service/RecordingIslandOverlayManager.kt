@@ -304,6 +304,7 @@ object RecordingIslandOverlayManager {
         try {
             val nm = context.getSystemService(Context.NOTIFICATION_SERVICE) as? android.app.NotificationManager
             nm?.cancel(RecordingForegroundService.NOTIFICATION_ID)
+            nm?.cancel(RecordingForegroundService.FINISHED_NOTIFICATION_ID)
         } catch (_: Exception) {}
         try {
             val openIntent = Intent(context, MainActivity::class.java).apply {
@@ -318,12 +319,115 @@ object RecordingIslandOverlayManager {
         dismissAndReset()
     }
 
+    fun dismissBothFinishedNotificationAndOverlay(context: Context) {
+        try {
+            val nm = context.getSystemService(Context.NOTIFICATION_SERVICE) as? android.app.NotificationManager
+            nm?.cancel(RecordingForegroundService.NOTIFICATION_ID)
+            nm?.cancel(RecordingForegroundService.FINISHED_NOTIFICATION_ID)
+        } catch (_: Exception) {}
+        dismissAndReset()
+    }
+
     fun dismissAndReset() {
         isRecordingSessionActive = false
         lastIsShowingAppendConfirm = false
         lastIsShowingFinishedCompletion = false
         currentMode = OverlayMode.DOCKED_PILL
         detachOverlayWindow()
+    }
+
+    private fun attachFinishedCardSwipeAndTapListener(context: Context, finishedCard: View) {
+        val density = context.resources.displayMetrics.density
+        val touchSlopPx = 10f * density
+        val horizontalSwipeThresholdPx = 48f * density
+        val upwardSwipeThresholdPx = 28f * density
+
+        var downRawX = 0f
+        var downRawY = 0f
+        var isDragging = false
+
+        finishedCard.setOnTouchListener { view, event ->
+            when (event.actionMasked) {
+                MotionEvent.ACTION_DOWN -> {
+                    downRawX = event.rawX
+                    downRawY = event.rawY
+                    isDragging = false
+                    view.animate().cancel()
+                    true
+                }
+                MotionEvent.ACTION_MOVE -> {
+                    val dx = event.rawX - downRawX
+                    val dy = event.rawY - downRawY
+                    if (!isDragging && (kotlin.math.abs(dx) > touchSlopPx || kotlin.math.abs(dy) > touchSlopPx)) {
+                        isDragging = true
+                    }
+                    if (isDragging) {
+                        // Allow dragging horizontally to either side or upward
+                        val clampedDy = dy.coerceAtMost(0f)
+                        view.translationX = dx
+                        view.translationY = clampedDy
+                        val dragProgress = maxOf(
+                            kotlin.math.abs(dx) / (horizontalSwipeThresholdPx * 2.2f),
+                            kotlin.math.abs(clampedDy) / (upwardSwipeThresholdPx * 2.2f)
+                        ).coerceIn(0f, 0.85f)
+                        view.alpha = 1f - dragProgress
+                    }
+                    true
+                }
+                MotionEvent.ACTION_UP -> {
+                    val dx = event.rawX - downRawX
+                    val dy = event.rawY - downRawY
+                    val swipedUpward = dy < -upwardSwipeThresholdPx && kotlin.math.abs(dy) >= kotlin.math.abs(dx) * 0.5f
+                    val swipedHorizontally = kotlin.math.abs(dx) > horizontalSwipeThresholdPx
+
+                    if (!isDragging && kotlin.math.abs(dx) <= touchSlopPx && kotlin.math.abs(dy) <= touchSlopPx) {
+                        view.translationX = 0f
+                        view.translationY = 0f
+                        view.alpha = 1f
+                        view.performClick()
+                    } else if (swipedUpward) {
+                        val targetY = -((view.height.takeIf { it > 0 } ?: (96 * density).toInt()).toFloat() + 64f * density)
+                        view.animate()
+                            .translationY(targetY)
+                            .alpha(0f)
+                            .setDuration(150L)
+                            .withEndAction {
+                                dismissBothFinishedNotificationAndOverlay(context)
+                            }
+                            .start()
+                    } else if (swipedHorizontally) {
+                        val direction = if (dx > 0f) 1f else -1f
+                        val screenWidth = context.resources.displayMetrics.widthPixels.takeIf { it > 0 } ?: 1080
+                        view.animate()
+                            .translationX(direction * screenWidth.toFloat())
+                            .alpha(0f)
+                            .setDuration(160L)
+                            .withEndAction {
+                                dismissBothFinishedNotificationAndOverlay(context)
+                            }
+                            .start()
+                    } else {
+                        view.animate()
+                            .translationX(0f)
+                            .translationY(0f)
+                            .alpha(1f)
+                            .setDuration(140L)
+                            .start()
+                    }
+                    true
+                }
+                MotionEvent.ACTION_CANCEL -> {
+                    view.animate()
+                        .translationX(0f)
+                        .translationY(0f)
+                        .alpha(1f)
+                        .setDuration(140L)
+                        .start()
+                    true
+                }
+                else -> false
+            }
+        }
     }
 
     internal fun buildOverlayContentView(context: Context): View {
@@ -402,7 +506,7 @@ object RecordingIslandOverlayManager {
             override fun onTouchEvent(event: MotionEvent?): Boolean {
                 if (event?.action == MotionEvent.ACTION_OUTSIDE || event?.action == MotionEvent.ACTION_DOWN) {
                     if (lastIsShowingFinishedCompletion) {
-                        dismissAndReset()
+                        dismissBothFinishedNotificationAndOverlay(context)
                         return true
                     } else if (!lastIsShowingAppendConfirm) {
                         collapseToDockedPill()
@@ -419,7 +523,7 @@ object RecordingIslandOverlayManager {
             isFocusable = false
             setOnClickListener {
                 if (lastIsShowingFinishedCompletion) {
-                    dismissAndReset()
+                    dismissBothFinishedNotificationAndOverlay(context)
                 } else if (!lastIsShowingAppendConfirm) {
                     collapseToDockedPill()
                 }
@@ -436,6 +540,7 @@ object RecordingIslandOverlayManager {
             finishedCard.setOnClickListener {
                 handleFinishedCapsuleTapOpenSavedRecording(context)
             }
+            attachFinishedCardSwipeAndTapListener(context, finishedCard)
             val cardLp = FrameLayout.LayoutParams(
                 FrameLayout.LayoutParams.MATCH_PARENT,
                 FrameLayout.LayoutParams.WRAP_CONTENT,
