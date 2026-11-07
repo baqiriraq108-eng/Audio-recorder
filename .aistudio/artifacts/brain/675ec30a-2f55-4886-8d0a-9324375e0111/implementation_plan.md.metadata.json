@@ -1,6 +1,6 @@
 {
-  "summary": "Updated implementation plan unifying all procedural dialogs to the exact zero-elevation deep dark surface of Edit Recording Details, styling selected audio setting chips with a tonal dark fill and coral-orange border and text, and refining the recording completion flow so only the Dynamic Island overlay capsule transitions in-place on the home screen while the notification shade updates silently without a duplicate heads-up popup.",
-  "updatedAt": "2026-11-05T08:49:57.260292308Z",
+  "summary": " Architectural and UI plan to fix the jumpy/dancing Dynamic Island recording capsule expansion by implementing a pure in-place geometric width, height, and corner-radius morph with internal content crossfading, strict top-center anchoring, and disabled system window animations (windowAnimations = 0).",
+  "updatedAt": "2026-11-07T01:01:56.891702138Z",
   "requestFeedback": true,
   "userFacing": true
 }

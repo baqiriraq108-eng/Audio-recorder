@@ -739,6 +739,15 @@ fun RecorderScreen(
     }
 
     if (showAppendSaveConfirmDialog) {
+        var dialogRecordingTitle by remember(showAppendSaveConfirmDialog, appendTarget) {
+            val defaultTitle = appendTarget?.title
+                ?: com.example.service.RecordingIslandOverlayManager.currentEditedRecordingTitle.ifBlank {
+                    com.example.service.RecordingIslandOverlayManager.generateDefaultTimestampedTitle()
+                }
+            com.example.service.RecordingIslandOverlayManager.currentEditedRecordingTitle = defaultTitle
+            mutableStateOf(defaultTitle)
+        }
+
         Dialog(
             onDismissRequest = onDismissAppendSaveConfirmDialog,
             properties = DialogProperties(usePlatformDefaultWidth = false)
@@ -784,9 +793,9 @@ fun RecorderScreen(
                         modifier = Modifier.testTag("append_confirm_dialog_message")
                     )
 
-                    Spacer(modifier = Modifier.height(24.dp))
+                    Spacer(modifier = Modifier.height(20.dp))
 
-                    // Symmetric side-by-side equal-width button pill containers
+                    // Symmetric side-by-side equal-width button pill containers on top
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.spacedBy(12.dp),
@@ -826,7 +835,11 @@ fun RecorderScreen(
                                 .background(TonalDarkBrown)
                                 .m3PressScale(
                                     shape = CircleShape,
-                                    onClick = onConfirmAppendSave
+                                    onClick = {
+                                        com.example.service.RecordingIslandOverlayManager.currentEditedRecordingTitle =
+                                            dialogRecordingTitle.trim()
+                                        onConfirmAppendSave()
+                                    }
                                 )
                                 .testTag("append_confirm_yes_save_button")
                         ) {
@@ -840,6 +853,33 @@ fun RecorderScreen(
                             )
                         }
                     }
+
+                    Spacer(modifier = Modifier.height(14.dp))
+
+                    // Recording Name Input Field directly beneath the buttons
+                    androidx.compose.material3.OutlinedTextField(
+                        value = dialogRecordingTitle,
+                        onValueChange = {
+                            dialogRecordingTitle = it
+                            com.example.service.RecordingIslandOverlayManager.currentEditedRecordingTitle = it
+                        },
+                        label = { Text("Recording Title", maxLines = 1) },
+                        singleLine = true,
+                        shape = RoundedCornerShape(14.dp),
+                        colors = androidx.compose.material3.OutlinedTextFieldDefaults.colors(
+                            focusedBorderColor = PeachAccent,
+                            unfocusedBorderColor = Color(0xFF3D2E27),
+                            focusedLabelColor = PrimaryText,
+                            unfocusedLabelColor = SecondaryText,
+                            focusedTextColor = PrimaryText,
+                            unfocusedTextColor = PrimaryText,
+                            focusedContainerColor = com.example.ui.theme.ObsidianBackground,
+                            unfocusedContainerColor = com.example.ui.theme.ObsidianBackground
+                        ),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .testTag("append_confirm_title_input")
+                    )
                 }
             }
         }

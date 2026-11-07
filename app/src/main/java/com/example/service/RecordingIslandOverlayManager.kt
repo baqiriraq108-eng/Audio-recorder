@@ -1,51 +1,68 @@
 package com.example.service
 
+import android.animation.Animator
+import android.animation.AnimatorListenerAdapter
+import android.animation.ValueAnimator
 import android.content.Context
 import android.content.Intent
 import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.LinearGradient
+import android.graphics.Outline
 import android.graphics.Paint
 import android.graphics.Path
 import android.graphics.PixelFormat
 import android.graphics.Shader
+import android.graphics.drawable.GradientDrawable
 import android.net.Uri
 import android.os.Build
 import android.os.SystemClock
 import android.provider.Settings
+import android.text.Editable
+import android.text.InputType
+import android.text.TextWatcher
 import android.util.TypedValue
 import android.view.Gravity
+import android.view.HapticFeedbackConstants
 import android.view.LayoutInflater
 import android.view.MotionEvent
 import android.view.View
+import android.view.ViewGroup
+import android.view.ViewOutlineProvider
 import android.view.WindowManager
+import android.view.animation.DecelerateInterpolator
+import android.view.animation.PathInterpolator
+import android.view.inputmethod.EditorInfo
+import android.view.inputmethod.InputMethodManager
 import android.widget.Chronometer
+import android.widget.EditText
 import android.widget.FrameLayout
 import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.TextView
 import com.example.MainActivity
 import com.example.R
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 
 /**
- * Xiaomi-Style System Overlay Dynamic Capsule (`RecordingIslandOverlayManager`) for active recording.
+ * Dynamic Island System Overlay Capsule (`RecordingIslandOverlayManager`) for active recording.
  *
  * - Appears ONLY when the app moves to the background / Home Screen (`!isAppInForeground`) during
  *   an active or paused recording session (`isRecordingSessionActive`).
  * - Automatically hides whenever `MainActivity` is visible in the foreground.
- * - Supports interactive modes:
- *   1. [OverlayMode.DOCKED_PILL]: Compact black capsule at the top-center status bar / camera cutout
- *      with a live mini oscillating coral waveform on the left and live recording timer on the right.
- *      Tapping anywhere on the capsule expands it to [OverlayMode.EXPANDED_CARD].
- *   2. [OverlayMode.EXPANDED_CARD]: Fixed-height non-expandable dark card (`#1A1614`, `24dp` radius,
- *      zero chevron arrows, zero Cast icon, zero seekbar) with:
- *      - Top Row: Mic icon + `Recording`/`Paused` (Far-Left), live/frozen timer (Far-Right).
- *        Tapping the header opens `MainActivity` and hides the overlay.
- *      - Middle Row: Full-width horizontally centered oscillating cubic-Bezier coral waveform.
- *      - Bottom Row: 3 equal-sized icon-only buttons: Far-Left `Bookmark`, Center `Save`, Far-Right `Pause/Resume`.
- *      - Tapping anywhere outside the expanded card returns it to [OverlayMode.DOCKED_PILL].
- *   3. When the Save button is pressed (`lastIsShowingAppendConfirm == true`), the recording capsule
- *      disappears completely and displays the Save / Cancel (`Θ Don't` / `Σ Save`) confirmation message.
+ * - Implements **Pure In-Place Geometric Morphing** (like YouTube Music / Dynamic Island):
+ *   1. Keeps the exact same `WindowManager` host view and persistent `morphCapsuleShell` attached
+ *      across [OverlayMode.DOCKED_PILL] <-> [OverlayMode.EXPANDED_CARD] transitions without destroying
+ *      or re-creating views, and disables all system window transitions (`windowAnimations = 0`).
+ *   2. Eliminates all rotation, horizontal X-axis sliding, scale distortion, and bouncy overshoot.
+ *      The horizontal center of the capsule remains strictly anchored to top-center throughout
+ *      every frame of expansion and collapse.
+ *   3. Uses a single synchronized `ValueAnimator` (`PathInterpolator(0.2f, 0f, 0f, 1f)`) to smoothly
+ *      interpolate the capsule's pixel width (`pillWidthPx` <-> `expandedWidthPx`), pixel height
+ *      (`pillHeightPx` <-> `expandedHeightPx`), corner radius (`pillHeightPx / 2f` <-> `24dp`),
+ *      and surface color while crossfading the internal pill content and expanded controls in place.
  */
 object RecordingIslandOverlayManager {
 
@@ -57,8 +74,45 @@ object RecordingIslandOverlayManager {
     private const val PREFS_NAME = "dynamic_island_overlay_prefs"
     private const val KEY_PROMPTED_ONCE = "overlay_permission_prompted_once"
 
-    private const val MINI_WAVEFORM_WIDTH_PX = 96
-    private const val MINI_WAVEFORM_HEIGHT_PX = 36
+    private const val MINI_WAVEFORM_WIDTH_PX = 84
+    private const val MINI_WAVEFORM_HEIGHT_PX = 32
+
+    // Sleek compact capsule dimensions & physical screen-right timer alignment
+    internal const val DOCKED_PILL_PAD_LEFT_DP = 11f
+    internal const val DOCKED_PILL_PAD_RIGHT_DP = 14f
+    internal const val DOCKED_PILL_PAD_VERTICAL_DP = 5f
+    internal const val DOCKED_PILL_WAVEFORM_WIDTH_DP = 34f
+    internal const val DOCKED_PILL_WAVEFORM_HEIGHT_DP = 15f
+    internal const val DOCKED_PILL_TIMER_LEFT_MARGIN_DP = 14f
+    internal const val DOCKED_PILL_TIMER_TEXT_SIZE_SP = 11.5f
+
+    // In-place geometric morph constants (width, height, corner radius, crossfade)
+    internal const val MORPH_EXPAND_DURATION_MS = 220L
+    internal const val MORPH_COLLAPSE_DURATION_MS = 190L
+    internal const val TARGET_HIGH_REFRESH_RATE_HZ = 120f
+    private const val EXPANDED_CARD_CORNER_RADIUS_DP = 24f
+    private const val EXPANDED_HORIZONTAL_MARGIN_DP = 12f
+
+    private const val PILL_BG_COLOR = 0xFF0D0B0A.toInt()
+    private const val CARD_BG_COLOR = 0xFF1A1614.toInt()
+    private const val PILL_STROKE_COLOR = 0x33F08C4B
+    private const val CARD_STROKE_COLOR = 0x26F08C4B
+
+    private const val DEFAULT_TOP_DOCK_DP = 6f
+    private const val TRASH_WINDOW_SIZE_DP = 96f
+    private const val TRASH_TARGET_SIZE_DP = 56f
+    private const val TRASH_ICON_SIZE_DP = 26f
+    private const val TRASH_BOTTOM_MARGIN_DP = 48f
+    private const val TRASH_WINDOW_BOTTOM_MARGIN_DP = 28f // 28dp + (96dp - 56dp)/2 = 48dp visual bottom margin
+    private const val TRASH_CAPTURE_RADIUS_DP = 88f
+    private const val LONG_PRESS_DRAG_TIMEOUT_MS = 120L
+
+    private const val TRASH_CONTAINER_IDLE_COLOR = 0xFF33251E.toInt()
+    private const val TRASH_CONTAINER_HOVER_COLOR = 0xFF422D24.toInt()
+    private const val TRASH_BORDER_IDLE_COLOR = 0xFF4A382E.toInt()
+    private const val TRASH_BORDER_HOVER_COLOR = 0xFFF4D7C7.toInt()
+    private const val TRASH_ICON_LIGHT_BEIGE = 0xFFF4D7C7.toInt()
+    private const val TRASH_HOVER_SCALE = 1.22f
 
     @Volatile
     var isAppInForeground: Boolean = false
@@ -100,14 +154,113 @@ object RecordingIslandOverlayManager {
     var lastFinishedTitle: String = "Finished recording"
         private set
 
+    @Volatile
+    var suggestedRecordingTitle: String = ""
+        private set
+
+    @Volatile
+    var currentEditedRecordingTitle: String = ""
+        internal set
+
+    @Volatile
+    var isDraggingPill: Boolean = false
+        private set
+
+    @Volatile
+    var isBottomTrashTargetVisible: Boolean = false
+        private set
+
+    @Volatile
+    var isTrashTargetHovered: Boolean = false
+        private set
+
+    @Volatile
+    var pillDragOffsetX: Int = 0
+        private set
+
+    @Volatile
+    var pillDragOffsetY: Int = 0
+        private set
+
+    @Volatile
+    var lastMorphPivotY: Float = 0f
+        private set
+
+    @Volatile
+    var lastMorphRefreshRateHz: Float = TARGET_HIGH_REFRESH_RATE_HZ
+        private set
+
+    @Volatile
+    var currentMorphProgress: Float = 0f
+        private set
+
+    @Volatile
+    var currentMorphWidthPx: Int = 0
+        private set
+
+    @Volatile
+    var currentMorphHeightPx: Int = 0
+        private set
+
+    @Volatile
+    var currentMorphCornerRadiusPx: Float = 0f
+        private set
+
+    @Volatile
+    var morphShellCreationCount: Int = 0
+        private set
+
     internal var currentOverlayRootView: View? = null
         private set
 
-    private var attachedWindowView: View? = null
-    private var attachedMode: OverlayMode? = null
+    /**
+     * Persistent single capsule container that animates its width, height, and corner radius in-place
+     * while crossfading [persistentDockedPillLayer] and [persistentExpandedCardLayer].
+     */
+    internal var currentMorphCapsuleShell: FrameLayout? = null
+        private set
+
+    internal var persistentDockedPillLayer: LinearLayout? = null
+        private set
+
+    internal var persistentExpandedCardLayer: FrameLayout? = null
+        private set
+
+    private var morphCapsuleBackground: GradientDrawable? = null
+    private var measuredPillWidthPx: Int = 0
+    private var measuredPillHeightPx: Int = 0
+    private var measuredExpandedWidthPx: Int = 0
+    private var measuredExpandedHeightPx: Int = 0
+
+    /**
+     * Points to the inner `56dp x 56dp` circular container housing strictly the single `ImageView`
+     * trash icon (`childCount == 1`, zero `TextView`s).
+     */
+    internal var currentTrashTargetRootView: View? = null
+        private set
+
+    /**
+     * Points to the outer `96dp x 96dp` unclipped window wrapper (`clipChildren = false`,
+     * `clipToPadding = false`) that gives the `56dp` inner circle `20dp` of transparent margin
+     * on all 4 sides so scaling to `1.22x` on hover never clips against the WindowManager surface.
+     */
+    internal var currentTrashOverlayWindowView: FrameLayout? = null
+        private set
+
+    internal var lastCreatedWindowLayoutParams: WindowManager.LayoutParams? = null
+        private set
+
+    internal var lastCreatedTrashWindowLayoutParams: WindowManager.LayoutParams? = null
+        private set
+
+    private var activePillWindowParams: WindowManager.LayoutParams? = null
+    private var attachedWindowView: FrameLayout? = null
+    private var attachedTrashWindowView: View? = null
     private var attachedConfirmState: Boolean? = null
     private var attachedFinishedState: Boolean? = null
 
+    private var snapBackAnimator: ValueAnimator? = null
+    private var morphAnimator: ValueAnimator? = null
     private var windowManager: WindowManager? = null
     private var appContext: Context? = null
     private var lastWaveformBitmap: Bitmap? = null
@@ -117,7 +270,25 @@ object RecordingIslandOverlayManager {
     private var onStopSaveCallback: (() -> Unit)? = null
     private var onPauseResumeCallback: (() -> Unit)? = null
     private var onConfirmAppendSaveCallback: (() -> Unit)? = null
+    private var onConfirmAppendSaveWithTitleCallback: ((String?) -> Unit)? = null
     private var onCancelAppendSaveCallback: (() -> Unit)? = null
+    private var onDiscardRecordingCallback: (() -> Unit)? = null
+
+    private fun defaultTopY(context: Context): Int {
+        return (DEFAULT_TOP_DOCK_DP * context.resources.displayMetrics.density).toInt()
+    }
+
+    internal fun generateDefaultTimestampedTitle(customBaseTitle: String? = null): String {
+        val candidate = customBaseTitle?.trim().orEmpty()
+        if (candidate.isNotEmpty() &&
+            !candidate.equals("Recording", ignoreCase = true) &&
+            !candidate.equals("Paused", ignoreCase = true)
+        ) {
+            return candidate
+        }
+        val dateStamp = SimpleDateFormat("MMM d, HH:mm", Locale.US).format(Date())
+        return "Recording — $dateStamp"
+    }
 
     fun canDrawSystemOverlay(context: Context): Boolean {
         return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
@@ -178,6 +349,7 @@ object RecordingIslandOverlayManager {
         if (inForeground) {
             // Hide overlay capsule immediately when MainActivity is in the foreground
             lastIsShowingFinishedCompletion = false
+            hideBottomTrashTarget()
             detachOverlayWindow()
         } else if (isRecordingSessionActive || lastIsShowingFinishedCompletion) {
             if (previousInForeground && !canDrawSystemOverlay(context)) {
@@ -185,6 +357,9 @@ object RecordingIslandOverlayManager {
             }
             if (!lastIsShowingAppendConfirm && !lastIsShowingFinishedCompletion) {
                 currentMode = OverlayMode.DOCKED_PILL
+                currentMorphProgress = 0f
+                pillDragOffsetX = 0
+                pillDragOffsetY = defaultTopY(context)
             }
             syncOverlayView(context.applicationContext)
         }
@@ -195,13 +370,17 @@ object RecordingIslandOverlayManager {
         onStopSave: () -> Unit,
         onPauseResume: () -> Unit,
         onConfirmAppendSave: () -> Unit,
-        onCancelAppendSave: () -> Unit
+        onCancelAppendSave: () -> Unit,
+        onDiscardRecording: (() -> Unit)? = null,
+        onConfirmAppendSaveWithTitle: ((String?) -> Unit)? = null
     ) {
         onBookmarkCallback = onBookmark
         onStopSaveCallback = onStopSave
         onPauseResumeCallback = onPauseResume
         onConfirmAppendSaveCallback = onConfirmAppendSave
+        onConfirmAppendSaveWithTitleCallback = onConfirmAppendSaveWithTitle
         onCancelAppendSaveCallback = onCancelAppendSave
+        onDiscardRecordingCallback = onDiscardRecording
     }
 
     fun updateRecordingOverlayState(
@@ -211,10 +390,12 @@ object RecordingIslandOverlayManager {
         elapsedMs: Long,
         waveformBitmap: Bitmap,
         oscillatingDisplacements: FloatArray,
-        isShowingAppendConfirmation: Boolean = false
+        isShowingAppendConfirmation: Boolean = false,
+        defaultSuggestedTitle: String? = null
     ) {
         val appCtx = context.applicationContext
         appContext = appCtx
+        val wasShowingConfirm = lastIsShowingAppendConfirm
         isRecordingSessionActive = true
         lastIsShowingFinishedCompletion = false
         lastStateTitle = title
@@ -224,13 +405,29 @@ object RecordingIslandOverlayManager {
         lastOscillatingDisplacements = oscillatingDisplacements.copyOf()
         lastIsShowingAppendConfirm = isShowingAppendConfirmation
         if (isShowingAppendConfirmation) {
-            // Recording capsule disappears completely; transition to Save/Cancel confirmation card
+            isDraggingPill = false
+            hideBottomTrashTarget()
+            pillDragOffsetX = 0
+            pillDragOffsetY = defaultTopY(appCtx)
+            if (!wasShowingConfirm || suggestedRecordingTitle.isBlank()) {
+                val initialTitle = generateDefaultTimestampedTitle(defaultSuggestedTitle ?: title)
+                suggestedRecordingTitle = initialTitle
+                currentEditedRecordingTitle = initialTitle
+            }
+            // Recording capsule transitions to Greek Save/Cancel confirmation card
             currentMode = OverlayMode.EXPANDED_CARD
         }
 
         if (shouldDisplayOverlay()) {
+            // While the user is actively dragging the compact pill, only update in-place text/waveform
+            // and NEVER recreate layout params or interrupt the 1:1 finger drag!
+            if (isDraggingPill && currentMode == OverlayMode.DOCKED_PILL && !isShowingAppendConfirmation) {
+                updatePersistentRecordingLayersInPlace(appCtx)
+                return
+            }
             syncOverlayView(appCtx)
         } else {
+            hideBottomTrashTarget()
             detachOverlayWindow()
         }
     }
@@ -238,8 +435,7 @@ object RecordingIslandOverlayManager {
     /**
      * Displays the "Finished recording" completion capsule directly on the active screen
      * at the exact same moment it is posted to the notification shade.
-     * Remains visible on screen until the user taps it (opening the saved recording) or taps outside it.
-     * Deduplicated so redundant completion triggers never recreate or flash the capsule.
+     * Transitions the attached overlay window in-place without spawning a duplicate window.
      */
     fun showFinishedCompletionOverlay(
         context: Context,
@@ -248,6 +444,11 @@ object RecordingIslandOverlayManager {
         val appCtx = context.applicationContext
         appContext = appCtx
         val resolvedTitle = title.ifBlank { "Finished recording" }
+
+        isDraggingPill = false
+        hideBottomTrashTarget()
+        pillDragOffsetX = 0
+        pillDragOffsetY = defaultTopY(appCtx)
 
         // Deduplicate: if already showing the finished completion capsule, update title in-place and return
         if (lastIsShowingFinishedCompletion && currentOverlayRootView != null) {
@@ -266,23 +467,88 @@ object RecordingIslandOverlayManager {
         if (shouldDisplayOverlay()) {
             syncOverlayView(appCtx, forceRecreate = true)
         } else {
+            lastCreatedWindowLayoutParams = createWindowLayoutParams(appCtx)
             currentOverlayRootView = buildOverlayContentView(appCtx)
             detachWindowOnly()
         }
     }
 
+    /**
+     * Pure in-place geometric expansion from the docked top-center pill to the expanded recording card.
+     * Does NOT destroy or re-create the view or window; animates width, height, and corner radius
+     * outward from top-center and downward from the top edge while crossfading the internal layers.
+     */
     fun expandFromDockedPill() {
         val ctx = appContext ?: return
         if (lastIsShowingAppendConfirm || lastIsShowingFinishedCompletion) return
+        cancelSnapBackAnimator()
+        isDraggingPill = false
+        hideBottomTrashTarget()
+        pillDragOffsetX = 0
+        pillDragOffsetY = defaultTopY(ctx)
         currentMode = OverlayMode.EXPANDED_CARD
-        syncOverlayView(ctx, forceRecreate = true)
+        lastMorphPivotY = 0f
+        lastMorphRefreshRateHz = TARGET_HIGH_REFRESH_RATE_HZ
+
+        // Ensure the persistent morph shell exists without destroying it if already built
+        ensurePersistentMorphShell(ctx)
+        updatePersistentRecordingLayersInPlace(ctx)
+
+        val lp = createWindowLayoutParams(ctx)
+        activePillWindowParams = lp
+        lastCreatedWindowLayoutParams = lp
+
+        persistentDockedPillLayer?.isClickable = false
+        persistentExpandedCardLayer?.let { cardLayer ->
+            cardLayer.visibility = View.VISIBLE
+            cardLayer.isClickable = true
+            currentOverlayRootView = cardLayer
+        }
+
+        // Expand window minimum height prior to starting the in-place geometric morph so zero
+        // mid-animation WindowManager relayout calls occur while width & height expand.
+        attachedWindowView?.minimumHeight = measuredExpandedHeightPx
+        if (isOverlayAttachedToWindow && attachedWindowView != null) {
+            try {
+                windowManager?.updateViewLayout(attachedWindowView, lp)
+            } catch (_: Exception) {}
+        }
+
+        startInPlaceGeometricMorph(ctx, targetProgress = 1f)
     }
 
+    /**
+     * Pure in-place geometric collapse from the expanded card back into the docked top-center pill.
+     * Does NOT destroy or re-create the view or window; smoothly contracts width, height, and corner
+     * radius inward toward top-center and upward toward the top edge while crossfading back to the pill.
+     */
     fun collapseToDockedPill() {
         val ctx = appContext ?: return
         if (lastIsShowingAppendConfirm || lastIsShowingFinishedCompletion) return
+        cancelSnapBackAnimator()
+        isDraggingPill = false
+        hideBottomTrashTarget()
+        pillDragOffsetX = 0
+        pillDragOffsetY = defaultTopY(ctx)
         currentMode = OverlayMode.DOCKED_PILL
-        syncOverlayView(ctx, forceRecreate = true)
+        lastMorphPivotY = 0f
+        lastMorphRefreshRateHz = TARGET_HIGH_REFRESH_RATE_HZ
+
+        ensurePersistentMorphShell(ctx)
+        updatePersistentRecordingLayersInPlace(ctx)
+
+        val lp = createWindowLayoutParams(ctx)
+        activePillWindowParams = lp
+        lastCreatedWindowLayoutParams = lp
+
+        persistentExpandedCardLayer?.isClickable = false
+        persistentDockedPillLayer?.let { pillLayer ->
+            pillLayer.visibility = View.VISIBLE
+            pillLayer.isClickable = true
+            currentOverlayRootView = pillLayer
+        }
+
+        startInPlaceGeometricMorph(ctx, targetProgress = 0f)
     }
 
     fun handleHeaderTapOpenApp(context: Context) {
@@ -297,6 +563,8 @@ object RecordingIslandOverlayManager {
         isAppInForeground = true
         lastIsShowingFinishedCompletion = false
         currentMode = OverlayMode.DOCKED_PILL
+        currentMorphProgress = 0f
+        hideBottomTrashTarget()
         detachOverlayWindow()
     }
 
@@ -328,12 +596,516 @@ object RecordingIslandOverlayManager {
         dismissAndReset()
     }
 
+    /**
+     * Immediately discards and rejects the active recording without saving, removes the foreground
+     * notification, terminates `RecordingForegroundService`, and closes both overlay windows.
+     * Triggered when the compact pill is dragged and dropped onto the bottom trash bin target.
+     */
+    fun handleDragToTrashDiscard(context: Context) {
+        val appCtx = context.applicationContext
+        cancelSnapBackAnimator()
+        cancelMorphAnimator()
+        hideBottomTrashTarget()
+        pillDragOffsetX = 0
+        pillDragOffsetY = defaultTopY(appCtx)
+        dismissAndReset()
+
+        try {
+            val nm = appCtx.getSystemService(Context.NOTIFICATION_SERVICE) as? android.app.NotificationManager
+            nm?.cancel(RecordingForegroundService.NOTIFICATION_ID)
+            nm?.cancel(RecordingForegroundService.FINISHED_NOTIFICATION_ID)
+        } catch (_: Exception) {}
+
+        // 1. Immediately invoke direct ViewModel/Service discard handlers for 0ms audio hardware & state reset
+        var handledDirectly = false
+        RecordingForegroundService.activeDiscardHandler?.let { handler ->
+            try {
+                handler.invoke()
+                handledDirectly = true
+            } catch (_: Exception) {}
+        }
+        if (!handledDirectly) {
+            RecordingForegroundService.activeCancelAppendSaveHandler?.let { handler ->
+                try {
+                    handler.invoke()
+                    handledDirectly = true
+                } catch (_: Exception) {}
+            }
+        }
+        onDiscardRecordingCallback?.let { cb ->
+            try {
+                cb.invoke()
+            } catch (_: Exception) {}
+        } ?: onCancelAppendSaveCallback?.let { cb ->
+            try {
+                cb.invoke()
+            } catch (_: Exception) {}
+        }
+
+        // 2. Always send dedicated ACTION_DISCARD_RECORDING intent to RecordingForegroundService
+        //    to guarantee stopForeground(STOP_FOREGROUND_REMOVE), nm.cancel(NOTIFICATION_ID), and stopSelf()
+        try {
+            val discardIntent = Intent(appCtx, RecordingForegroundService::class.java).apply {
+                action = RecordingForegroundService.ACTION_DISCARD_RECORDING
+            }
+            appCtx.startService(discardIntent)
+        } catch (_: Exception) {}
+
+        // 3. Broadcast ACTION_USER_DISCARD so any registered receiver also resets UI state
+        try {
+            appCtx.sendBroadcast(
+                Intent(RecordingForegroundService.ACTION_USER_DISCARD).setPackage(appCtx.packageName)
+            )
+        } catch (_: Exception) {}
+    }
+
     fun dismissAndReset() {
+        cancelSnapBackAnimator()
+        cancelMorphAnimator()
+        hideBottomTrashTarget()
         isRecordingSessionActive = false
         lastIsShowingAppendConfirm = false
         lastIsShowingFinishedCompletion = false
+        suggestedRecordingTitle = ""
+        currentEditedRecordingTitle = ""
+        isDraggingPill = false
+        pillDragOffsetX = 0
+        appContext?.let { pillDragOffsetY = defaultTopY(it) }
         currentMode = OverlayMode.DOCKED_PILL
+        currentMorphProgress = 0f
         detachOverlayWindow()
+    }
+
+    private fun cancelSnapBackAnimator() {
+        try {
+            snapBackAnimator?.cancel()
+        } catch (_: Exception) {}
+        snapBackAnimator = null
+    }
+
+    private fun cancelMorphAnimator() {
+        try {
+            morphAnimator?.cancel()
+        } catch (_: Exception) {}
+        morphAnimator = null
+    }
+
+    /**
+     * Builds the inner `56dp x 56dp` strictly icon-only circular trash bin target view.
+     * Uses the exact outlined trash bin silhouette (`R.drawable.ic_island_trash_outline`) from the
+     * "Move to Trash?" dialog in light beige (`#F4D7C7`), inside a circular warm dark container (`#33251E`),
+     * with ZERO text labels, captions, or names.
+     */
+    internal fun buildBottomTrashTargetView(context: Context, hovered: Boolean = false): FrameLayout {
+        val density = context.resources.displayMetrics.density.takeIf { it > 0f } ?: 1f
+        val containerSizePx = (TRASH_TARGET_SIZE_DP * density).toInt().coerceAtLeast(48)
+        val iconSizePx = (TRASH_ICON_SIZE_DP * density).toInt().coerceAtLeast(24)
+
+        val circleBg = GradientDrawable().apply {
+            shape = GradientDrawable.OVAL
+            setColor(if (hovered) TRASH_CONTAINER_HOVER_COLOR else TRASH_CONTAINER_IDLE_COLOR)
+            val strokeWidthPx = ((if (hovered) 1.5f else 1f) * density).toInt().coerceAtLeast(1)
+            val strokeColor = if (hovered) TRASH_BORDER_HOVER_COLOR else TRASH_BORDER_IDLE_COLOR
+            setStroke(strokeWidthPx, strokeColor)
+        }
+
+        val innerCircleContainer = FrameLayout(context).apply {
+            layoutParams = FrameLayout.LayoutParams(
+                containerSizePx,
+                containerSizePx,
+                Gravity.CENTER
+            )
+            background = circleBg
+            clipChildren = false
+            clipToPadding = false
+            isClickable = false
+            isFocusable = false
+            val targetScale = if (hovered) TRASH_HOVER_SCALE else 1.0f
+            scaleX = targetScale
+            scaleY = targetScale
+        }
+
+        val trashIcon = ImageView(context).apply {
+            layoutParams = FrameLayout.LayoutParams(
+                iconSizePx,
+                iconSizePx,
+                Gravity.CENTER
+            )
+            setImageResource(R.drawable.ic_island_trash_outline)
+            setColorFilter(TRASH_ICON_LIGHT_BEIGE)
+            scaleType = ImageView.ScaleType.FIT_CENTER
+            isClickable = false
+            isFocusable = false
+            contentDescription = null
+        }
+
+        innerCircleContainer.addView(trashIcon)
+        return innerCircleContainer
+    }
+
+    /**
+     * Wraps the `56dp x 56dp` inner circular target inside a generous `96dp x 96dp` transparent
+     * window root with `clipChildren = false` and `clipToPadding = false` so scaling the inner
+     * circle to `1.22x` (`68.3dp`) never clips against the WindowManager surface boundaries.
+     */
+    internal fun buildBottomTrashOverlayWindowRoot(
+        context: Context,
+        innerCircle: FrameLayout
+    ): FrameLayout {
+        val density = context.resources.displayMetrics.density.takeIf { it > 0f } ?: 1f
+        val windowSizePx = (TRASH_WINDOW_SIZE_DP * density).toInt().coerceAtLeast(96)
+        val circleSizePx = (TRASH_TARGET_SIZE_DP * density).toInt().coerceAtLeast(48)
+
+        return FrameLayout(context).apply {
+            layoutParams = FrameLayout.LayoutParams(windowSizePx, windowSizePx)
+            clipChildren = false
+            clipToPadding = false
+            isClickable = false
+            isFocusable = false
+            (innerCircle.parent as? ViewGroup)?.removeView(innerCircle)
+            addView(
+                innerCircle,
+                FrameLayout.LayoutParams(
+                    circleSizePx,
+                    circleSizePx,
+                    Gravity.CENTER
+                )
+            )
+        }
+    }
+
+    internal fun createTrashWindowLayoutParams(context: Context): WindowManager.LayoutParams {
+        val density = context.resources.displayMetrics.density.takeIf { it > 0f } ?: 1f
+        val windowSizePx = (TRASH_WINDOW_SIZE_DP * density).toInt().coerceAtLeast(96)
+        val overlayType = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
+        } else {
+            @Suppress("DEPRECATION")
+            WindowManager.LayoutParams.TYPE_PHONE
+        }
+        return WindowManager.LayoutParams(
+            windowSizePx,
+            windowSizePx,
+            overlayType,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
+                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+                WindowManager.LayoutParams.FLAG_HARDWARE_ACCELERATED,
+            PixelFormat.TRANSLUCENT
+        ).apply {
+            gravity = Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL
+            y = (TRASH_WINDOW_BOTTOM_MARGIN_DP * density).toInt()
+            windowAnimations = 0
+            applyHighRefreshRateHint(this)
+        }
+    }
+
+    private fun applyHighRefreshRateHint(lp: WindowManager.LayoutParams) {
+        lastMorphRefreshRateHz = TARGET_HIGH_REFRESH_RATE_HZ
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            try {
+                lp.preferredRefreshRate = TARGET_HIGH_REFRESH_RATE_HZ
+            } catch (_: Exception) {}
+        }
+    }
+
+    private fun updateTrashTargetHoverVisuals(context: Context, hovered: Boolean) {
+        if (isTrashTargetHovered == hovered && currentTrashTargetRootView != null) return
+        isTrashTargetHovered = hovered
+        val innerCircle = currentTrashTargetRootView as? FrameLayout ?: return
+        val density = context.resources.displayMetrics.density.takeIf { it > 0f } ?: 1f
+        val circleBg = GradientDrawable().apply {
+            shape = GradientDrawable.OVAL
+            setColor(if (hovered) TRASH_CONTAINER_HOVER_COLOR else TRASH_CONTAINER_IDLE_COLOR)
+            val strokeWidthPx = ((if (hovered) 1.5f else 1f) * density).toInt().coerceAtLeast(1)
+            val strokeColor = if (hovered) TRASH_BORDER_HOVER_COLOR else TRASH_BORDER_IDLE_COLOR
+            setStroke(strokeWidthPx, strokeColor)
+        }
+        innerCircle.background = circleBg
+        val targetScale = if (hovered) TRASH_HOVER_SCALE else 1.0f
+        innerCircle.scaleX = targetScale
+        innerCircle.scaleY = targetScale
+        innerCircle.animate()
+            .scaleX(targetScale)
+            .scaleY(targetScale)
+            .setDuration(90L)
+            .start()
+    }
+
+    internal fun showBottomTrashTarget(context: Context) {
+        val appCtx = context.applicationContext
+        val innerCircle = currentTrashTargetRootView as? FrameLayout ?: buildBottomTrashTargetView(appCtx, hovered = false).also {
+            currentTrashTargetRootView = it
+        }
+        val outerWindowRoot = currentTrashOverlayWindowView ?: buildBottomTrashOverlayWindowRoot(appCtx, innerCircle).also {
+            currentTrashOverlayWindowView = it
+        }
+        val trashLp = createTrashWindowLayoutParams(appCtx)
+        lastCreatedTrashWindowLayoutParams = trashLp
+        isBottomTrashTargetVisible = true
+        isTrashTargetHovered = false
+        updateTrashTargetHoverVisuals(appCtx, hovered = false)
+
+        if (!canDrawSystemOverlay(appCtx) || attachedTrashWindowView != null) {
+            return
+        }
+
+        try {
+            val wm = (windowManager ?: (appCtx.getSystemService(Context.WINDOW_SERVICE) as? WindowManager))
+                ?.also { windowManager = it } ?: return
+            outerWindowRoot.alpha = 0f
+            wm.addView(outerWindowRoot, trashLp)
+            attachedTrashWindowView = outerWindowRoot
+            outerWindowRoot.animate()
+                .alpha(1f)
+                .setDuration(100L)
+                .start()
+        } catch (_: Exception) {
+            attachedTrashWindowView = null
+        }
+    }
+
+    internal fun hideBottomTrashTarget() {
+        isBottomTrashTargetVisible = false
+        isTrashTargetHovered = false
+        val viewToRemove = attachedTrashWindowView
+        attachedTrashWindowView = null
+        currentTrashOverlayWindowView = null
+        currentTrashTargetRootView = null
+        if (viewToRemove != null) {
+            try {
+                windowManager?.removeViewImmediate(viewToRemove)
+            } catch (_: Exception) {
+                try {
+                    windowManager?.removeView(viewToRemove)
+                } catch (_: Exception) {}
+            }
+        }
+    }
+
+    private fun resolveFullScreenDimensions(context: Context): Pair<Int, Int> {
+        val dm = context.resources.displayMetrics
+        var width = dm.widthPixels.takeIf { it > 0 } ?: 1080
+        var height = dm.heightPixels.takeIf { it > 0 } ?: 2400
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            try {
+                val wm = windowManager ?: (context.getSystemService(Context.WINDOW_SERVICE) as? WindowManager)
+                val bounds = wm?.currentWindowMetrics?.bounds
+                if (bounds != null && bounds.width() > 0 && bounds.height() > 0) {
+                    width = maxOf(width, bounds.width())
+                    height = maxOf(height, bounds.height())
+                }
+            } catch (_: Exception) {}
+        }
+        return width to height
+    }
+
+    /**
+     * Checks whether the dragged compact pill or touch coordinate `(rawX, rawY)` is inside the
+     * bottom-center trash target's capture zone. Uses the real on-screen coordinates of the attached
+     * trash circle when available on device, with display-metrics fallback for unit tests.
+     */
+    internal fun isPointOverBottomTrashTarget(context: Context, rawX: Float, rawY: Float): Boolean {
+        val dm = context.resources.displayMetrics
+        val density = dm.density.takeIf { it > 0f } ?: 1f
+        val (screenWidth, screenHeight) = resolveFullScreenDimensions(context)
+
+        var trashCenterX = screenWidth / 2f
+        val trashBottomMarginPx = TRASH_BOTTOM_MARGIN_DP * density
+        val trashRadiusPx = (TRASH_TARGET_SIZE_DP * density) / 2f
+        var trashCenterY = screenHeight - trashBottomMarginPx - trashRadiusPx
+
+        // If the inner trash circle is laid out on a real screen, read its exact screen coordinates
+        val innerCircle = currentTrashTargetRootView
+        if (innerCircle != null && innerCircle.width > 0 && innerCircle.height > 0) {
+            val loc = IntArray(2)
+            innerCircle.getLocationOnScreen(loc)
+            if (loc[1] > 0) {
+                trashCenterX = loc[0] + innerCircle.width / 2f
+                trashCenterY = loc[1] + innerCircle.height / 2f
+            }
+        }
+
+        val captureRadiusPx = TRASH_CAPTURE_RADIUS_DP * density
+        val captureRadiusSq = captureRadiusPx * captureRadiusPx
+
+        // Check finger coordinate (rawX, rawY)
+        val dxFinger = rawX - trashCenterX
+        val dyFinger = rawY - trashCenterY
+        if (dxFinger * dxFinger + dyFinger * dyFinger <= captureRadiusSq) {
+            return true
+        }
+
+        // Also check the dragged pill's visual center coordinate
+        val pillHalfH = ((measuredPillHeightPx.takeIf { it > 0 } ?: (26f * density).toInt()) / 2f)
+        val pillCenterX = (screenWidth / 2f) + pillDragOffsetX
+        val pillCenterY = pillDragOffsetY + pillHalfH
+        val dxPill = pillCenterX - trashCenterX
+        val dyPill = pillCenterY - trashCenterY
+        return (dxPill * dxPill + dyPill * dyPill <= captureRadiusSq)
+    }
+
+    /**
+     * Ultra-smooth 1:1 window position update that mutates the cached `WindowManager.LayoutParams`
+     * in-place without object allocations or throttling.
+     */
+    private fun updateDockedPillWindowPositionDirect(context: Context, newX: Int, newY: Int) {
+        pillDragOffsetX = newX
+        pillDragOffsetY = newY.coerceAtLeast(0)
+        val lp = (activePillWindowParams ?: lastCreatedWindowLayoutParams ?: createWindowLayoutParams(context)).also {
+            it.x = pillDragOffsetX
+            it.y = pillDragOffsetY
+            it.windowAnimations = 0
+            activePillWindowParams = it
+            lastCreatedWindowLayoutParams = it
+        }
+        val host = attachedWindowView ?: return
+        val wm = windowManager ?: return
+        try {
+            wm.updateViewLayout(host, lp)
+        } catch (_: Exception) {}
+    }
+
+    private fun animatePillSnapBackToTopDock(context: Context) {
+        val appCtx = context.applicationContext
+        val startX = pillDragOffsetX
+        val startY = pillDragOffsetY
+        val targetX = 0
+        val targetY = defaultTopY(appCtx)
+
+        if (startX == targetX && startY == targetY) {
+            isDraggingPill = false
+            return
+        }
+
+        cancelSnapBackAnimator()
+        val animator = ValueAnimator.ofFloat(0f, 1f).apply {
+            duration = 160L
+            interpolator = DecelerateInterpolator()
+            addUpdateListener { anim ->
+                val fraction = anim.animatedValue as Float
+                val curX = (startX + ((targetX - startX) * fraction)).toInt()
+                val curY = (startY + ((targetY - startY) * fraction)).toInt()
+                updateDockedPillWindowPositionDirect(appCtx, curX, curY)
+            }
+        }
+        snapBackAnimator = animator
+        // Set target position immediately for synchronous unit tests while animating smoothly on device
+        updateDockedPillWindowPositionDirect(appCtx, targetX, targetY)
+        isDraggingPill = false
+        try {
+            animator.start()
+        } catch (_: Exception) {
+            updateDockedPillWindowPositionDirect(appCtx, targetX, targetY)
+        }
+    }
+
+    /**
+     * Attaches 1:1 raw-coordinate finger tracking and drag-to-discard handling to the compact pill
+     * (`OverlayMode.DOCKED_PILL`).
+     * - Short tap: expands the pill into [OverlayMode.EXPANDED_CARD] via an in-place geometric morph.
+     * - Drag or long-press: binds `(params.x, params.y)` directly 1:1 to `(event.rawX, event.rawY)` deltas,
+     *   shows the unclipped `96dp x 96dp` bottom trash target, highlights the `56dp` inner circle on hover,
+     *   and immediately discards the recording + stops the service when dropped in the capture zone.
+     */
+    private fun attachDockedPillTouchAndDragListener(context: Context, pillView: View) {
+        val appCtx = context.applicationContext
+        val density = appCtx.resources.displayMetrics.density.takeIf { it > 0f } ?: 1f
+        val touchSlopPx = 3f * density
+
+        var downRawX = 0f
+        var downRawY = 0f
+        var startOffsetX = 0
+        var startOffsetY = defaultTopY(appCtx)
+        var pointerDown = false
+
+        val longPressRunnable = Runnable {
+            if (pointerDown && !isDraggingPill && currentMode == OverlayMode.DOCKED_PILL) {
+                isDraggingPill = true
+                try {
+                    pillView.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
+                } catch (_: Exception) {}
+                showBottomTrashTarget(appCtx)
+            }
+        }
+
+        pillView.setOnTouchListener { view, event ->
+            if (currentMode != OverlayMode.DOCKED_PILL) {
+                return@setOnTouchListener false
+            }
+            when (event.actionMasked) {
+                MotionEvent.ACTION_DOWN -> {
+                    cancelSnapBackAnimator()
+                    pointerDown = true
+                    isDraggingPill = false
+                    downRawX = event.rawX
+                    downRawY = event.rawY
+                    if (pillDragOffsetY == 0) {
+                        pillDragOffsetY = defaultTopY(appCtx)
+                    }
+                    startOffsetX = pillDragOffsetX
+                    startOffsetY = pillDragOffsetY
+                    view.postDelayed(longPressRunnable, LONG_PRESS_DRAG_TIMEOUT_MS)
+                    true
+                }
+                MotionEvent.ACTION_MOVE -> {
+                    val dx = event.rawX - downRawX
+                    val dy = event.rawY - downRawY
+                    if (!isDraggingPill && (kotlin.math.abs(dx) > touchSlopPx || kotlin.math.abs(dy) > touchSlopPx)) {
+                        view.removeCallbacks(longPressRunnable)
+                        isDraggingPill = true
+                        showBottomTrashTarget(appCtx)
+                    }
+                    if (isDraggingPill) {
+                        val newX = (startOffsetX + dx).toInt()
+                        val newY = (startOffsetY + dy).toInt().coerceAtLeast(0)
+                        updateDockedPillWindowPositionDirect(appCtx, newX, newY)
+                        val overTrash = isPointOverBottomTrashTarget(appCtx, event.rawX, event.rawY)
+                        updateTrashTargetHoverVisuals(appCtx, overTrash)
+                    }
+                    true
+                }
+                MotionEvent.ACTION_UP -> {
+                    pointerDown = false
+                    view.removeCallbacks(longPressRunnable)
+                    val dx = event.rawX - downRawX
+                    val dy = event.rawY - downRawY
+                    val heldDurationMs = event.eventTime - event.downTime
+                    if (!isDraggingPill && heldDurationMs >= LONG_PRESS_DRAG_TIMEOUT_MS) {
+                        isDraggingPill = true
+                        showBottomTrashTarget(appCtx)
+                    }
+
+                    if (!isDraggingPill && kotlin.math.abs(dx) <= touchSlopPx && kotlin.math.abs(dy) <= touchSlopPx) {
+                        hideBottomTrashTarget()
+                        view.performClick()
+                    } else {
+                        val newX = (startOffsetX + dx).toInt()
+                        val newY = (startOffsetY + dy).toInt().coerceAtLeast(0)
+                        pillDragOffsetX = newX
+                        pillDragOffsetY = newY
+                        val droppedOnTrash = isTrashTargetHovered || isPointOverBottomTrashTarget(appCtx, event.rawX, event.rawY)
+                        hideBottomTrashTarget()
+                        if (droppedOnTrash) {
+                            handleDragToTrashDiscard(appCtx)
+                        } else {
+                            animatePillSnapBackToTopDock(appCtx)
+                        }
+                    }
+                    true
+                }
+                MotionEvent.ACTION_CANCEL -> {
+                    pointerDown = false
+                    view.removeCallbacks(longPressRunnable)
+                    hideBottomTrashTarget()
+                    if (isDraggingPill) {
+                        animatePillSnapBackToTopDock(appCtx)
+                    }
+                    true
+                }
+                else -> false
+            }
+        }
     }
 
     private fun attachFinishedCardSwipeAndTapListener(context: Context, finishedCard: View) {
@@ -362,7 +1134,6 @@ object RecordingIslandOverlayManager {
                         isDragging = true
                     }
                     if (isDragging) {
-                        // Allow dragging horizontally to either side or upward
                         val clampedDy = dy.coerceAtMost(0f)
                         view.translationX = dx
                         view.translationY = clampedDy
@@ -431,37 +1202,63 @@ object RecordingIslandOverlayManager {
     }
 
     internal fun buildOverlayContentView(context: Context): View {
-        return if (currentMode == OverlayMode.DOCKED_PILL && !lastIsShowingAppendConfirm && !lastIsShowingFinishedCompletion) {
-            buildDockedPillView(context)
+        return if (!lastIsShowingAppendConfirm && !lastIsShowingFinishedCompletion) {
+            ensurePersistentMorphShell(context)
+            if (currentMode == OverlayMode.DOCKED_PILL) {
+                persistentDockedPillLayer!!
+            } else {
+                persistentExpandedCardLayer!!
+            }
         } else {
-            buildExpandedCardView(context)
+            buildSpecialStateCardView(context)
         }
     }
 
-    private fun buildDockedPillView(context: Context): View {
-        val density = context.resources.displayMetrics.density
-        val padH = (14f * density).toInt()
-        val padV = (7f * density).toInt()
+    /**
+     * Builds the sleeker compact docked capsule layer at the top-center of the screen.
+     * - Enforces physical Left-to-Right layout (`View.LAYOUT_DIRECTION_LTR`) so RTL system locales
+     *   NEVER invert coordinates or flip the timer to the left.
+     * - Places the mini oscillating waveform (`34dp x 15dp`) on the physical left and shifts the
+     *   monospace timer (`11.5sp`) toward the physical right side of the screen (`leftMargin = 14dp`)
+     *   with `14dp` of physical right padding (`padRightPx`) so the seconds digits are completely
+     *   visible and never clipped by the capsule's curved outer border.
+     */
+    private fun buildDockedPillView(context: Context): LinearLayout {
+        val density = context.resources.displayMetrics.density.takeIf { it > 0f } ?: 1f
+        val padLeftPx = (DOCKED_PILL_PAD_LEFT_DP * density).toInt()
+        val padRightPx = (DOCKED_PILL_PAD_RIGHT_DP * density).toInt()
+        val padVPx = (DOCKED_PILL_PAD_VERTICAL_DP * density).toInt()
+        val waveformWidthPx = (DOCKED_PILL_WAVEFORM_WIDTH_DP * density).toInt()
+        val waveformHeightPx = (DOCKED_PILL_WAVEFORM_HEIGHT_DP * density).toInt()
+        val timerLeftMarginPx = (DOCKED_PILL_TIMER_LEFT_MARGIN_DP * density).toInt()
 
         val pillContainer = LinearLayout(context).apply {
             id = R.id.notif_recording_compact_root
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            setBackgroundResource(R.drawable.bg_island_docked_pill)
-            setPadding(padH, padV, padH, padV)
+            layoutDirection = View.LAYOUT_DIRECTION_LTR
+            // Background & border are rendered by the parent morphCapsuleShell so there is zero double-border during morph
+            background = null
+            setPadding(padLeftPx, padVPx, padRightPx, padVPx)
+            clipChildren = false
+            clipToPadding = false
             isClickable = true
             isFocusable = true
             setOnClickListener {
                 expandFromDockedPill()
             }
         }
+        attachDockedPillTouchAndDragListener(context, pillContainer)
 
         val miniWaveformImage = ImageView(context).apply {
             id = R.id.notif_recording_waveform
             layoutParams = LinearLayout.LayoutParams(
-                (44f * density).toInt(),
-                (18f * density).toInt()
-            )
+                waveformWidthPx,
+                waveformHeightPx
+            ).apply {
+                gravity = Gravity.CENTER_VERTICAL or Gravity.LEFT
+            }
+            layoutDirection = View.LAYOUT_DIRECTION_LTR
             scaleType = ImageView.ScaleType.FIT_XY
             isClickable = false
             isFocusable = false
@@ -480,11 +1277,20 @@ object RecordingIslandOverlayManager {
                 LinearLayout.LayoutParams.WRAP_CONTENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT
             ).apply {
-                marginStart = (10f * density).toInt()
+                leftMargin = timerLeftMarginPx
+                rightMargin = 0
+                gravity = Gravity.CENTER_VERTICAL or Gravity.RIGHT
             }
+            layoutDirection = View.LAYOUT_DIRECTION_LTR
+            textDirection = View.TEXT_DIRECTION_LTR
+            gravity = Gravity.CENTER_VERTICAL or Gravity.RIGHT
+            includeFontPadding = false
+            isSingleLine = true
+            maxLines = 1
+            setPadding(0, 0, (2f * density).toInt(), 0)
             isClickable = false
             isFocusable = false
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, DOCKED_PILL_TIMER_TEXT_SIZE_SP)
             typeface = android.graphics.Typeface.MONOSPACE
             setTextColor(if (lastIsPaused) 0x99F4D7C7.toInt() else 0xFFF08C4B.toInt())
             text = formatTimerMs(lastElapsedMs)
@@ -494,95 +1300,34 @@ object RecordingIslandOverlayManager {
         return pillContainer
     }
 
-    private fun buildExpandedCardView(context: Context): View {
+    /**
+     * Builds the persistent expanded live recording controls layer that lives permanently inside
+     * [currentMorphCapsuleShell] alongside [persistentDockedPillLayer].
+     */
+    private fun buildExpandedLiveRecordingLayer(context: Context): FrameLayout {
         val inflater = LayoutInflater.from(context)
-        val density = context.resources.displayMetrics.density
-        val horizontalMargin = (12f * density).toInt()
-        val topMargin = (8f * density).toInt()
-
-        // Full-screen transparent backdrop when expanded so tapping ANYWHERE outside the card
-        // reliably collapses the capsule back to its original DOCKED_PILL size (or dismisses the finished completion capsule).
-        val outerWrapper = object : FrameLayout(context) {
+        val layerWrapper = object : FrameLayout(context) {
             override fun onTouchEvent(event: MotionEvent?): Boolean {
-                if (event?.action == MotionEvent.ACTION_OUTSIDE || event?.action == MotionEvent.ACTION_DOWN) {
-                    if (lastIsShowingFinishedCompletion) {
-                        dismissBothFinishedNotificationAndOverlay(context)
-                        return true
-                    } else if (!lastIsShowingAppendConfirm) {
-                        collapseToDockedPill()
-                        return true
-                    }
+                val action = event?.actionMasked ?: event?.action
+                if (action == MotionEvent.ACTION_OUTSIDE) {
+                    handleOutsideTouchEvent(context)
+                    return false
                 }
                 return super.onTouchEvent(event)
             }
         }.apply {
-            setPadding(horizontalMargin, topMargin, horizontalMargin, topMargin)
             clipChildren = false
             clipToPadding = false
             isClickable = true
             isFocusable = false
             setOnClickListener {
-                if (lastIsShowingFinishedCompletion) {
-                    dismissBothFinishedNotificationAndOverlay(context)
-                } else if (!lastIsShowingAppendConfirm) {
-                    collapseToDockedPill()
-                }
+                handleHeaderTapOpenApp(context)
             }
         }
 
-        if (lastIsShowingFinishedCompletion) {
-            val finishedCard = inflater.inflate(R.layout.notification_finished_compact, outerWrapper, false)
-            finishedCard.isClickable = true
-            finishedCard.isFocusable = true
-            finishedCard.findViewById<ImageView>(R.id.notif_finished_badge)?.setImageResource(R.drawable.ic_notif_finished_check)
-            finishedCard.findViewById<TextView>(R.id.notif_finished_title)?.text =
-                buildGradientBlendedTitle(lastFinishedTitle.ifBlank { context.getString(R.string.notification_finished_recording) })
-            finishedCard.setOnClickListener {
-                handleFinishedCapsuleTapOpenSavedRecording(context)
-            }
-            attachFinishedCardSwipeAndTapListener(context, finishedCard)
-            val cardLp = FrameLayout.LayoutParams(
-                FrameLayout.LayoutParams.MATCH_PARENT,
-                FrameLayout.LayoutParams.WRAP_CONTENT,
-                Gravity.TOP or Gravity.CENTER_HORIZONTAL
-            )
-            outerWrapper.addView(finishedCard, cardLp)
-            return outerWrapper
-        }
-
-        if (lastIsShowingAppendConfirm) {
-            // Recording capsule disappears completely; render only the Save / Cancel confirmation message card
-            val confirmCard = inflater.inflate(R.layout.notification_append_confirm_compact, outerWrapper, false)
-            confirmCard.isClickable = true
-            confirmCard.findViewById<TextView>(R.id.notif_append_dont_text)?.text = buildGradientBlendedTitle("Don't")
-            confirmCard.findViewById<TextView>(R.id.notif_append_save_text)?.text = buildGradientBlendedTitle("Save")
-            confirmCard.findViewById<View>(R.id.notif_append_dont_button)?.setOnClickListener {
-                dismissAndReset()
-                onCancelAppendSaveCallback?.invoke()
-            }
-            confirmCard.findViewById<View>(R.id.notif_append_save_button)?.setOnClickListener {
-                val callback = onConfirmAppendSaveCallback
-                if (callback != null) {
-                    // Single emission source: callback invokes handleConfirmAppendSaveFromNotification()
-                    callback.invoke()
-                } else {
-                    showFinishedCompletionOverlay(
-                        context = context,
-                        title = context.getString(R.string.notification_finished_recording)
-                    )
-                }
-            }
-            val cardLp = FrameLayout.LayoutParams(
-                FrameLayout.LayoutParams.MATCH_PARENT,
-                FrameLayout.LayoutParams.WRAP_CONTENT,
-                Gravity.TOP or Gravity.CENTER_HORIZONTAL
-            )
-            outerWrapper.addView(confirmCard, cardLp)
-            return outerWrapper
-        }
-
-        val cardView = inflater.inflate(R.layout.notification_recording_live, outerWrapper, false)
-        // Second tap on the expanded capsule opens the app to the currently active recording window
+        val cardView = inflater.inflate(R.layout.notification_recording_live, layerWrapper, false)
+        // Outer rounded background & border are drawn by morphCapsuleShell so the corner radius morphs cleanly
+        cardView.background = null
         cardView.isClickable = true
         cardView.setOnClickListener {
             handleHeaderTapOpenApp(context)
@@ -608,6 +1353,9 @@ object RecordingIslandOverlayManager {
             if (callback != null) {
                 callback.invoke()
             } else {
+                val defaultTitle = generateDefaultTimestampedTitle(lastStateTitle)
+                suggestedRecordingTitle = defaultTitle
+                currentEditedRecordingTitle = defaultTitle
                 lastIsShowingAppendConfirm = true
                 lastIsShowingFinishedCompletion = false
                 currentMode = OverlayMode.EXPANDED_CARD
@@ -618,12 +1366,525 @@ object RecordingIslandOverlayManager {
             onPauseResumeCallback?.invoke()
         }
 
+        layerWrapper.addView(
+            cardView,
+            FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.WRAP_CONTENT,
+                Gravity.TOP or Gravity.CENTER_HORIZONTAL
+            )
+        )
+        return layerWrapper
+    }
+
+    /**
+     * Ensures the persistent [currentMorphCapsuleShell] and its two internal layers
+     * ([persistentDockedPillLayer] and [persistentExpandedCardLayer]) exist and are pre-measured
+     * to their exact pixel bounds. Never destroys or re-creates them across expand/collapse!
+     */
+    private fun ensurePersistentMorphShell(context: Context): FrameLayout {
+        val density = context.resources.displayMetrics.density.takeIf { it > 0f } ?: 1f
+        val (screenWidth, _) = resolveFullScreenDimensions(context)
+        val horizontalMarginPx = (EXPANDED_HORIZONTAL_MARGIN_DP * density).toInt()
+        val targetExpandedWidthPx = (screenWidth - horizontalMarginPx * 2).coerceAtLeast((280f * density).toInt())
+
+        val existingShell = currentMorphCapsuleShell
+        val existingPill = persistentDockedPillLayer
+        val existingCard = persistentExpandedCardLayer
+        if (existingShell != null && existingPill != null && existingCard != null) {
+            measurePersistentLayers(context, existingPill, existingCard, targetExpandedWidthPx)
+            return existingShell
+        }
+
+        val pillLayer = buildDockedPillView(context)
+        val cardLayer = buildExpandedLiveRecordingLayer(context)
+        persistentDockedPillLayer = pillLayer
+        persistentExpandedCardLayer = cardLayer
+        measurePersistentLayers(context, pillLayer, cardLayer, targetExpandedWidthPx)
+
+        val initialProgress = if (currentMode == OverlayMode.EXPANDED_CARD) 1f else 0f
+        currentMorphProgress = initialProgress
+        val initialW = lerpInt(measuredPillWidthPx, measuredExpandedWidthPx, initialProgress)
+        val initialH = lerpInt(measuredPillHeightPx, measuredExpandedHeightPx, initialProgress)
+        val pillRadiusPx = measuredPillHeightPx / 2f
+        val expandedRadiusPx = EXPANDED_CARD_CORNER_RADIUS_DP * density
+        val initialRadius = lerpFloat(pillRadiusPx, expandedRadiusPx, initialProgress)
+
+        currentMorphWidthPx = initialW
+        currentMorphHeightPx = initialH
+        currentMorphCornerRadiusPx = initialRadius
+
+        val strokeWidthPx = (1f * density).toInt().coerceAtLeast(1)
+        val bgDrawable = GradientDrawable().apply {
+            shape = GradientDrawable.RECTANGLE
+            cornerRadius = initialRadius
+            setColor(lerpArgb(PILL_BG_COLOR, CARD_BG_COLOR, initialProgress))
+            setStroke(strokeWidthPx, lerpArgb(PILL_STROKE_COLOR, CARD_STROKE_COLOR, initialProgress))
+        }
+        morphCapsuleBackground = bgDrawable
+
+        val shell = object : FrameLayout(context) {
+            override fun onTouchEvent(event: MotionEvent?): Boolean {
+                val action = event?.actionMasked ?: event?.action
+                if (action == MotionEvent.ACTION_OUTSIDE) {
+                    handleOutsideTouchEvent(context)
+                    return false
+                }
+                return super.onTouchEvent(event)
+            }
+        }.apply {
+            layoutParams = FrameLayout.LayoutParams(
+                initialW,
+                initialH,
+                Gravity.TOP or Gravity.CENTER_HORIZONTAL
+            )
+            background = bgDrawable
+            clipChildren = true
+            clipToPadding = true
+            clipToOutline = true
+            outlineProvider = object : ViewOutlineProvider() {
+                override fun getOutline(view: View, outline: Outline) {
+                    val w = view.width.takeIf { it > 0 } ?: currentMorphWidthPx.coerceAtLeast(1)
+                    val h = view.height.takeIf { it > 0 } ?: currentMorphHeightPx.coerceAtLeast(1)
+                    outline.setRoundRect(0, 0, w, h, currentMorphCornerRadiusPx)
+                }
+            }
+            // Enforce strict zero-twist, zero-slide, zero-overshoot geometry
+            translationX = 0f
+            translationY = 0f
+            rotation = 0f
+            scaleX = 1f
+            scaleY = 1f
+        }
+
+        // Add both persistent layers anchored strictly at TOP | CENTER_HORIZONTAL with fixed internal sizes
+        // so internal views NEVER shift, squish, or reflow while the outer shell morphs its width & height!
+        shell.addView(
+            pillLayer,
+            FrameLayout.LayoutParams(
+                measuredPillWidthPx,
+                measuredPillHeightPx,
+                Gravity.TOP or Gravity.CENTER_HORIZONTAL
+            )
+        )
+        shell.addView(
+            cardLayer,
+            FrameLayout.LayoutParams(
+                measuredExpandedWidthPx,
+                measuredExpandedHeightPx,
+                Gravity.TOP or Gravity.CENTER_HORIZONTAL
+            )
+        )
+
+        currentMorphCapsuleShell = shell
+        morphShellCreationCount += 1
+        applyMorphProgress(context, initialProgress)
+        return shell
+    }
+
+    private fun measurePersistentLayers(
+        context: Context,
+        pillLayer: LinearLayout,
+        cardLayer: FrameLayout,
+        targetExpandedWidthPx: Int
+    ) {
+        val density = context.resources.displayMetrics.density.takeIf { it > 0f } ?: 1f
+        val (screenWidth, _) = resolveFullScreenDimensions(context)
+
+        pillLayer.measure(
+            View.MeasureSpec.makeMeasureSpec(screenWidth, View.MeasureSpec.AT_MOST),
+            View.MeasureSpec.makeMeasureSpec(0, View.MeasureSpec.UNSPECIFIED)
+        )
+        measuredPillWidthPx = pillLayer.measuredWidth.takeIf { it > 0 } ?: (104f * density).toInt()
+        measuredPillHeightPx = pillLayer.measuredHeight.takeIf { it > 0 } ?: (26f * density).toInt()
+
+        measuredExpandedWidthPx = targetExpandedWidthPx
+        cardLayer.measure(
+            View.MeasureSpec.makeMeasureSpec(targetExpandedWidthPx, View.MeasureSpec.EXACTLY),
+            View.MeasureSpec.makeMeasureSpec(0, View.MeasureSpec.UNSPECIFIED)
+        )
+        measuredExpandedHeightPx = cardLayer.measuredHeight.takeIf { it > 0 } ?: (136f * density).toInt()
+
+        // Keep child layout params in sync with exact measured dimensions
+        (pillLayer.layoutParams as? FrameLayout.LayoutParams)?.let { lp ->
+            if (lp.width != measuredPillWidthPx || lp.height != measuredPillHeightPx) {
+                lp.width = measuredPillWidthPx
+                lp.height = measuredPillHeightPx
+                lp.gravity = Gravity.TOP or Gravity.CENTER_HORIZONTAL
+                pillLayer.layoutParams = lp
+            }
+        }
+        (cardLayer.layoutParams as? FrameLayout.LayoutParams)?.let { lp ->
+            if (lp.width != measuredExpandedWidthPx || lp.height != measuredExpandedHeightPx) {
+                lp.width = measuredExpandedWidthPx
+                lp.height = measuredExpandedHeightPx
+                lp.gravity = Gravity.TOP or Gravity.CENTER_HORIZONTAL
+                cardLayer.layoutParams = lp
+            }
+        }
+    }
+
+    /**
+     * Applies a single frame of the in-place geometric morph (`progress` in `0f..1f`):
+     * - Width: `lerp(measuredPillWidthPx, measuredExpandedWidthPx, progress)`
+     * - Height: `lerp(measuredPillHeightPx, measuredExpandedHeightPx, progress)`
+     * - Corner Radius: `lerp(pillHeightPx / 2f, 24dp, progress)`
+     * - Crossfade: fades out `persistentDockedPillLayer` over `0.0..0.30` and fades in
+     *   `persistentExpandedCardLayer` over `0.18..1.0` without any rotation, X-translation, or scale.
+     */
+    internal fun applyMorphProgress(context: Context, progress: Float) {
+        val clamped = progress.coerceIn(0f, 1f)
+        currentMorphProgress = clamped
+        val density = context.resources.displayMetrics.density.takeIf { it > 0f } ?: 1f
+
+        val w = lerpInt(measuredPillWidthPx, measuredExpandedWidthPx, clamped)
+        val h = lerpInt(measuredPillHeightPx, measuredExpandedHeightPx, clamped)
+        val pillRadiusPx = measuredPillHeightPx / 2f
+        val expandedRadiusPx = EXPANDED_CARD_CORNER_RADIUS_DP * density
+        val radius = lerpFloat(pillRadiusPx, expandedRadiusPx, clamped)
+
+        currentMorphWidthPx = w
+        currentMorphHeightPx = h
+        currentMorphCornerRadiusPx = radius
+
+        val strokeWidthPx = (1f * density).toInt().coerceAtLeast(1)
+        morphCapsuleBackground?.apply {
+            cornerRadius = radius
+            setColor(lerpArgb(PILL_BG_COLOR, CARD_BG_COLOR, clamped))
+            setStroke(strokeWidthPx, lerpArgb(PILL_STROKE_COLOR, CARD_STROKE_COLOR, clamped))
+        }
+
+        currentMorphCapsuleShell?.let { shell ->
+            // Lock transform properties so twisting, sliding, or dancing is impossible
+            shell.translationX = 0f
+            shell.translationY = 0f
+            shell.rotation = 0f
+            shell.scaleX = 1f
+            shell.scaleY = 1f
+
+            val shellLp = (shell.layoutParams as? FrameLayout.LayoutParams)
+                ?: FrameLayout.LayoutParams(w, h, Gravity.TOP or Gravity.CENTER_HORIZONTAL)
+            shellLp.width = w
+            shellLp.height = h
+            shellLp.gravity = Gravity.TOP or Gravity.CENTER_HORIZONTAL
+            shell.layoutParams = shellLp
+            shell.invalidateOutline()
+            shell.requestLayout()
+        }
+
+        val pillAlpha = ((0.30f - clamped) / 0.30f).coerceIn(0f, 1f)
+        val cardAlpha = ((clamped - 0.18f) / 0.82f).coerceIn(0f, 1f)
+
+        persistentDockedPillLayer?.let { pill ->
+            pill.translationX = 0f
+            pill.translationY = 0f
+            pill.rotation = 0f
+            pill.scaleX = 1f
+            pill.scaleY = 1f
+            pill.alpha = pillAlpha
+            pill.visibility = if (clamped < 0.99f || currentMode == OverlayMode.DOCKED_PILL) {
+                View.VISIBLE
+            } else {
+                View.INVISIBLE
+            }
+        }
+
+        persistentExpandedCardLayer?.let { card ->
+            card.translationX = 0f
+            card.translationY = 0f
+            card.rotation = 0f
+            card.scaleX = 1f
+            card.scaleY = 1f
+            card.alpha = cardAlpha
+            card.visibility = if (clamped > 0.01f || currentMode == OverlayMode.EXPANDED_CARD) {
+                View.VISIBLE
+            } else {
+                View.INVISIBLE
+            }
+        }
+    }
+
+    /**
+     * Runs the single synchronized in-place geometric morph animator between `currentMorphProgress`
+     * and `targetProgress` (`1f` for expand, `0f` for collapse) using a monotonic, non-overshooting
+     * decelerate curve (`PathInterpolator(0.2f, 0f, 0f, 1f)`).
+     */
+    private fun startInPlaceGeometricMorph(context: Context, targetProgress: Float) {
+        cancelMorphAnimator()
+        val startProgress = currentMorphProgress
+        val shell = currentMorphCapsuleShell ?: return
+
+        if (kotlin.math.abs(startProgress - targetProgress) < 0.001f) {
+            applyMorphProgress(context, targetProgress)
+            if (targetProgress == 0f) {
+                attachedWindowView?.minimumHeight = measuredPillHeightPx
+            }
+            return
+        }
+
+        shell.setLayerType(View.LAYER_TYPE_HARDWARE, null)
+        val durationMs = if (targetProgress > startProgress) {
+            MORPH_EXPAND_DURATION_MS
+        } else {
+            MORPH_COLLAPSE_DURATION_MS
+        }
+        // Monotonic decelerate curve with zero bouncy overshoot
+        val interpolator = PathInterpolator(0.2f, 0f, 0f, 1f)
+
+        val animator = ValueAnimator.ofFloat(startProgress, targetProgress).apply {
+            duration = durationMs
+            this.interpolator = interpolator
+            addUpdateListener { anim ->
+                val p = anim.animatedValue as Float
+                applyMorphProgress(context, p)
+            }
+            addListener(object : AnimatorListenerAdapter() {
+                override fun onAnimationEnd(animation: Animator) {
+                    applyMorphProgress(context, targetProgress)
+                    shell.setLayerType(View.LAYER_TYPE_NONE, null)
+                    if (targetProgress == 0f) {
+                        attachedWindowView?.minimumHeight = measuredPillHeightPx
+                    }
+                }
+
+                override fun onAnimationCancel(animation: Animator) {
+                    shell.setLayerType(View.LAYER_TYPE_NONE, null)
+                }
+            })
+        }
+        morphAnimator = animator
+        try {
+            animator.start()
+        } catch (_: Exception) {
+            applyMorphProgress(context, targetProgress)
+            shell.setLayerType(View.LAYER_TYPE_NONE, null)
+        }
+    }
+
+    private fun lerpInt(start: Int, end: Int, fraction: Float): Int {
+        return (start + ((end - start) * fraction)).toInt()
+    }
+
+    private fun lerpFloat(start: Float, end: Float, fraction: Float): Float {
+        return start + (end - start) * fraction
+    }
+
+    private fun lerpArgb(startColor: Int, endColor: Int, fraction: Float): Int {
+        val f = fraction.coerceIn(0f, 1f)
+        val startA = (startColor ushr 24) and 0xFF
+        val startR = (startColor ushr 16) and 0xFF
+        val startG = (startColor ushr 8) and 0xFF
+        val startB = startColor and 0xFF
+
+        val endA = (endColor ushr 24) and 0xFF
+        val endR = (endColor ushr 16) and 0xFF
+        val endG = (endColor ushr 8) and 0xFF
+        val endB = endColor and 0xFF
+
+        val a = (startA + ((endA - startA) * f).toInt()).coerceIn(0, 255)
+        val r = (startR + ((endR - startR) * f).toInt()).coerceIn(0, 255)
+        val g = (startG + ((endG - startG) * f).toInt()).coerceIn(0, 255)
+        val b = (startB + ((endB - startB) * f).toInt()).coerceIn(0, 255)
+        return (a shl 24) or (r shl 16) or (g shl 8) or b
+    }
+
+    private fun handleOutsideTouchEvent(context: Context): Boolean {
+        if (lastIsShowingFinishedCompletion) {
+            dismissBothFinishedNotificationAndOverlay(context)
+            return true
+        } else if (currentMode == OverlayMode.EXPANDED_CARD && !lastIsShowingAppendConfirm) {
+            collapseToDockedPill()
+            return true
+        }
+        return false
+    }
+
+    private fun enableOverlayKeyboardFocus(context: Context, editText: EditText) {
+        val host = attachedWindowView
+        val wm = windowManager ?: (context.getSystemService(Context.WINDOW_SERVICE) as? WindowManager)
+        val lp = activePillWindowParams ?: lastCreatedWindowLayoutParams
+        if (host != null && wm != null && lp != null) {
+            val updatedFlags = lp.flags and
+                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE.inv() and
+                WindowManager.LayoutParams.FLAG_ALT_FOCUSABLE_IM.inv()
+            if (lp.flags != updatedFlags) {
+                lp.flags = updatedFlags
+                lp.windowAnimations = 0
+                lp.softInputMode = WindowManager.LayoutParams.SOFT_INPUT_STATE_VISIBLE or
+                    WindowManager.LayoutParams.SOFT_INPUT_ADJUST_NOTHING
+                try {
+                    wm.updateViewLayout(host, lp)
+                } catch (_: Exception) {}
+            }
+        }
+        editText.requestFocus()
+        try {
+            val imm = context.getSystemService(Context.INPUT_METHOD_SERVICE) as? InputMethodManager
+            imm?.showSoftInput(editText, InputMethodManager.SHOW_IMPLICIT)
+        } catch (_: Exception) {}
+    }
+
+    private fun hideOverlayKeyboard(context: Context, view: View?) {
+        if (view == null) return
+        try {
+            val imm = context.getSystemService(Context.INPUT_METHOD_SERVICE) as? InputMethodManager
+            imm?.hideSoftInputFromWindow(view.windowToken, 0)
+        } catch (_: Exception) {}
+    }
+
+    /**
+     * Builds the special-state cards for the Greek Save Confirmation (`lastIsShowingAppendConfirm`)
+     * and the Finished Recording completion capsule (`lastIsShowingFinishedCompletion`).
+     */
+    private fun buildSpecialStateCardView(context: Context): View {
+        val inflater = LayoutInflater.from(context)
+        val density = context.resources.displayMetrics.density.takeIf { it > 0f } ?: 1f
+
+        val outerWrapper = object : FrameLayout(context) {
+            override fun onTouchEvent(event: MotionEvent?): Boolean {
+                val action = event?.actionMasked ?: event?.action
+                if (action == MotionEvent.ACTION_OUTSIDE) {
+                    handleOutsideTouchEvent(context)
+                    return false
+                }
+                if (action == MotionEvent.ACTION_DOWN) {
+                    if (handleOutsideTouchEvent(context)) {
+                        return true
+                    }
+                }
+                return super.onTouchEvent(event)
+            }
+        }.apply {
+            clipChildren = false
+            clipToPadding = false
+            isClickable = true
+            isFocusable = false
+            setOnClickListener {
+                handleOutsideTouchEvent(context)
+            }
+        }
+
+        if (lastIsShowingFinishedCompletion) {
+            val finishedCard = inflater.inflate(R.layout.notification_finished_compact, outerWrapper, false)
+            finishedCard.isClickable = true
+            finishedCard.isFocusable = true
+            finishedCard.findViewById<ImageView>(R.id.notif_finished_badge)?.setImageResource(R.drawable.ic_notif_finished_check)
+            finishedCard.findViewById<TextView>(R.id.notif_finished_title)?.text =
+                buildGradientBlendedTitle(lastFinishedTitle.ifBlank { context.getString(R.string.notification_finished_recording) })
+            finishedCard.setOnClickListener {
+                handleFinishedCapsuleTapOpenSavedRecording(context)
+            }
+            attachFinishedCardSwipeAndTapListener(context, finishedCard)
+            val cardLp = FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.WRAP_CONTENT,
+                Gravity.TOP or Gravity.CENTER_HORIZONTAL
+            )
+            outerWrapper.addView(finishedCard, cardLp)
+            return outerWrapper
+        }
+
+        // Greek Save / Cancel confirmation card (`notification_append_confirm_compact`)
+        val confirmCard = inflater.inflate(R.layout.notification_append_confirm_compact, outerWrapper, false)
+        confirmCard.isClickable = true
+        confirmCard.findViewById<TextView>(R.id.notif_append_dont_text)?.text = buildGradientBlendedTitle("Don't")
+        confirmCard.findViewById<TextView>(R.id.notif_append_save_text)?.text = buildGradientBlendedTitle("Save")
+
+        val initialTitle = currentEditedRecordingTitle.ifBlank {
+            suggestedRecordingTitle.ifBlank {
+                generateDefaultTimestampedTitle(lastStateTitle)
+            }
+        }
+        if (suggestedRecordingTitle.isBlank()) {
+            suggestedRecordingTitle = initialTitle
+        }
+        currentEditedRecordingTitle = initialTitle
+
+        val inputContainer = confirmCard.findViewById<FrameLayout>(R.id.notif_append_title_input_container)
+        confirmCard.findViewById<View>(R.id.notif_append_title_display)?.visibility = View.GONE
+
+        val titleInputField = EditText(context).apply {
+            id = R.id.notif_append_title_input
+            layoutParams = FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                (48f * density).toInt(),
+                Gravity.CENTER_VERTICAL
+            )
+            minHeight = (48f * density).toInt()
+            setBackgroundResource(R.drawable.bg_notif_title_input)
+            val padH = (14f * density).toInt()
+            val padV = (10f * density).toInt()
+            setPadding(padH, padV, padH, padV)
+            gravity = Gravity.CENTER_VERTICAL or Gravity.START
+            includeFontPadding = false
+            isSingleLine = true
+            maxLines = 1
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_CAP_SENTENCES
+            imeOptions = EditorInfo.IME_ACTION_DONE
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
+            typeface = android.graphics.Typeface.create("sans-serif-medium", android.graphics.Typeface.NORMAL)
+            setTextColor(0xFFF4D7C7.toInt())
+            setHintTextColor(0xFF9E8C82.toInt())
+            hint = "Recording title"
+            setText(initialTitle)
+            try {
+                setSelection(initialTitle.length)
+            } catch (_: Exception) {}
+            isFocusable = true
+            isFocusableInTouchMode = true
+            isClickable = true
+            setOnClickListener {
+                enableOverlayKeyboardFocus(context, this)
+            }
+            setOnFocusChangeListener { _, hasFocus ->
+                if (hasFocus) {
+                    enableOverlayKeyboardFocus(context, this)
+                }
+            }
+            addTextChangedListener(object : TextWatcher {
+                override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) {}
+                override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {
+                    currentEditedRecordingTitle = s?.toString().orEmpty()
+                }
+                override fun afterTextChanged(s: Editable?) {}
+            })
+        }
+        inputContainer?.addView(titleInputField)
+
+        confirmCard.findViewById<View>(R.id.notif_append_dont_button)?.setOnClickListener {
+            hideOverlayKeyboard(context, titleInputField)
+            dismissAndReset()
+            onCancelAppendSaveCallback?.invoke()
+        }
+        confirmCard.findViewById<View>(R.id.notif_append_save_button)?.setOnClickListener {
+            hideOverlayKeyboard(context, titleInputField)
+            val enteredTitle = titleInputField.text?.toString()?.trim().orEmpty()
+            val finalTitle = enteredTitle.ifBlank {
+                suggestedRecordingTitle.ifBlank {
+                    generateDefaultTimestampedTitle(lastStateTitle)
+                }
+            }
+            currentEditedRecordingTitle = finalTitle
+
+            val titleCallback = onConfirmAppendSaveWithTitleCallback
+            val callback = onConfirmAppendSaveCallback
+            if (titleCallback != null) {
+                titleCallback.invoke(finalTitle)
+            } else if (callback != null) {
+                callback.invoke()
+            } else {
+                showFinishedCompletionOverlay(
+                    context = context,
+                    title = context.getString(R.string.notification_finished_recording)
+                )
+            }
+        }
         val cardLp = FrameLayout.LayoutParams(
             FrameLayout.LayoutParams.MATCH_PARENT,
             FrameLayout.LayoutParams.WRAP_CONTENT,
             Gravity.TOP or Gravity.CENTER_HORIZONTAL
         )
-        outerWrapper.addView(cardView, cardLp)
+        outerWrapper.addView(confirmCard, cardLp)
         return outerWrapper
     }
 
@@ -700,27 +1961,30 @@ object RecordingIslandOverlayManager {
         }
     }
 
-    private fun updateAttachedViewInPlace(context: Context, root: View) {
-        if (lastIsShowingFinishedCompletion) {
-            root.findViewById<TextView>(R.id.notif_finished_title)?.text =
-                buildGradientBlendedTitle(lastFinishedTitle.ifBlank { context.getString(R.string.notification_finished_recording) })
-        } else if (currentMode == OverlayMode.DOCKED_PILL && !lastIsShowingAppendConfirm) {
-            val miniWaveform = root.findViewById<ImageView>(R.id.notif_recording_waveform)
+    private fun updatePersistentRecordingLayersInPlace(context: Context) {
+        persistentDockedPillLayer?.let { pill ->
+            val miniWaveform = pill.findViewById<ImageView>(R.id.notif_recording_waveform)
             miniWaveform?.setImageBitmap(
                 renderMiniOscillatingWaveformBitmap(
                     displacements = lastOscillatingDisplacements,
                     isPaused = lastIsPaused
                 )
             )
-            val timerText = root.findViewById<TextView>(R.id.notif_recording_paused_timer)
+            val timerText = pill.findViewById<TextView>(R.id.notif_recording_paused_timer)
             timerText?.setTextColor(if (lastIsPaused) 0x99F4D7C7.toInt() else 0xFFF08C4B.toInt())
             timerText?.text = formatTimerMs(lastElapsedMs)
-        } else if (!lastIsShowingAppendConfirm) {
-            bindExpandedRecordingCardViews(context, root)
+        }
+        persistentExpandedCardLayer?.let { card ->
+            bindExpandedRecordingCardViews(context, card)
         }
     }
 
-    private fun createWindowLayoutParams(context: Context): WindowManager.LayoutParams {
+    internal fun createWindowLayoutParams(context: Context): WindowManager.LayoutParams {
+        val density = context.resources.displayMetrics.density.takeIf { it > 0f } ?: 1f
+        val (screenWidth, _) = resolveFullScreenDimensions(context)
+        val horizontalMarginPx = (EXPANDED_HORIZONTAL_MARGIN_DP * density).toInt()
+        val fixedExpandedWidthPx = (screenWidth - horizontalMarginPx * 2).coerceAtLeast((280f * density).toInt())
+
         val overlayType = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
         } else {
@@ -729,70 +1993,156 @@ object RecordingIslandOverlayManager {
         }
 
         val isPill = currentMode == OverlayMode.DOCKED_PILL && !lastIsShowingAppendConfirm && !lastIsShowingFinishedCompletion
-        val widthSpec = if (isPill) {
-            WindowManager.LayoutParams.WRAP_CONTENT
-        } else {
-            WindowManager.LayoutParams.MATCH_PARENT
+
+        // Keep window width constant at fixedExpandedWidthPx across DOCKED_PILL <-> EXPANDED_CARD
+        // so WindowManagerService never reallocates or shifts windowFrame.left during expansion/collapse.
+        // Strictly WRAP_CONTENT height in all modes so the rest of the phone screen remains 100% interactive.
+        val widthSpec = fixedExpandedWidthPx
+        val heightSpec = WindowManager.LayoutParams.WRAP_CONTENT
+
+        val defaultY = defaultTopY(context)
+        if (pillDragOffsetY == 0) {
+            pillDragOffsetY = defaultY
         }
-        val heightSpec = if (isPill || lastIsShowingAppendConfirm) {
-            WindowManager.LayoutParams.WRAP_CONTENT
+
+        val focusFlag = if (lastIsShowingAppendConfirm) {
+            0
         } else {
-            // Full-screen transparent touch catcher in EXPANDED_CARD or Finished completion mode so any outside tap collapses/dismisses
-            WindowManager.LayoutParams.MATCH_PARENT
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
         }
+
+        // Keep flags consistent between DOCKED_PILL and EXPANDED_CARD so status-bar / cutout
+        // coordinate origins never shift by 1 pixel when expanding or collapsing.
+        val flags = focusFlag or
+            WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
+            WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+            WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS or
+            WindowManager.LayoutParams.FLAG_WATCH_OUTSIDE_TOUCH or
+            WindowManager.LayoutParams.FLAG_HARDWARE_ACCELERATED
 
         return WindowManager.LayoutParams(
             widthSpec,
             heightSpec,
             overlayType,
-            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
-                WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
-                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
-                WindowManager.LayoutParams.FLAG_WATCH_OUTSIDE_TOUCH,
+            flags,
             PixelFormat.TRANSLUCENT
         ).apply {
             gravity = Gravity.TOP or Gravity.CENTER_HORIZONTAL
-            y = (6f * context.resources.displayMetrics.density).toInt()
+            x = if (isPill) pillDragOffsetX else 0
+            y = if (isPill) pillDragOffsetY else defaultY
+            // Strictly disable all system window enter/exit/resize transitions
+            windowAnimations = 0
+            if (lastIsShowingAppendConfirm) {
+                softInputMode = WindowManager.LayoutParams.SOFT_INPUT_ADJUST_NOTHING
+            }
+            applyHighRefreshRateHint(this)
         }
     }
 
-    private fun syncOverlayView(context: Context, forceRecreate: Boolean = false) {
+    private fun syncOverlayView(
+        context: Context,
+        forceRecreate: Boolean = false
+    ) {
+        val lp = createWindowLayoutParams(context)
+        activePillWindowParams = lp
+        lastCreatedWindowLayoutParams = lp
+
         if (!shouldDisplayOverlay() || !canDrawSystemOverlay(context)) {
             detachWindowOnly()
             currentOverlayRootView = buildOverlayContentView(context)
             return
         }
 
-        val existingHost = attachedWindowView as? FrameLayout
-        val existingContent = currentOverlayRootView
-        if (!forceRecreate &&
-            isOverlayAttachedToWindow &&
-            existingHost != null &&
-            existingContent != null &&
-            attachedMode == currentMode &&
-            attachedConfirmState == lastIsShowingAppendConfirm &&
-            attachedFinishedState == lastIsShowingFinishedCompletion
-        ) {
-            updateAttachedViewInPlace(context, existingContent)
+        val isSpecialCard = lastIsShowingAppendConfirm || lastIsShowingFinishedCompletion
+        val existingHost = attachedWindowView
+
+        // Fast path for normal active recording (DOCKED_PILL or EXPANDED_CARD):
+        // Keep the single persistent morphCapsuleShell attached inside existingHost!
+        if (!isSpecialCard) {
+            val morphShell = ensurePersistentMorphShell(context)
+            updatePersistentRecordingLayersInPlace(context)
+
+            if (morphAnimator?.isRunning != true) {
+                val targetP = if (currentMode == OverlayMode.EXPANDED_CARD) 1f else 0f
+                applyMorphProgress(context, targetP)
+            }
+            currentOverlayRootView = if (currentMode == OverlayMode.DOCKED_PILL) {
+                persistentDockedPillLayer
+            } else {
+                persistentExpandedCardLayer
+            }
+
+            try {
+                val wm = (windowManager ?: (context.getSystemService(Context.WINDOW_SERVICE) as? WindowManager))
+                    ?.also { windowManager = it } ?: return
+
+                if (isOverlayAttachedToWindow && existingHost != null) {
+                    if (existingHost.childCount != 1 || existingHost.getChildAt(0) !== morphShell) {
+                        existingHost.removeAllViews()
+                        (morphShell.parent as? ViewGroup)?.removeView(morphShell)
+                        existingHost.addView(morphShell)
+                    }
+                    existingHost.minimumHeight = if (currentMode == OverlayMode.EXPANDED_CARD) {
+                        measuredExpandedHeightPx
+                    } else {
+                        measuredPillHeightPx
+                    }
+                    try {
+                        wm.updateViewLayout(existingHost, lp)
+                    } catch (_: Exception) {}
+                    attachedConfirmState = false
+                    attachedFinishedState = false
+                    return
+                }
+
+                val hostContainer = createPersistentHostContainer(context).apply {
+                    minimumHeight = if (currentMode == OverlayMode.EXPANDED_CARD) {
+                        measuredExpandedHeightPx
+                    } else {
+                        measuredPillHeightPx
+                    }
+                    (morphShell.parent as? ViewGroup)?.removeView(morphShell)
+                    addView(morphShell)
+                }
+                wm.addView(hostContainer, lp)
+                attachedWindowView = hostContainer
+                attachedConfirmState = false
+                attachedFinishedState = false
+                isOverlayAttachedToWindow = true
+            } catch (_: Exception) {
+                attachedWindowView = null
+                isOverlayAttachedToWindow = false
+            }
             return
         }
 
-        val content = buildOverlayContentView(context)
-        currentOverlayRootView = content
+        // Special state path: Greek Save Confirmation card or Finished Recording completion card
+        if (!forceRecreate &&
+            isOverlayAttachedToWindow &&
+            existingHost != null &&
+            currentOverlayRootView != null &&
+            attachedConfirmState == lastIsShowingAppendConfirm &&
+            attachedFinishedState == lastIsShowingFinishedCompletion
+        ) {
+            if (lastIsShowingFinishedCompletion) {
+                currentOverlayRootView?.findViewById<TextView>(R.id.notif_finished_title)?.text =
+                    buildGradientBlendedTitle(lastFinishedTitle.ifBlank { context.getString(R.string.notification_finished_recording) })
+            }
+            return
+        }
+
+        val specialContent = buildSpecialStateCardView(context)
+        currentOverlayRootView = specialContent
 
         try {
             val wm = (windowManager ?: (context.getSystemService(Context.WINDOW_SERVICE) as? WindowManager))
                 ?.also { windowManager = it } ?: return
 
-            val lp = createWindowLayoutParams(context)
-
             if (isOverlayAttachedToWindow && existingHost != null) {
-                // Keep the existing overlay window attached (NEVER removeView -> addView)
-                // Swap child content in-place with a smooth crossfade and update layout params
-                content.alpha = 0f
+                existingHost.minimumHeight = 0
                 existingHost.removeAllViews()
                 existingHost.addView(
-                    content,
+                    specialContent,
                     FrameLayout.LayoutParams(
                         FrameLayout.LayoutParams.MATCH_PARENT,
                         FrameLayout.LayoutParams.WRAP_CONTENT,
@@ -802,22 +2152,14 @@ object RecordingIslandOverlayManager {
                 try {
                     wm.updateViewLayout(existingHost, lp)
                 } catch (_: Exception) {}
-                content.animate()
-                    .alpha(1f)
-                    .setDuration(140L)
-                    .start()
-                attachedMode = currentMode
                 attachedConfirmState = lastIsShowingAppendConfirm
                 attachedFinishedState = lastIsShowingFinishedCompletion
                 return
             }
 
-            // First-time attachment only: create persistent host container and addView once
-            val hostContainer = FrameLayout(context).apply {
-                clipChildren = false
-                clipToPadding = false
+            val hostContainer = createPersistentHostContainer(context).apply {
                 addView(
-                    content,
+                    specialContent,
                     FrameLayout.LayoutParams(
                         FrameLayout.LayoutParams.MATCH_PARENT,
                         FrameLayout.LayoutParams.WRAP_CONTENT,
@@ -827,7 +2169,6 @@ object RecordingIslandOverlayManager {
             }
             wm.addView(hostContainer, lp)
             attachedWindowView = hostContainer
-            attachedMode = currentMode
             attachedConfirmState = lastIsShowingAppendConfirm
             attachedFinishedState = lastIsShowingFinishedCompletion
             isOverlayAttachedToWindow = true
@@ -837,15 +2178,45 @@ object RecordingIslandOverlayManager {
         }
     }
 
+    private fun createPersistentHostContainer(context: Context): FrameLayout {
+        return object : FrameLayout(context) {
+            override fun onTouchEvent(event: MotionEvent?): Boolean {
+                val action = event?.actionMasked ?: event?.action
+                if (action == MotionEvent.ACTION_OUTSIDE) {
+                    handleOutsideTouchEvent(context)
+                    return false
+                }
+                if (action == MotionEvent.ACTION_DOWN && currentMode == OverlayMode.EXPANDED_CARD && !lastIsShowingAppendConfirm) {
+                    handleOutsideTouchEvent(context)
+                    return true
+                }
+                return super.onTouchEvent(event)
+            }
+        }.apply {
+            clipChildren = false
+            clipToPadding = false
+            translationX = 0f
+            translationY = 0f
+            rotation = 0f
+            scaleX = 1f
+            scaleY = 1f
+        }
+    }
+
     private fun detachOverlayWindow() {
         detachWindowOnly()
         currentOverlayRootView = null
+        currentMorphCapsuleShell = null
+        persistentDockedPillLayer = null
+        persistentExpandedCardLayer = null
+        morphCapsuleBackground = null
     }
 
     private fun detachWindowOnly() {
+        cancelMorphAnimator()
         val viewToRemove = attachedWindowView
         attachedWindowView = null
-        attachedMode = null
+        activePillWindowParams = null
         attachedConfirmState = null
         attachedFinishedState = null
         isOverlayAttachedToWindow = false
@@ -878,7 +2249,7 @@ object RecordingIslandOverlayManager {
             floatArrayOf(-0.35f, 0.55f, -0.75f, 0.65f, -0.45f, 0.30f)
         }
         val count = points.size
-        val padX = 3f
+        val padX = 2.5f
         val usableWidth = (width - padX * 2f).coerceAtLeast(1f)
         val maxHalfAmp = height * 0.42f
 
@@ -911,7 +2282,7 @@ object RecordingIslandOverlayManager {
 
         val strokePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
             style = Paint.Style.STROKE
-            strokeWidth = 3f
+            strokeWidth = 2.75f
             strokeCap = Paint.Cap.ROUND
             strokeJoin = Paint.Join.ROUND
             shader = LinearGradient(
@@ -939,9 +2310,9 @@ object RecordingIslandOverlayManager {
         val minutes = (totalSeconds % 3600L) / 60L
         val seconds = totalSeconds % 60L
         return if (hours > 0L) {
-            String.format(java.util.Locale.US, "%02d:%02d:%02d", hours, minutes, seconds)
+            String.format(Locale.US, "%02d:%02d:%02d", hours, minutes, seconds)
         } else {
-            String.format(java.util.Locale.US, "%02d:%02d", minutes, seconds)
+            String.format(Locale.US, "%02d:%02d", minutes, seconds)
         }
     }
 }

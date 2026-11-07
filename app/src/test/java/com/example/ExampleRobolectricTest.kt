@@ -1,9 +1,11 @@
 package com.example
 
 import android.content.Context
+import android.content.Intent
 import androidx.test.core.app.ApplicationProvider
 import com.example.audio.WavFileTools
 import com.example.data.AudioFormatUtils
+import com.example.service.RecordingForegroundService
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
@@ -724,32 +726,218 @@ class ExampleRobolectricTest {
             com.example.service.RecordingIslandOverlayManager.OverlayMode.DOCKED_PILL,
             com.example.service.RecordingIslandOverlayManager.currentMode
         )
-        // Verify tapping the docked pill view expands it to EXPANDED_CARD
-        val dockedPillView = com.example.service.RecordingIslandOverlayManager.currentOverlayRootView
+        // Verify tapping the docked pill view expands it to EXPANDED_CARD via 120 FPS top-center morph,
+        // and verify docked pill enforces physical LTR layout with generous right padding for unclipped timer
+        val dockedPillView = com.example.service.RecordingIslandOverlayManager.currentOverlayRootView as? android.widget.LinearLayout
         org.junit.Assert.assertNotNull(dockedPillView)
+        assertEquals(
+            "Docked pill must enforce physical LTR layout so RTL locales never invert timer position",
+            android.view.View.LAYOUT_DIRECTION_LTR,
+            dockedPillView?.layoutDirection
+        )
+        assertTrue(
+            "Docked pill physical right padding must be generous (>= left padding) so seconds digits are never clipped",
+            (dockedPillView?.paddingRight ?: 0) >= (dockedPillView?.paddingLeft ?: 0)
+        )
+        // Child 0 is mini waveform on physical left; Child 1 is timer on physical right
+        assertEquals(R.id.notif_recording_waveform, dockedPillView?.getChildAt(0)?.id)
+        assertEquals(R.id.notif_recording_paused_timer, dockedPillView?.getChildAt(1)?.id)
+
+        val morphShellBeforeExpand = com.example.service.RecordingIslandOverlayManager.currentMorphCapsuleShell
+        org.junit.Assert.assertNotNull("Persistent morph capsule shell must be initialized", morphShellBeforeExpand)
+        val creationCountBeforeExpand = com.example.service.RecordingIslandOverlayManager.morphShellCreationCount
+        val pillWidthBeforeExpand = com.example.service.RecordingIslandOverlayManager.currentMorphWidthPx
+        val pillHeightBeforeExpand = com.example.service.RecordingIslandOverlayManager.currentMorphHeightPx
+        val pillRadiusBeforeExpand = com.example.service.RecordingIslandOverlayManager.currentMorphCornerRadiusPx
+
         dockedPillView?.performClick()
+        org.robolectric.Shadows.shadowOf(android.os.Looper.getMainLooper()).idle()
         assertEquals(
             com.example.service.RecordingIslandOverlayManager.OverlayMode.EXPANDED_CARD,
             com.example.service.RecordingIslandOverlayManager.currentMode
         )
+        assertEquals(0f, com.example.service.RecordingIslandOverlayManager.lastMorphPivotY, 0.01f)
+        assertEquals(120f, com.example.service.RecordingIslandOverlayManager.lastMorphRefreshRateHz, 0.01f)
+        // Verify pure in-place geometric expansion: exact same persistent view shell is kept without recreation
+        org.junit.Assert.assertSame(
+            "Capsule expansion must keep the exact same morph shell view attached in-place without recreating",
+            morphShellBeforeExpand,
+            com.example.service.RecordingIslandOverlayManager.currentMorphCapsuleShell
+        )
+        assertEquals(
+            "Morph shell creation count must not increase during expansion",
+            creationCountBeforeExpand,
+            com.example.service.RecordingIslandOverlayManager.morphShellCreationCount
+        )
+        assertTrue(
+            "Expanded width must be strictly greater than compact pill width",
+            com.example.service.RecordingIslandOverlayManager.currentMorphWidthPx > pillWidthBeforeExpand
+        )
+        assertTrue(
+            "Expanded height must be strictly greater than compact pill height",
+            com.example.service.RecordingIslandOverlayManager.currentMorphHeightPx > pillHeightBeforeExpand
+        )
+        assertTrue(
+            "Expanded corner radius (24dp) must morph smoothly from compact pill radius",
+            com.example.service.RecordingIslandOverlayManager.currentMorphCornerRadiusPx > pillRadiusBeforeExpand
+        )
+        // Verify zero twisting, sliding, or scale distortion
+        assertEquals(0f, morphShellBeforeExpand!!.rotation, 0.001f)
+        assertEquals(0f, morphShellBeforeExpand.translationX, 0.001f)
+        assertEquals(1f, morphShellBeforeExpand.scaleX, 0.001f)
+        assertEquals(1f, morphShellBeforeExpand.scaleY, 0.001f)
+
+        // Verify mid-morph (p = 0.5f) continuous geometric interpolation and internal layer crossfade
+        com.example.service.RecordingIslandOverlayManager.applyMorphProgress(context, 0.5f)
+        val midWidth = com.example.service.RecordingIslandOverlayManager.currentMorphWidthPx
+        val midHeight = com.example.service.RecordingIslandOverlayManager.currentMorphHeightPx
+        assertTrue(midWidth > pillWidthBeforeExpand)
+        assertTrue(midHeight > pillHeightBeforeExpand)
+        com.example.service.RecordingIslandOverlayManager.applyMorphProgress(context, 1.0f)
+
         // Verify waveform remains strictly VISIBLE in the expanded capsule
         val expandedCardWaveform = com.example.service.RecordingIslandOverlayManager.currentOverlayRootView
             ?.findViewById<android.widget.ImageView>(R.id.notif_recording_waveform)
         org.junit.Assert.assertNotNull(expandedCardWaveform)
         assertEquals(android.view.View.VISIBLE, expandedCardWaveform?.visibility)
 
-        // Verify tapping outside the expanded card collapses it back to DOCKED_PILL
+        // Verify expanded capsule window uses WRAP_CONTENT height, windowAnimations = 0, and FLAG_NOT_TOUCH_MODAL | FLAG_WATCH_OUTSIDE_TOUCH
+        // so the rest of the phone screen remains 100% interactive and default window enter/exit animations are disabled
+        val expandedLp = com.example.service.RecordingIslandOverlayManager.lastCreatedWindowLayoutParams
+        org.junit.Assert.assertNotNull(expandedLp)
+        assertEquals(
+            "Default window enter/exit animations must be strictly disabled (windowAnimations = 0)",
+            0,
+            expandedLp?.windowAnimations
+        )
+        assertEquals(
+            android.view.WindowManager.LayoutParams.WRAP_CONTENT,
+            expandedLp?.height
+        )
+        assertTrue(
+            (expandedLp!!.flags and android.view.WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL) != 0
+        )
+        assertTrue(
+            (expandedLp.flags and android.view.WindowManager.LayoutParams.FLAG_WATCH_OUTSIDE_TOUCH) != 0
+        )
+
+        // Verify outside touch (ACTION_OUTSIDE) collapses the expanded card back to DOCKED_PILL in-place
         val expandedWrapperView = com.example.service.RecordingIslandOverlayManager.currentOverlayRootView
         org.junit.Assert.assertNotNull(expandedWrapperView)
-        expandedWrapperView?.performClick()
+        val outsideEvent = android.view.MotionEvent.obtain(
+            100L,
+            100L,
+            android.view.MotionEvent.ACTION_OUTSIDE,
+            200f,
+            800f,
+            0
+        )
+        expandedWrapperView?.dispatchTouchEvent(outsideEvent)
+        outsideEvent.recycle()
+        org.robolectric.Shadows.shadowOf(android.os.Looper.getMainLooper()).idle()
         assertEquals(
             com.example.service.RecordingIslandOverlayManager.OverlayMode.DOCKED_PILL,
             com.example.service.RecordingIslandOverlayManager.currentMode
         )
+        org.junit.Assert.assertSame(
+            "Capsule collapse must keep the exact same morph shell view attached in-place without recreating",
+            morphShellBeforeExpand,
+            com.example.service.RecordingIslandOverlayManager.currentMorphCapsuleShell
+        )
+        assertEquals(pillWidthBeforeExpand, com.example.service.RecordingIslandOverlayManager.currentMorphWidthPx)
+        assertEquals(pillHeightBeforeExpand, com.example.service.RecordingIslandOverlayManager.currentMorphHeightPx)
         // Verify waveform remains present in docked pill mode
         val dockedWaveform = com.example.service.RecordingIslandOverlayManager.currentOverlayRootView
             ?.findViewById<android.widget.ImageView>(R.id.notif_recording_waveform)
         org.junit.Assert.assertNotNull(dockedWaveform)
+
+        // Verify compact pill long-press & drag shows strictly icon-only bottom trash target,
+        // snaps back when released away from trash, and discards recording when dropped onto trash target
+        val pillForDrag = com.example.service.RecordingIslandOverlayManager.currentOverlayRootView
+        org.junit.Assert.assertNotNull(pillForDrag)
+        val dm = context.resources.displayMetrics
+        val screenCenterX = (dm.widthPixels.takeIf { it > 0 } ?: 1080) / 2f
+        val screenHeight = (dm.heightPixels.takeIf { it > 0 } ?: 2400).toFloat()
+        val midY = screenHeight * 0.30f
+        val downEv = android.view.MotionEvent.obtain(200L, 200L, android.view.MotionEvent.ACTION_DOWN, screenCenterX, 20f, 0)
+        val moveMidEv = android.view.MotionEvent.obtain(200L, 260L, android.view.MotionEvent.ACTION_MOVE, screenCenterX + 40f, midY, 0)
+        val upMidEv = android.view.MotionEvent.obtain(200L, 320L, android.view.MotionEvent.ACTION_UP, screenCenterX + 40f, midY, 0)
+        pillForDrag?.dispatchTouchEvent(downEv)
+        pillForDrag?.dispatchTouchEvent(moveMidEv)
+        assertTrue(com.example.service.RecordingIslandOverlayManager.isBottomTrashTargetVisible)
+        val trashWindowRoot = com.example.service.RecordingIslandOverlayManager.currentTrashOverlayWindowView as? android.view.ViewGroup
+        org.junit.Assert.assertNotNull(trashWindowRoot)
+        org.junit.Assert.assertFalse("Trash outer window root must disable clipChildren to prevent hover clipping", trashWindowRoot!!.clipChildren)
+        org.junit.Assert.assertFalse("Trash outer window root must disable clipToPadding to prevent hover clipping", trashWindowRoot.clipToPadding)
+        val trashWindowLp = com.example.service.RecordingIslandOverlayManager.lastCreatedTrashWindowLayoutParams
+        org.junit.Assert.assertNotNull(trashWindowLp)
+        assertTrue(
+            "Trash window layout width must be generous (96dp) to accommodate 1.22x hover expansion without clipping",
+            trashWindowLp!!.width >= (90f * dm.density).toInt()
+        )
+        assertTrue(
+            "Trash window layout height must be generous (96dp) to accommodate 1.22x hover expansion without clipping",
+            trashWindowLp.height >= (90f * dm.density).toInt()
+        )
+        val trashTargetView = com.example.service.RecordingIslandOverlayManager.currentTrashTargetRootView as? android.view.ViewGroup
+        org.junit.Assert.assertNotNull(trashTargetView)
+        // Strictly icon-only: 1 child (ImageView) and 0 TextViews
+        assertEquals(1, trashTargetView?.childCount)
+        assertTrue(trashTargetView?.getChildAt(0) is android.widget.ImageView)
+        pillForDrag?.dispatchTouchEvent(upMidEv)
+        downEv.recycle()
+        moveMidEv.recycle()
+        upMidEv.recycle()
+        org.robolectric.Shadows.shadowOf(android.os.Looper.getMainLooper()).idle()
+        // Released away from trash -> trash target hides and pill snaps back to top center dock (x = 0)
+        org.junit.Assert.assertFalse(com.example.service.RecordingIslandOverlayManager.isBottomTrashTargetVisible)
+        assertEquals(0, com.example.service.RecordingIslandOverlayManager.pillDragOffsetX)
+        assertTrue(com.example.service.RecordingIslandOverlayManager.shouldDisplayOverlay())
+
+        // Drag compact pill onto bottom trash target -> hover scales up (1.22f) and release discards recording & closes capsule
+        val trashY = screenHeight - (48f * dm.density) - (28f * dm.density)
+        val downTrashEv = android.view.MotionEvent.obtain(400L, 400L, android.view.MotionEvent.ACTION_DOWN, screenCenterX, 20f, 0)
+        val moveTrashEv = android.view.MotionEvent.obtain(400L, 460L, android.view.MotionEvent.ACTION_MOVE, screenCenterX, trashY, 0)
+        val upTrashEv = android.view.MotionEvent.obtain(400L, 520L, android.view.MotionEvent.ACTION_UP, screenCenterX, trashY, 0)
+        pillForDrag?.dispatchTouchEvent(downTrashEv)
+        pillForDrag?.dispatchTouchEvent(moveTrashEv)
+        assertTrue(com.example.service.RecordingIslandOverlayManager.isTrashTargetHovered)
+        pillForDrag?.dispatchTouchEvent(upTrashEv)
+        downTrashEv.recycle()
+        moveTrashEv.recycle()
+        upTrashEv.recycle()
+        org.robolectric.Shadows.shadowOf(android.os.Looper.getMainLooper()).idle()
+        org.junit.Assert.assertFalse(
+            "Dropping pill onto trash target must immediately dismiss overlay capsule",
+            com.example.service.RecordingIslandOverlayManager.shouldDisplayOverlay()
+        )
+        // Verify RecordingForegroundService handles ACTION_DISCARD_RECORDING by cancelling NOTIFICATION_ID
+        // and blocking any late ACTION_UPDATE_NOTIFICATION from resurrecting the notification
+        val discardServiceController = org.robolectric.Robolectric.buildService(
+            com.example.service.RecordingForegroundService::class.java
+        ).create()
+        val discardService = discardServiceController.get()
+        val startForDiscardIntent = Intent(context, RecordingForegroundService::class.java).apply {
+            action = RecordingForegroundService.ACTION_START_FOREGROUND
+            putExtra(RecordingForegroundService.EXTRA_TITLE, "Recording")
+        }
+        discardService.onStartCommand(startForDiscardIntent, 0, 98)
+        val discardIntent = Intent(context, RecordingForegroundService::class.java).apply {
+            action = RecordingForegroundService.ACTION_DISCARD_RECORDING
+        }
+        discardService.onStartCommand(discardIntent, 0, 99)
+        val staleUpdateIntent = Intent(context, RecordingForegroundService::class.java).apply {
+            action = RecordingForegroundService.ACTION_UPDATE_NOTIFICATION
+            putExtra(RecordingForegroundService.EXTRA_TITLE, "Recording")
+            putExtra(RecordingForegroundService.EXTRA_RECORDING_ELAPSED_MS, 12_000L)
+        }
+        discardService.onStartCommand(staleUpdateIntent, 0, 100)
+        val nmAfterDiscard = context.getSystemService(android.content.Context.NOTIFICATION_SERVICE) as android.app.NotificationManager
+        val shadowNmAfterDiscard = org.robolectric.Shadows.shadowOf(nmAfterDiscard)
+        org.junit.Assert.assertNull(
+            "Recording notification must be completely removed and not resurrected after trash drop discard",
+            shadowNmAfterDiscard.getNotification(RecordingForegroundService.NOTIFICATION_ID)
+        )
 
         com.example.service.RecordingIslandOverlayManager.handleHeaderTapOpenApp(context)
         org.junit.Assert.assertFalse(com.example.service.RecordingIslandOverlayManager.shouldDisplayOverlay())
@@ -775,6 +963,20 @@ class ExampleRobolectricTest {
             "Save button must be displayed in confirmation message",
             confirmOverlayRoot?.findViewById<android.view.View>(R.id.notif_append_save_button)
         )
+        val titleInputField = confirmOverlayRoot?.findViewById<android.widget.EditText>(R.id.notif_append_title_input)
+        org.junit.Assert.assertNotNull(
+            "Recording title input field must be present directly beneath the Greek action buttons in save confirmation card",
+            titleInputField
+        )
+        assertTrue(
+            "Recording title input must be pre-populated with default timestamped title",
+            titleInputField?.text?.toString().orEmpty().startsWith("Recording")
+        )
+        val confirmLinearRoot = confirmOverlayRoot?.findViewById<android.widget.LinearLayout>(R.id.notif_append_confirm_root)
+        org.junit.Assert.assertNotNull(confirmLinearRoot)
+        assertEquals(android.widget.LinearLayout.VERTICAL, confirmLinearRoot?.orientation)
+        assertEquals(R.id.notif_append_buttons_row, confirmLinearRoot?.getChildAt(0)?.id)
+        assertEquals(R.id.notif_append_title_input_container, confirmLinearRoot?.getChildAt(1)?.id)
         val appendConfirmNotif = service.buildAppendSaveConfirmationNotification()
         assertEquals(R.drawable.ic_notif_finished_check, appendConfirmNotif.smallIcon.resId)
         assertEquals("Σ Save", appendConfirmNotif.actions[1].title.toString())
