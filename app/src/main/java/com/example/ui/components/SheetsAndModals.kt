@@ -4,6 +4,8 @@ import android.net.Uri
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.animateContentSize
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -86,6 +88,7 @@ import com.example.ui.theme.PeachAccent
 import com.example.ui.theme.PrimaryText
 import com.example.ui.theme.SecondaryText
 import com.example.ui.theme.SuccessSage
+import com.example.ui.theme.TabularMonoStyle
 import com.example.ui.theme.TonalDarkBrown
 import com.example.ui.theme.WarmSecondarySurface
 import com.example.ui.theme.m3PressScale
@@ -97,25 +100,45 @@ import androidx.activity.compose.BackHandler
 import androidx.compose.ui.window.DialogProperties
 
 @Composable
+fun AutoSizingActionButtonText(
+    text: String,
+    color: Color = PrimaryText,
+    initialFontSizeSp: Float = 14f,
+    minFontSizeSp: Float = 10.5f
+) {
+    var fontSizeSp by remember(text) { mutableStateOf(initialFontSizeSp) }
+    Text(
+        text = text,
+        style = MaterialTheme.typography.labelLarge.copy(
+            fontWeight = FontWeight.SemiBold,
+            fontSize = fontSizeSp.sp
+        ),
+        color = color,
+        maxLines = 1,
+        softWrap = false,
+        overflow = TextOverflow.Visible,
+        onTextLayout = { result ->
+            if (result.didOverflowWidth && fontSizeSp > minFontSizeSp) {
+                fontSizeSp = (fontSizeSp - 0.75f).coerceAtLeast(minFontSizeSp)
+            }
+        }
+    )
+}
+
+@Composable
 fun PostRecordingSaveSheet(
     pending: PendingSaveSession,
     onSave: (title: String, skipSilenceOnSave: Boolean) -> Unit,
-    onDiscard: () -> Unit
+    onDiscard: () -> Unit,
+    onCancelKeepPaused: () -> Unit = onDiscard
 ) {
     var titleText by remember(pending) { mutableStateOf(pending.suggestedTitle) }
 
-    // Block back navigation while the mandatory save title dialog is displayed
-    BackHandler(enabled = true) {
-        // Strictly non-dismissible: user must explicitly tap Save or Don't Save
-    }
-
     Dialog(
-        onDismissRequest = {
-            // Strictly non-dismissible: cannot be bypassed by clicking outside or pressing back
-        },
+        onDismissRequest = onCancelKeepPaused,
         properties = DialogProperties(
-            dismissOnBackPress = false,
-            dismissOnClickOutside = false,
+            dismissOnBackPress = true,
+            dismissOnClickOutside = true,
             usePlatformDefaultWidth = false
         )
     ) {
@@ -159,25 +182,78 @@ fun PostRecordingSaveSheet(
                     overflow = TextOverflow.Ellipsis
                 )
 
-                Spacer(modifier = Modifier.height(8.dp))
-
-                Text(
-                    text = "Enter a title for this recording. Audio is saved in its full original state; you can toggle silence skipping anytime during playback.",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = SecondaryText
-                )
-
                 Spacer(modifier = Modifier.height(16.dp))
+
+                // Three equal-width action buttons side-by-side: Left: Discard, Center: Cancel, Right: Save
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Box(
+                        contentAlignment = Alignment.Center,
+                        modifier = Modifier
+                            .weight(1f)
+                            .height(48.dp)
+                            .clip(CircleShape)
+                            .background(TonalDarkBrown)
+                            .m3PressScale(
+                                shape = CircleShape,
+                                onClick = onDiscard
+                            )
+                            .padding(horizontal = 8.dp)
+                            .testTag("save_sheet_discard_button")
+                    ) {
+                        AutoSizingActionButtonText(text = "Discard", color = PrimaryText)
+                    }
+
+                    Box(
+                        contentAlignment = Alignment.Center,
+                        modifier = Modifier
+                            .weight(1f)
+                            .height(48.dp)
+                            .clip(CircleShape)
+                            .background(TonalDarkBrown)
+                            .m3PressScale(
+                                shape = CircleShape,
+                                onClick = onCancelKeepPaused
+                            )
+                            .padding(horizontal = 8.dp)
+                            .testTag("save_sheet_cancel_button")
+                    ) {
+                        AutoSizingActionButtonText(text = "Cancel", color = PrimaryText)
+                    }
+
+                    Box(
+                        contentAlignment = Alignment.Center,
+                        modifier = Modifier
+                            .weight(1f)
+                            .height(48.dp)
+                            .clip(CircleShape)
+                            .background(TonalDarkBrown)
+                            .m3PressScale(
+                                shape = CircleShape,
+                                onClick = { onSave(titleText, false) }
+                            )
+                            .padding(horizontal = 8.dp)
+                            .testTag("save_sheet_confirm_button")
+                    ) {
+                        AutoSizingActionButtonText(text = "Save", color = PrimaryText)
+                    }
+                }
+
+                Spacer(modifier = Modifier.height(14.dp))
 
                 OutlinedTextField(
                     value = titleText,
                     onValueChange = { titleText = it },
                     label = { Text("Recording Title", maxLines = 1) },
                     singleLine = true,
-                    shape = RoundedCornerShape(12.dp),
+                    shape = RoundedCornerShape(14.dp),
                     colors = OutlinedTextFieldDefaults.colors(
-                        focusedBorderColor = PrimaryText,
-                        unfocusedBorderColor = androidx.compose.ui.graphics.Color.Transparent,
+                        focusedBorderColor = PeachAccent,
+                        unfocusedBorderColor = OutlineWarm,
+                        cursorColor = PeachAccent,
                         focusedLabelColor = PrimaryText,
                         unfocusedLabelColor = SecondaryText,
                         focusedTextColor = PrimaryText,
@@ -189,62 +265,6 @@ fun PostRecordingSaveSheet(
                         .fillMaxWidth()
                         .testTag("save_sheet_title_input")
                 )
-
-                Spacer(modifier = Modifier.height(22.dp))
-
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(12.dp),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Button(
-                        onClick = onDiscard,
-                        shape = CircleShape,
-                        elevation = ButtonDefaults.buttonElevation(0.dp, 0.dp, 0.dp),
-                        colors = ButtonDefaults.buttonColors(
-                            containerColor = TonalDarkBrown,
-                            contentColor = PrimaryText
-                        ),
-                        modifier = Modifier
-                            .weight(1f)
-                            .height(48.dp)
-                            .testTag("save_sheet_discard_button")
-                    ) {
-                        Text(
-                            text = "Cancel",
-                            style = MaterialTheme.typography.labelLarge.copy(
-                                fontWeight = FontWeight.SemiBold,
-                                fontSize = 15.sp
-                            ),
-                            color = PrimaryText,
-                            maxLines = 1
-                        )
-                    }
-
-                    Button(
-                        onClick = { onSave(titleText, false) },
-                        shape = CircleShape,
-                        elevation = ButtonDefaults.buttonElevation(0.dp, 0.dp, 0.dp),
-                        colors = ButtonDefaults.buttonColors(
-                            containerColor = TonalDarkBrown,
-                            contentColor = PrimaryText
-                        ),
-                        modifier = Modifier
-                            .weight(1f)
-                            .height(48.dp)
-                            .testTag("save_sheet_confirm_button")
-                    ) {
-                        Text(
-                            text = "Confirm",
-                            style = MaterialTheme.typography.labelLarge.copy(
-                                fontWeight = FontWeight.SemiBold,
-                                fontSize = 15.sp
-                            ),
-                            color = PrimaryText,
-                            maxLines = 1
-                        )
-                    }
-                }
             }
         }
     }
@@ -253,103 +273,207 @@ fun PostRecordingSaveSheet(
 @Composable
 fun ExportWithoutSilenceDialog(
     state: SilenceExportState,
+    onConfirm: () -> Unit,
     onDismiss: () -> Unit
 ) {
-    Dialog(onDismissRequest = onDismiss) {
+    Dialog(
+        onDismissRequest = onDismiss,
+        properties = DialogProperties(usePlatformDefaultWidth = false)
+    ) {
         Surface(
             shape = RoundedCornerShape(24.dp),
             color = WarmSecondarySurface,
             tonalElevation = 0.dp,
             modifier = Modifier
                 .fillMaxWidth()
+                .padding(horizontal = 24.dp)
                 .graphicsLayer()
                 .animateContentSize()
                 .testTag("export_without_silence_modal")
         ) {
             Column(
-                modifier = Modifier.padding(24.dp),
+                modifier = Modifier.padding(horizontal = 24.dp, vertical = 22.dp),
                 horizontalAlignment = Alignment.CenterHorizontally
             ) {
                 Box(
                     contentAlignment = Alignment.Center,
                     modifier = Modifier
-                        .size(48.dp)
+                        .size(52.dp)
                         .clip(CircleShape)
                         .background(ElevatedSurface)
+                        .border(1.dp, OutlineWarm, CircleShape)
                 ) {
                     Icon(
-                        imageVector = if (state.isRunning) Icons.Default.IosShare else Icons.Default.CheckCircle,
+                        imageVector = when {
+                            !state.isConfirmed -> Icons.Default.IosShare
+                            state.isRunning -> Icons.Default.GraphicEq
+                            else -> Icons.Default.CheckCircle
+                        },
                         contentDescription = "Silence export status",
-                        tint = if (state.isRunning) PrimaryText else SuccessSage,
-                        modifier = Modifier.size(24.dp)
+                        tint = PeachAccent,
+                        modifier = Modifier.size(26.dp)
                     )
                 }
 
                 Spacer(modifier = Modifier.height(14.dp))
 
                 Text(
-                    text = if (state.isRunning) "Exporting Without Silence…" else "Export Complete",
+                    text = when {
+                        !state.isConfirmed -> "Export Without Silence?"
+                        state.isRunning -> "Exporting Without Silence…"
+                        else -> "Export Complete"
+                    },
                     style = MaterialTheme.typography.titleLarge.copy(
                         fontWeight = FontWeight.Bold,
                         fontSize = 20.sp
                     ),
                     color = PrimaryText,
+                    textAlign = TextAlign.Center,
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis
-                )
-
-                Spacer(modifier = Modifier.height(6.dp))
-
-                Text(
-                    text = if (state.isRunning) {
-                        "Rendering non-destructive trimmed copy of \"${state.source.title}\""
-                    } else {
-                        "Saved as \"${state.completedTitle ?: state.source.title}\" in Library"
-                    },
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = SecondaryText
-                )
-
-                Spacer(modifier = Modifier.height(18.dp))
-
-                LinearProgressIndicator(
-                    progress = { state.progress.coerceIn(0f, 1f) },
-                    color = if (state.isRunning) PrimaryText else SuccessSage,
-                    trackColor = ObsidianBackground,
-                    strokeCap = StrokeCap.Round,
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .height(10.dp)
-                        .clip(RoundedCornerShape(8.dp))
                 )
 
                 Spacer(modifier = Modifier.height(8.dp))
 
                 Text(
-                    text = "${(state.progress * 100).toInt()}%",
-                    style = MaterialTheme.typography.labelSmall,
-                    color = PrimaryText,
-                    maxLines = 1
+                    text = when {
+                        !state.isConfirmed -> "Create a non-destructive copy of \"${state.source.title}\" with silent gaps trimmed. The new recording will be saved directly into Local Storage."
+                        state.isRunning -> "Processing audio and saving trimmed copy of \"${state.source.title}\" to Local Storage…"
+                        else -> "Saved as \"${state.completedTitle ?: state.source.title}\" in Local Storage."
+                    },
+                    style = MaterialTheme.typography.bodyMedium.copy(
+                        fontSize = 14.sp,
+                        lineHeight = 20.sp
+                    ),
+                    color = SecondaryText,
+                    textAlign = TextAlign.Center
                 )
 
-                Spacer(modifier = Modifier.height(22.dp))
+                Spacer(modifier = Modifier.height(20.dp))
 
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(12.dp),
-                    verticalAlignment = Alignment.CenterVertically
+                // Beautiful Progress Indicator Section (Holds at 0% until confirmed)
+                val animatedProgress by animateFloatAsState(
+                    targetValue = if (state.isConfirmed) state.progress.coerceIn(0f, 1f) else 0f,
+                    animationSpec = tween(durationMillis = 200),
+                    label = "silence_export_progress_anim"
+                )
+
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(16.dp))
+                        .background(ElevatedSurface)
+                        .border(1.dp, OutlineWarm, RoundedCornerShape(16.dp))
+                        .padding(horizontal = 16.dp, vertical = 14.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally
                 ) {
-                    Button(
-                        onClick = onDismiss,
-                        shape = CircleShape,
-                        elevation = ButtonDefaults.buttonElevation(0.dp, 0.dp, 0.dp),
-                        colors = ButtonDefaults.buttonColors(
-                            containerColor = TonalDarkBrown,
-                            contentColor = PrimaryText
-                        ),
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            text = when {
+                                !state.isConfirmed -> "Ready to export"
+                                state.isRunning -> "Analyzing & stripping silence…"
+                                else -> "Completed"
+                            },
+                            style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.Medium),
+                            color = PrimaryText
+                        )
+                        Text(
+                            text = "${(animatedProgress * 100).toInt()}%",
+                            style = TabularMonoStyle.copy(fontSize = 13.sp, fontWeight = FontWeight.Bold),
+                            color = PeachAccent
+                        )
+                    }
+
+                    Spacer(modifier = Modifier.height(10.dp))
+
+                    LinearProgressIndicator(
+                        progress = { animatedProgress },
+                        color = PeachAccent,
+                        trackColor = ObsidianBackground,
+                        strokeCap = StrokeCap.Round,
                         modifier = Modifier
-                            .weight(1f)
+                            .fillMaxWidth()
+                            .height(8.dp)
+                            .clip(RoundedCornerShape(6.dp))
+                    )
+                }
+
+                Spacer(modifier = Modifier.height(24.dp))
+
+                // Action Buttons adhering to the standard [Cancel] [Confirm] hierarchy
+                if (!state.isConfirmed) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(12.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Box(
+                            contentAlignment = Alignment.Center,
+                            modifier = Modifier
+                                .weight(1f)
+                                .height(48.dp)
+                                .clip(CircleShape)
+                                .background(TonalDarkBrown)
+                                .m3PressScale(
+                                    shape = CircleShape,
+                                    onClick = onDismiss
+                                )
+                                .testTag("export_silence_cancel_button")
+                        ) {
+                            Text(
+                                text = "Cancel",
+                                style = MaterialTheme.typography.labelLarge.copy(
+                                    fontWeight = FontWeight.SemiBold,
+                                    fontSize = 15.sp
+                                ),
+                                color = PrimaryText,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                        }
+
+                        Box(
+                            contentAlignment = Alignment.Center,
+                            modifier = Modifier
+                                .weight(1f)
+                                .height(48.dp)
+                                .clip(CircleShape)
+                                .background(TonalDarkBrown)
+                                .m3PressScale(
+                                    shape = CircleShape,
+                                    onClick = onConfirm
+                                )
+                                .testTag("export_silence_confirm_button")
+                        ) {
+                            Text(
+                                text = "Confirm",
+                                style = MaterialTheme.typography.labelLarge.copy(
+                                    fontWeight = FontWeight.SemiBold,
+                                    fontSize = 15.sp
+                                ),
+                                color = PrimaryText,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                        }
+                    }
+                } else if (state.isRunning) {
+                    Box(
+                        contentAlignment = Alignment.Center,
+                        modifier = Modifier
+                            .fillMaxWidth()
                             .height(48.dp)
+                            .clip(CircleShape)
+                            .background(TonalDarkBrown)
+                            .m3PressScale(
+                                shape = CircleShape,
+                                onClick = onDismiss
+                            )
+                            .testTag("export_silence_abort_button")
                     ) {
                         Text(
                             text = "Cancel",
@@ -358,30 +482,33 @@ fun ExportWithoutSilenceDialog(
                                 fontSize = 15.sp
                             ),
                             color = PrimaryText,
-                            maxLines = 1
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
                         )
                     }
-
-                    Button(
-                        onClick = onDismiss,
-                        shape = CircleShape,
-                        elevation = ButtonDefaults.buttonElevation(0.dp, 0.dp, 0.dp),
-                        colors = ButtonDefaults.buttonColors(
-                            containerColor = TonalDarkBrown,
-                            contentColor = PrimaryText
-                        ),
+                } else {
+                    Box(
+                        contentAlignment = Alignment.Center,
                         modifier = Modifier
-                            .weight(1f)
+                            .fillMaxWidth()
                             .height(48.dp)
+                            .clip(CircleShape)
+                            .background(TonalDarkBrown)
+                            .m3PressScale(
+                                shape = CircleShape,
+                                onClick = onDismiss
+                            )
+                            .testTag("export_silence_done_button")
                     ) {
                         Text(
-                            text = "Confirm",
+                            text = "Done",
                             style = MaterialTheme.typography.labelLarge.copy(
                                 fontWeight = FontWeight.SemiBold,
                                 fontSize = 15.sp
                             ),
                             color = PrimaryText,
-                            maxLines = 1
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
                         )
                     }
                 }
@@ -409,7 +536,16 @@ fun ShareExportActionSheet(
         sheetState = sheetState,
         shape = RoundedCornerShape(topStart = 24.dp, topEnd = 24.dp),
         containerColor = WarmSecondarySurface,
-        contentColor = PrimaryText
+        contentColor = PrimaryText,
+        dragHandle = {
+            Box(
+                modifier = Modifier
+                    .padding(top = 10.dp, bottom = 4.dp)
+                    .size(width = 36.dp, height = 4.dp)
+                    .clip(CircleShape)
+                    .background(SecondaryText.copy(alpha = 0.4f))
+            )
+        }
     ) {
         Column(
             modifier = Modifier
@@ -614,7 +750,16 @@ fun FormatConversionSheet(
         sheetState = sheetState,
         shape = RoundedCornerShape(topStart = 24.dp, topEnd = 24.dp),
         containerColor = WarmSecondarySurface,
-        contentColor = PrimaryText
+        contentColor = PrimaryText,
+        dragHandle = {
+            Box(
+                modifier = Modifier
+                    .padding(top = 10.dp, bottom = 4.dp)
+                    .size(width = 36.dp, height = 4.dp)
+                    .clip(CircleShape)
+                    .background(SecondaryText.copy(alpha = 0.4f))
+            )
+        }
     ) {
         Column(
             modifier = Modifier
@@ -893,7 +1038,7 @@ fun FormatConversionSheet(
                                     Icon(
                                         imageVector = Icons.Default.Refresh,
                                         contentDescription = "Reset Default",
-                                        tint = SecondaryText,
+                                        tint = PeachAccent,
                                         modifier = Modifier.size(16.dp)
                                     )
                                 }
@@ -1047,10 +1192,11 @@ fun EditRecordingDialog(
                     onValueChange = { title = it },
                     label = { Text("Title", maxLines = 1) },
                     singleLine = true,
-                    shape = RoundedCornerShape(12.dp),
+                    shape = RoundedCornerShape(14.dp),
                     colors = OutlinedTextFieldDefaults.colors(
-                        focusedBorderColor = PrimaryText,
-                        unfocusedBorderColor = androidx.compose.ui.graphics.Color.Transparent,
+                        focusedBorderColor = PeachAccent,
+                        unfocusedBorderColor = OutlineWarm,
+                        cursorColor = PeachAccent,
                         focusedLabelColor = PrimaryText,
                         unfocusedLabelColor = SecondaryText,
                         focusedTextColor = PrimaryText,
@@ -1066,10 +1212,11 @@ fun EditRecordingDialog(
                     onValueChange = { tags = it },
                     label = { Text("Tags", maxLines = 1) },
                     singleLine = true,
-                    shape = RoundedCornerShape(12.dp),
+                    shape = RoundedCornerShape(14.dp),
                     colors = OutlinedTextFieldDefaults.colors(
-                        focusedBorderColor = PrimaryText,
-                        unfocusedBorderColor = androidx.compose.ui.graphics.Color.Transparent,
+                        focusedBorderColor = PeachAccent,
+                        unfocusedBorderColor = OutlineWarm,
+                        cursorColor = PeachAccent,
                         focusedLabelColor = PrimaryText,
                         unfocusedLabelColor = SecondaryText,
                         focusedTextColor = PrimaryText,
@@ -1086,10 +1233,11 @@ fun EditRecordingDialog(
                     label = { Text("Notes", maxLines = 1) },
                     minLines = 2,
                     maxLines = 3,
-                    shape = RoundedCornerShape(12.dp),
+                    shape = RoundedCornerShape(14.dp),
                     colors = OutlinedTextFieldDefaults.colors(
-                        focusedBorderColor = PrimaryText,
-                        unfocusedBorderColor = androidx.compose.ui.graphics.Color.Transparent,
+                        focusedBorderColor = PeachAccent,
+                        unfocusedBorderColor = OutlineWarm,
+                        cursorColor = PeachAccent,
                         focusedLabelColor = PrimaryText,
                         unfocusedLabelColor = SecondaryText,
                         focusedTextColor = PrimaryText,
@@ -1247,8 +1395,8 @@ val ImportCloudWithArrowIcon: ImageVector by lazy {
 
 /**
  * Custom vector icon combining the hollow/outlined Trash Bin silhouette from the Trash tab
- * (with a rectangular center cutout showing the container background) in [PeachAccent] and
- * 3 horizontal side sweep lines in [CloudArrowBrown] (matching the arrow in the Import Cloud).
+ * (with a rectangular center cutout showing the container background) and 3 horizontal
+ * side sweep lines in [PeachAccent], proportioned to fill the 24x24 viewport.
  */
 val OutlinedDeleteSweepIcon: ImageVector by lazy {
     ImageVector.Builder(
@@ -1263,14 +1411,14 @@ val OutlinedDeleteSweepIcon: ImageVector by lazy {
             fill = SolidColor(PeachAccent),
             pathFillType = PathFillType.NonZero
         ) {
-            moveTo(10.5f, 5f)
-            lineTo(9.5f, 4f)
-            horizontalLineTo(6.5f)
-            lineTo(5.5f, 5f)
-            horizontalLineTo(2.5f)
-            verticalLineTo(7f)
+            moveTo(10.2f, 4f)
+            lineTo(9.1f, 2.8f)
+            horizontalLineTo(5.9f)
+            lineTo(4.8f, 4f)
+            horizontalLineTo(1.5f)
+            verticalLineTo(6.2f)
             horizontalLineTo(13.5f)
-            verticalLineTo(5f)
+            verticalLineTo(4f)
             close()
         }
         // 2. Outlined Trash Bin Body with Hollow Rectangular Opening in the Center
@@ -1279,43 +1427,43 @@ val OutlinedDeleteSweepIcon: ImageVector by lazy {
             pathFillType = PathFillType.EvenOdd
         ) {
             // Outer bin wall
-            moveTo(3.5f, 18.2f)
-            curveTo(3.5f, 19.2f, 4.3f, 20f, 5.3f, 20f)
-            horizontalLineTo(10.7f)
-            curveTo(11.7f, 20f, 12.5f, 19.2f, 12.5f, 18.2f)
-            verticalLineTo(8f)
-            horizontalLineTo(3.5f)
-            verticalLineTo(18.2f)
+            moveTo(2.5f, 19.2f)
+            curveTo(2.5f, 20.3f, 3.4f, 21.2f, 4.5f, 21.2f)
+            horizontalLineTo(10.5f)
+            curveTo(11.6f, 21.2f, 12.5f, 20.3f, 12.5f, 19.2f)
+            verticalLineTo(7.4f)
+            horizontalLineTo(2.5f)
+            verticalLineTo(19.2f)
             close()
             // Inner rectangular cutout (shows container color in the middle of the bin)
-            moveTo(5.5f, 10f)
-            horizontalLineTo(10.5f)
-            verticalLineTo(18f)
-            horizontalLineTo(5.5f)
+            moveTo(4.7f, 9.6f)
+            horizontalLineTo(10.3f)
+            verticalLineTo(19.0f)
+            horizontalLineTo(4.7f)
             close()
         }
-        // 3. Three Horizontal Side Sweep Lines (same color as the arrow in the Import Cloud)
+        // 3. Three-Tier Horizontal Side Sweep Lines in PeachAccent
         path(
-            fill = SolidColor(CloudArrowBrown),
+            fill = SolidColor(PeachAccent),
             pathFillType = PathFillType.NonZero
         ) {
-            // Top bar
-            moveTo(15f, 9f)
-            horizontalLineTo(22f)
-            verticalLineTo(11f)
-            horizontalLineTo(15f)
+            // Top bar (Tier 1 — widest)
+            moveTo(14.5f, 8.2f)
+            horizontalLineTo(22.5f)
+            verticalLineTo(10.4f)
+            horizontalLineTo(14.5f)
             close()
-            // Middle bar
-            moveTo(15f, 13f)
-            horizontalLineTo(20.5f)
-            verticalLineTo(15f)
-            horizontalLineTo(15f)
+            // Middle bar (Tier 2 — medium)
+            moveTo(14.5f, 12.8f)
+            horizontalLineTo(20.8f)
+            verticalLineTo(15.0f)
+            horizontalLineTo(14.5f)
             close()
-            // Bottom bar
-            moveTo(15f, 17f)
-            horizontalLineTo(19f)
-            verticalLineTo(19f)
-            horizontalLineTo(15f)
+            // Bottom bar (Tier 3 — compact)
+            moveTo(14.5f, 17.4f)
+            horizontalLineTo(19.0f)
+            verticalLineTo(19.6f)
+            horizontalLineTo(14.5f)
             close()
         }
     }.build()
@@ -1331,7 +1479,7 @@ fun UnifiedTrashConfirmDialog(
     icon: ImageVector = Icons.Default.DeleteOutline,
     dialogTestTag: String? = null
 ) {
-    val resolvedIconTint = if (icon === OutlinedDeleteSweepIcon) Color.Unspecified else PrimaryText
+    val resolvedIconTint = PeachAccent
     Dialog(
         onDismissRequest = onDismiss,
         properties = DialogProperties(usePlatformDefaultWidth = false)
@@ -1358,12 +1506,13 @@ fun UnifiedTrashConfirmDialog(
                         .size(48.dp)
                         .clip(CircleShape)
                         .background(ElevatedSurface)
+                        .border(1.dp, OutlineWarm, CircleShape)
                 ) {
                     Icon(
                         imageVector = icon,
                         contentDescription = title,
                         tint = resolvedIconTint,
-                        modifier = Modifier.size(24.dp)
+                        modifier = Modifier.size(26.dp)
                     )
                 }
 
@@ -1452,4 +1601,128 @@ fun UnifiedTrashConfirmDialog(
         }
     }
 }
+
+@Composable
+fun MergeRecordingsDialog(
+    selectedCount: Int,
+    defaultTitle: String,
+    onConfirmMerge: (String) -> Unit,
+    onDismiss: () -> Unit
+) {
+    var customTitle by remember(defaultTitle) { mutableStateOf(defaultTitle) }
+
+    Dialog(
+        onDismissRequest = onDismiss,
+        properties = DialogProperties(usePlatformDefaultWidth = false)
+    ) {
+        Surface(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 24.dp)
+                .clip(RoundedCornerShape(24.dp))
+                .testTag("merge_recordings_dialog"),
+            color = WarmSecondarySurface,
+            shape = RoundedCornerShape(24.dp),
+            tonalElevation = 0.dp
+        ) {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 24.dp, vertical = 22.dp)
+            ) {
+                Text(
+                    text = "Merge Recordings?",
+                    style = MaterialTheme.typography.titleLarge.copy(
+                        fontWeight = FontWeight.Bold,
+                        fontSize = 20.sp
+                    ),
+                    color = PrimaryText,
+                    modifier = Modifier.testTag("merge_recordings_dialog_title")
+                )
+
+                Spacer(modifier = Modifier.height(10.dp))
+
+                Text(
+                    text = "Combine $selectedCount selected recordings into a single new audio track in the order selected. Original files will remain untouched.",
+                    style = MaterialTheme.typography.bodyMedium.copy(
+                        fontSize = 14.sp,
+                        lineHeight = 20.sp
+                    ),
+                    color = SecondaryText,
+                    modifier = Modifier.testTag("merge_recordings_dialog_message")
+                )
+
+                Spacer(modifier = Modifier.height(16.dp))
+
+                OutlinedTextField(
+                    value = customTitle,
+                    onValueChange = { customTitle = it },
+                    label = { Text("Merged Recording Title", maxLines = 1) },
+                    singleLine = true,
+                    shape = RoundedCornerShape(14.dp),
+                    colors = OutlinedTextFieldDefaults.colors(
+                        focusedBorderColor = PeachAccent,
+                        unfocusedBorderColor = OutlineWarm,
+                        cursorColor = PeachAccent,
+                        focusedLabelColor = PrimaryText,
+                        unfocusedLabelColor = SecondaryText,
+                        focusedTextColor = PrimaryText,
+                        unfocusedTextColor = PrimaryText,
+                        focusedContainerColor = ObsidianBackground,
+                        unfocusedContainerColor = ObsidianBackground
+                    ),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .testTag("merge_recordings_title_input")
+                )
+
+                Spacer(modifier = Modifier.height(20.dp))
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(12.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Box(
+                        contentAlignment = Alignment.Center,
+                        modifier = Modifier
+                            .weight(1f)
+                            .height(48.dp)
+                            .clip(CircleShape)
+                            .background(TonalDarkBrown)
+                            .m3PressScale(
+                                shape = CircleShape,
+                                onClick = onDismiss
+                            )
+                            .padding(horizontal = 8.dp)
+                            .testTag("merge_recordings_cancel_button")
+                    ) {
+                        AutoSizingActionButtonText(text = "Cancel", color = PrimaryText)
+                    }
+
+                    Box(
+                        contentAlignment = Alignment.Center,
+                        modifier = Modifier
+                            .weight(1f)
+                            .height(48.dp)
+                            .clip(CircleShape)
+                            .background(TonalDarkBrown)
+                            .m3PressScale(
+                                shape = CircleShape,
+                                onClick = {
+                                    val finalTitle = customTitle.trim().ifBlank { defaultTitle }
+                                    onConfirmMerge(finalTitle)
+                                }
+                            )
+                            .padding(horizontal = 8.dp)
+                            .testTag("merge_recordings_confirm_button")
+                    ) {
+                        AutoSizingActionButtonText(text = "Merge", color = PrimaryText)
+                    }
+                }
+            }
+        }
+    }
+}
+
 

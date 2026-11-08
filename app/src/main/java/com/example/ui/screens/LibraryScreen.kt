@@ -9,6 +9,7 @@ import androidx.compose.animation.SizeTransform
 import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.core.Spring
 import androidx.compose.animation.core.animateDpAsState
+import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.spring
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
@@ -40,6 +41,7 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -98,6 +100,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.material.icons.automirrored.filled.CallMerge
 import com.example.data.AudioFormatUtils
 import com.example.data.LibraryFilterChip
 import com.example.data.LibrarySortDirection
@@ -106,6 +109,7 @@ import com.example.data.RecordingEntity
 import com.example.data.StorageDestination
 import com.example.ui.components.EditRecordingDialog
 import com.example.ui.components.ImportCloudWithArrowIcon
+import com.example.ui.components.MergeRecordingsDialog
 import com.example.ui.components.UploadCloudWithArrowIcon
 import com.example.ui.components.MiniWaveformThumbnail
 import com.example.ui.components.OutlinedDeleteSweepIcon
@@ -117,6 +121,7 @@ import com.example.ui.theme.NavInactiveContent
 import com.example.ui.theme.NavPillIndicator
 import com.example.ui.theme.ObsidianBackground
 import com.example.ui.theme.OnPeachAccent
+import com.example.ui.theme.OutlineWarm
 import com.example.ui.theme.PeachAccent
 import com.example.ui.theme.PrimaryText
 import com.example.ui.theme.SecondaryText
@@ -151,6 +156,7 @@ fun LibraryScreen(
     selectedIds: Set<Long>,
     syncingIds: Map<Long, Float> = emptyMap(),
     downloadingIds: Map<Long, Float> = emptyMap(),
+    mergeProgress: Int? = null,
     onSelectStorageTab: (StorageDestination) -> Unit,
     onSearchQueryChange: (String) -> Unit,
     onSelectFilter: (LibraryFilterChip) -> Unit,
@@ -160,6 +166,7 @@ fun LibraryScreen(
     onSelectAll: () -> Unit,
     onClearSelection: () -> Unit,
     onDeleteSelected: () -> Unit,
+    onMergeSelected: (String) -> Unit = {},
     onRestoreSelected: () -> Unit = {},
     onEmptyTrash: () -> Unit = {},
     onImportAudio: (List<Uri>, StorageDestination) -> Unit,
@@ -178,10 +185,10 @@ fun LibraryScreen(
     var editingRecording by remember { mutableStateOf<RecordingEntity?>(null) }
     var pendingDeleteRecording by remember { mutableStateOf<RecordingEntity?>(null) }
     var showDeleteSelectedConfirm by remember { mutableStateOf(false) }
+    var showMergeSelectedDialog by remember { mutableStateOf(false) }
     var showEmptyTrashConfirm by remember { mutableStateOf(false) }
     var sortMenuExpanded by remember { mutableStateOf(false) }
     val isMultiSelectActive = selectedIds.isNotEmpty()
-    val dateFormat = remember { SimpleDateFormat("MMM d, yyyy", Locale.US) }
 
     // Instant Synchronous State Evaluation per tab:
     // Pre-evaluates both Local and Cloud sorted/filtered lists synchronously in composition
@@ -222,6 +229,11 @@ fun LibraryScreen(
     val latestLocalTotalCount by rememberUpdatedState(localTotalCount)
     val latestCloudTotalCount by rememberUpdatedState(cloudTotalCount)
     val latestTrashTotalCount by rememberUpdatedState(trashTotalCount)
+
+    // Dedicated LazyListState instances per storage tab to preserve exact viewport scroll positions
+    val localListState = rememberLazyListState()
+    val cloudListState = rememberLazyListState()
+    val trashListState = rememberLazyListState()
 
     // Context-aware multi-document audio picker for importing audio files into active tab
     val importAudioLauncher = rememberLauncherForActivityResult(
@@ -264,6 +276,7 @@ fun LibraryScreen(
                             .size(40.dp)
                             .clip(CircleShape)
                             .background(ElevatedSurface)
+                            .border(1.dp, OutlineWarm, CircleShape)
                             .m3PressScale(shape = CircleShape, onClick = onSelectAll)
                     ) {
                         Icon(
@@ -273,20 +286,43 @@ fun LibraryScreen(
                             modifier = Modifier.size(20.dp)
                         )
                     }
+                    if (activeStorageTab != StorageDestination.TRASH && selectedIds.size >= 2) {
+                        Box(
+                            contentAlignment = Alignment.Center,
+                            modifier = Modifier
+                                .size(40.dp)
+                                .clip(CircleShape)
+                                .background(ElevatedSurface)
+                                .border(1.dp, OutlineWarm, CircleShape)
+                                .m3PressScale(
+                                    shape = CircleShape,
+                                    onClick = { showMergeSelectedDialog = true }
+                                )
+                                .testTag("library_merge_selected_button")
+                        ) {
+                            Icon(
+                                imageVector = Icons.AutoMirrored.Filled.CallMerge,
+                                contentDescription = "Merge selected recordings",
+                                tint = PeachAccent,
+                                modifier = Modifier.size(20.dp)
+                            )
+                        }
+                    }
                     if (activeStorageTab == StorageDestination.TRASH) {
                         Box(
                             contentAlignment = Alignment.Center,
                             modifier = Modifier
                                 .size(40.dp)
                                 .clip(CircleShape)
-                                .background(SuccessSage.copy(alpha = 0.2f))
+                                .background(ElevatedSurface)
+                                .border(1.dp, OutlineWarm, CircleShape)
                                 .m3PressScale(shape = CircleShape, onClick = onRestoreSelected)
                                 .testTag("library_restore_selected_button")
                         ) {
                             Icon(
                                 imageVector = Icons.Default.Restore,
                                 contentDescription = "Restore selected",
-                                tint = SuccessSage,
+                                tint = PeachAccent,
                                 modifier = Modifier.size(20.dp)
                             )
                         }
@@ -297,6 +333,7 @@ fun LibraryScreen(
                             .size(40.dp)
                             .clip(CircleShape)
                             .background(ElevatedSurface)
+                            .border(1.dp, OutlineWarm, CircleShape)
                             .m3PressScale(shape = CircleShape, onClick = { showDeleteSelectedConfirm = true })
                             .testTag("library_delete_selected_button")
                     ) {
@@ -313,38 +350,48 @@ fun LibraryScreen(
                             .size(40.dp)
                             .clip(CircleShape)
                             .background(ElevatedSurface)
+                            .border(1.dp, OutlineWarm, CircleShape)
                             .m3PressScale(shape = CircleShape, onClick = onClearSelection)
                     ) {
                         Icon(
                             imageVector = Icons.Default.Clear,
                             contentDescription = "Clear selection",
-                            tint = SecondaryText,
+                            tint = PeachAccent,
                             modifier = Modifier.size(20.dp)
                         )
                     }
                 }
             } else if (activeStorageTab == StorageDestination.TRASH) {
-                if (latestTrashTotalCount > 0) {
-                    Spacer(modifier = Modifier.width(8.dp))
-                    Box(
-                        contentAlignment = Alignment.Center,
-                        modifier = Modifier
-                            .size(40.dp)
-                            .clip(CircleShape)
-                            .background(ElevatedSurface)
-                            .m3PressScale(
-                                shape = CircleShape,
-                                onClick = { showEmptyTrashConfirm = true }
-                            )
-                            .testTag("library_empty_trash_button")
-                    ) {
-                        Icon(
-                            imageVector = OutlinedDeleteSweepIcon,
-                            contentDescription = "Empty Trash",
-                            tint = Color.Unspecified,
-                            modifier = Modifier.size(20.dp)
+                val isTrashEmpty = latestTrashTotalCount == 0
+                val emptyTrashContainerColor = if (isTrashEmpty) WarmSecondarySurface else ElevatedSurface
+                val emptyTrashBorderColor = if (isTrashEmpty) OutlineWarm.copy(alpha = 0.5f) else OutlineWarm
+                val emptyTrashIconTint = if (isTrashEmpty) SecondaryText.copy(alpha = 0.45f) else PeachAccent
+
+                Spacer(modifier = Modifier.width(8.dp))
+                Box(
+                    contentAlignment = Alignment.Center,
+                    modifier = Modifier
+                        .size(40.dp)
+                        .clip(CircleShape)
+                        .background(emptyTrashContainerColor)
+                        .border(1.dp, emptyTrashBorderColor, CircleShape)
+                        .m3PressScale(
+                            shape = CircleShape,
+                            enabled = !isTrashEmpty,
+                            onClick = {
+                                if (!isTrashEmpty) {
+                                    showEmptyTrashConfirm = true
+                                }
+                            }
                         )
-                    }
+                        .testTag("library_empty_trash_button")
+                ) {
+                    Icon(
+                        imageVector = OutlinedDeleteSweepIcon,
+                        contentDescription = "Empty Trash",
+                        tint = emptyTrashIconTint,
+                        modifier = Modifier.size(24.dp)
+                    )
                 }
             } else {
                 Spacer(modifier = Modifier.width(8.dp))
@@ -360,6 +407,7 @@ fun LibraryScreen(
                                 .size(40.dp)
                                 .clip(CircleShape)
                                 .background(ElevatedSurface)
+                                .border(1.dp, OutlineWarm, CircleShape)
                                 .m3PressScale(
                                     shape = CircleShape,
                                     onClick = { sortMenuExpanded = true }
@@ -388,7 +436,7 @@ fun LibraryScreen(
                                         Icon(
                                             imageVector = Icons.Default.SwapVert,
                                             contentDescription = null,
-                                            tint = if (isSelected) PeachAccent else SecondaryText,
+                                            tint = PeachAccent,
                                             modifier = Modifier.size(18.dp)
                                         )
                                     },
@@ -421,7 +469,7 @@ fun LibraryScreen(
                             }
 
                             HorizontalDivider(
-                                color = SecondaryText.copy(alpha = 0.16f),
+                                color = OutlineWarm,
                                 modifier = Modifier.padding(vertical = 4.dp)
                             )
 
@@ -437,7 +485,7 @@ fun LibraryScreen(
                                                 Icons.Default.ArrowDownward
                                             },
                                             contentDescription = null,
-                                            tint = if (isSelected) PeachAccent else SecondaryText,
+                                            tint = PeachAccent,
                                             modifier = Modifier.size(18.dp)
                                         )
                                     },
@@ -480,6 +528,7 @@ fun LibraryScreen(
                             .size(40.dp)
                             .clip(CircleShape)
                             .background(ElevatedSurface)
+                            .border(1.dp, OutlineWarm, CircleShape)
                             .m3PressScale(
                                 shape = CircleShape,
                                 enabled = !isImportingDriveFiles,
@@ -528,6 +577,7 @@ fun LibraryScreen(
             localCount = localTotalCount,
             cloudCount = cloudTotalCount,
             trashCount = trashTotalCount,
+            mergeProgress = mergeProgress,
             onSelectTab = onSelectStorageTab
         )
 
@@ -655,14 +705,26 @@ fun LibraryScreen(
             val isUnfiltered = searchQuery.isBlank() && selectedFilter == LibraryFilterChip.ALL
             val shouldBlockEmptyState = !isLibraryLoaded || (isUnfiltered && rawTabTotalCount > 0)
 
+            val currentListState = when (tab) {
+                StorageDestination.LOCAL -> localListState
+                StorageDestination.CLOUD -> cloudListState
+                StorageDestination.TRASH -> trashListState
+            }
+
+            val selectionOrderMap = remember(selectedIds) {
+                selectedIds.toList().mapIndexed { idx, id -> id to (idx + 1) }.toMap()
+            }
+
             if (tabRecordings.isNotEmpty()) {
                 LazyColumn(
+                    state = currentListState,
                     modifier = Modifier.fillMaxSize(),
                     verticalArrangement = Arrangement.spacedBy(12.dp),
                     contentPadding = PaddingValues(bottom = 16.dp)
                 ) {
                     items(items = tabRecordings, key = { it.id }) { item ->
-                        val isSelected = item.id in selectedIds
+                        val selectionNumber = selectionOrderMap[item.id]
+                        val isSelected = selectionNumber != null
                         val isCurrentlyActive = activeRecording?.id == item.id
                         var menuExpanded by remember { mutableStateOf(false) }
 
@@ -700,13 +762,41 @@ fun LibraryScreen(
                                 AnimatedVisibility(visible = isMultiSelectActive) {
                                     IconButton(
                                         onClick = { onToggleSelectRecording(item.id) },
-                                        modifier = Modifier.size(40.dp)
+                                        modifier = Modifier
+                                            .size(40.dp)
+                                            .testTag("library_item_select_badge_${item.id}")
                                     ) {
-                                        Icon(
-                                            imageVector = if (isSelected) Icons.Default.CheckBox else Icons.Default.CheckBoxOutlineBlank,
-                                            contentDescription = "Select item",
-                                            tint = if (isSelected) PeachAccent else SecondaryText
-                                        )
+                                        if (selectionNumber != null) {
+                                            Box(
+                                                contentAlignment = Alignment.Center,
+                                                modifier = Modifier
+                                                    .size(24.dp)
+                                                    .clip(CircleShape)
+                                                    .background(PeachAccent)
+                                            ) {
+                                                Text(
+                                                    text = selectionNumber.toString(),
+                                                    style = TabularMonoStyle.copy(
+                                                        fontSize = 12.sp,
+                                                        fontWeight = FontWeight.Bold
+                                                    ),
+                                                    color = OnPeachAccent,
+                                                    maxLines = 1
+                                                )
+                                            }
+                                        } else {
+                                            Box(
+                                                contentAlignment = Alignment.Center,
+                                                modifier = Modifier
+                                                    .size(22.dp)
+                                                    .clip(CircleShape)
+                                                    .border(
+                                                        width = 1.8.dp,
+                                                        color = SecondaryText,
+                                                        shape = CircleShape
+                                                    )
+                                            ) {}
+                                        }
                                     }
                                 }
 
@@ -730,11 +820,7 @@ fun LibraryScreen(
 
                                     Spacer(modifier = Modifier.height(4.dp))
 
-                                    val subtitleText = if (tab == StorageDestination.TRASH && item.trashedAt != null) {
-                                        "Trashed ${dateFormat.format(Date(item.trashedAt))} • ${AudioFormatUtils.formatDurationCompact(item.durationMs)}"
-                                    } else {
-                                        "${dateFormat.format(Date(item.createdAt))} • ${AudioFormatUtils.formatDurationCompact(item.durationMs)} • ${AudioFormatUtils.formatFileSize(item.sizeBytes)}"
-                                    }
+                                    val subtitleText = AudioFormatUtils.formatDurationCompact(item.durationMs)
                                     Text(
                                         text = subtitleText,
                                         style = MaterialTheme.typography.bodySmall,
@@ -748,16 +834,19 @@ fun LibraryScreen(
 
                                 // Trailing Controls Block
                                 val isActivelyUploading = syncingIds.containsKey(item.id)
+                                val isDownloadedToDevice = localRecordings.any { localRec ->
+                                    (!item.cloudFileId.isNullOrBlank() && localRec.cloudFileId == item.cloudFileId) ||
+                                        (item.filePath.isNotBlank() && localRec.filePath == item.filePath)
+                                }
                                 val isVerifiedUploaded = item.hasVerifiedCloudUpload
 
                                 Row(
                                     horizontalArrangement = Arrangement.spacedBy(6.dp),
                                     verticalAlignment = Alignment.CenterVertically
                                 ) {
-                                    // Dynamic Cloud Status Icon:
-                                    // - Unuploaded Recordings: Orange cloud with upward arrow (CloudUpload in PeachAccent).
-                                    // - Uploaded Recordings: Green cloud with checkmark (CloudDone in SuccessSage)
-                                    //   solely after a real Google Drive upload operation succeeds.
+                                    // Dynamic Cloud & Download Status Icon:
+                                    // - Unuploaded Recordings: Orange cloud with upward arrow (UploadCloudWithArrowIcon in PeachAccent).
+                                    // - Uploaded, Downloaded, or Drive-Retrieved Recordings: Green cloud with checkmark (CloudDone in SuccessSage).
                                     if (tab == StorageDestination.LOCAL) {
                                         Box(
                                             contentAlignment = Alignment.Center,
@@ -800,7 +889,8 @@ fun LibraryScreen(
                                         }
                                     } else {
                                         val isActivelyDownloading = downloadingIds.containsKey(item.id)
-                                        if (!isVerifiedUploaded) {
+                                        val isCloudSyncedOrDownloaded = isVerifiedUploaded || isDownloadedToDevice
+                                        if (!isCloudSyncedOrDownloaded) {
                                             Box(
                                                 contentAlignment = Alignment.Center,
                                                 modifier = Modifier
@@ -851,7 +941,7 @@ fun LibraryScreen(
                                                 } else {
                                                     Icon(
                                                         imageVector = Icons.Default.CloudDone,
-                                                        contentDescription = "Imported Cloud Recording",
+                                                        contentDescription = "Synced & Downloaded Cloud Recording",
                                                         tint = SuccessSage,
                                                         modifier = Modifier.size(16.dp)
                                                     )
@@ -891,7 +981,7 @@ fun LibraryScreen(
                                             Icon(
                                                 imageVector = Icons.Default.MoreVert,
                                                 contentDescription = "Recording actions",
-                                                tint = PrimaryText,
+                                                tint = PeachAccent,
                                                 modifier = Modifier.size(18.dp)
                                             )
                                         }
@@ -912,8 +1002,8 @@ fun LibraryScreen(
                                             )
                                             if (tab == StorageDestination.TRASH) {
                                                 DropdownMenuItem(
-                                                    leadingIcon = { Icon(Icons.Default.Restore, null, tint = SuccessSage) },
-                                                    text = { Text("Restore Recording", color = SuccessSage, maxLines = 1) },
+                                                    leadingIcon = { Icon(Icons.Default.Restore, null, tint = PeachAccent) },
+                                                    text = { Text("Restore Recording", color = PrimaryText, maxLines = 1) },
                                                     onClick = {
                                                         menuExpanded = false
                                                         onRestoreRecording(item)
@@ -922,7 +1012,7 @@ fun LibraryScreen(
                                                 )
                                                 DropdownMenuItem(
                                                     leadingIcon = { Icon(Icons.Default.DeleteOutline, null, tint = PeachAccent) },
-                                                    text = { Text("Delete Permanently", color = PeachAccent, maxLines = 1) },
+                                                    text = { Text("Delete Permanently", color = PrimaryText, maxLines = 1) },
                                                     onClick = {
                                                         menuExpanded = false
                                                         pendingDeleteRecording = item
@@ -932,7 +1022,7 @@ fun LibraryScreen(
                                             } else {
                                                 DropdownMenuItem(
                                                     leadingIcon = { Icon(Icons.Default.AddCircleOutline, null, tint = PeachAccent) },
-                                                    text = { Text("Continue Recording", color = PeachAccent, maxLines = 1) },
+                                                    text = { Text("Continue Recording", color = PrimaryText, maxLines = 1) },
                                                     onClick = {
                                                         menuExpanded = false
                                                         onContinueRecording(item)
@@ -948,7 +1038,7 @@ fun LibraryScreen(
                                                     }
                                                 )
                                                 DropdownMenuItem(
-                                                    leadingIcon = { Icon(Icons.Default.IosShare, null, tint = PrimaryText) },
+                                                    leadingIcon = { Icon(Icons.Default.IosShare, null, tint = PeachAccent) },
                                                     text = { Text("Export Without Silence", color = PrimaryText, maxLines = 1) },
                                                     onClick = {
                                                         menuExpanded = false
@@ -956,7 +1046,7 @@ fun LibraryScreen(
                                                     }
                                                 )
                                                 DropdownMenuItem(
-                                                    leadingIcon = { Icon(Icons.Default.Transform, null, tint = PrimaryText) },
+                                                    leadingIcon = { Icon(Icons.Default.Transform, null, tint = PeachAccent) },
                                                     text = { Text("Convert Format…", color = PrimaryText, maxLines = 1) },
                                                     onClick = {
                                                         menuExpanded = false
@@ -988,7 +1078,29 @@ fun LibraryScreen(
                                                             onSyncToCloud(item)
                                                         }
                                                     )
+                                                    DropdownMenuItem(
+                                                        leadingIcon = {
+                                                            Icon(
+                                                                imageVector = Icons.Default.ContentCopy,
+                                                                contentDescription = null,
+                                                                tint = PeachAccent
+                                                            )
+                                                        },
+                                                        text = {
+                                                            Text(
+                                                                text = "Copy to Cloud",
+                                                                color = PrimaryText,
+                                                                maxLines = 1
+                                                            )
+                                                        },
+                                                        onClick = {
+                                                            menuExpanded = false
+                                                            onCopyToCloud(item)
+                                                        },
+                                                        modifier = Modifier.testTag("menu_copy_to_cloud_${item.id}")
+                                                    )
                                                 } else {
+                                                    val isCloudSyncedOrDownloaded = isVerifiedUploaded || isDownloadedToDevice
                                                     if (!isVerifiedUploaded) {
                                                         DropdownMenuItem(
                                                             leadingIcon = {
@@ -1014,14 +1126,18 @@ fun LibraryScreen(
                                                     DropdownMenuItem(
                                                         leadingIcon = {
                                                             Icon(
-                                                                imageVector = ImportCloudWithArrowIcon,
+                                                                imageVector = if (isCloudSyncedOrDownloaded) {
+                                                                    Icons.Default.CloudDone
+                                                                } else {
+                                                                    ImportCloudWithArrowIcon
+                                                                },
                                                                 contentDescription = null,
-                                                                tint = Color.Unspecified
+                                                                tint = if (isCloudSyncedOrDownloaded) SuccessSage else Color.Unspecified
                                                             )
                                                         },
                                                         text = {
                                                             Text(
-                                                                text = "Download to Device",
+                                                                text = if (isDownloadedToDevice) "Downloaded to Device" else "Download to Device",
                                                                 color = PrimaryText,
                                                                 maxLines = 1
                                                             )
@@ -1032,9 +1148,30 @@ fun LibraryScreen(
                                                         },
                                                         modifier = Modifier.testTag("menu_download_cloud_${item.id}")
                                                     )
+                                                    DropdownMenuItem(
+                                                        leadingIcon = {
+                                                            Icon(
+                                                                imageVector = Icons.Default.ContentCopy,
+                                                                contentDescription = null,
+                                                                tint = PeachAccent
+                                                            )
+                                                        },
+                                                        text = {
+                                                            Text(
+                                                                text = "Copy to Local",
+                                                                color = PrimaryText,
+                                                                maxLines = 1
+                                                            )
+                                                        },
+                                                        onClick = {
+                                                            menuExpanded = false
+                                                            onDownloadFromCloud(item)
+                                                        },
+                                                        modifier = Modifier.testTag("menu_copy_to_local_${item.id}")
+                                                    )
                                                 }
                                                 DropdownMenuItem(
-                                                    leadingIcon = { Icon(Icons.Default.Edit, null, tint = SecondaryText) },
+                                                    leadingIcon = { Icon(Icons.Default.Edit, null, tint = PeachAccent) },
                                                     text = { Text("Edit Title & Notes", color = PrimaryText, maxLines = 1) },
                                                     onClick = {
                                                         menuExpanded = false
@@ -1043,7 +1180,7 @@ fun LibraryScreen(
                                                 )
                                                 DropdownMenuItem(
                                                     leadingIcon = { Icon(Icons.Default.DeleteOutline, null, tint = PeachAccent) },
-                                                    text = { Text("Move to Trash", color = PeachAccent, maxLines = 1) },
+                                                    text = { Text("Move to Trash", color = PrimaryText, maxLines = 1) },
                                                     onClick = {
                                                         menuExpanded = false
                                                         pendingDeleteRecording = item
@@ -1172,6 +1309,23 @@ fun LibraryScreen(
             icon = OutlinedDeleteSweepIcon
         )
     }
+
+    // Confirmation & naming dialog for merging 2 or more selected recordings
+    if (showMergeSelectedDialog && selectedIds.size >= 2) {
+        val defaultMergedTitle = remember(showMergeSelectedDialog) {
+            val stamp = SimpleDateFormat("MMM d, HH:mm", Locale.US).format(Date())
+            "Merged Recording — $stamp"
+        }
+        MergeRecordingsDialog(
+            selectedCount = selectedIds.size,
+            defaultTitle = defaultMergedTitle,
+            onConfirmMerge = { customTitle ->
+                showMergeSelectedDialog = false
+                onMergeSelected(customTitle)
+            },
+            onDismiss = { showMergeSelectedDialog = false }
+        )
+    }
 }
 
 @Composable
@@ -1180,10 +1334,16 @@ private fun LibraryStorageTabSwitcher(
     localCount: Int,
     cloudCount: Int,
     trashCount: Int,
+    mergeProgress: Int? = null,
     onSelectTab: (StorageDestination) -> Unit
 ) {
     val tabs = StorageDestination.entries
     val selectedIndex = tabs.indexOf(activeTab).coerceAtLeast(0)
+    val animatedMergeProgress by animateFloatAsState(
+        targetValue = ((mergeProgress ?: 0).coerceIn(0, 100)) / 100f,
+        animationSpec = tween(durationMillis = 150),
+        label = "library_local_tab_merge_progress_anim"
+    )
 
     BoxWithConstraints(
         modifier = Modifier
@@ -1219,13 +1379,18 @@ private fun LibraryStorageTabSwitcher(
         Row(modifier = Modifier.fillMaxSize()) {
             tabs.forEach { tab ->
                 val isSelected = activeTab == tab
+                val isLocalMerging = tab == StorageDestination.LOCAL && mergeProgress != null
                 val count = when (tab) {
                     StorageDestination.LOCAL -> localCount
                     StorageDestination.CLOUD -> cloudCount
                     StorageDestination.TRASH -> trashCount
                 }
                 val contentTint by animateColorAsState(
-                    targetValue = if (isSelected) NavActiveContent else NavInactiveContent,
+                    targetValue = when {
+                        isLocalMerging -> PeachAccent
+                        isSelected -> NavActiveContent
+                        else -> NavInactiveContent
+                    },
                     animationSpec = tween(200),
                     label = "library_tab_tint_${tab.id}"
                 )
@@ -1245,39 +1410,54 @@ private fun LibraryStorageTabSwitcher(
                         )
                         .testTag("library_storage_tab_${tab.id.lowercase()}")
                 ) {
-                    Icon(
-                        imageVector = when (tab) {
-                            StorageDestination.LOCAL -> Icons.Default.PhoneAndroid
-                            StorageDestination.CLOUD -> Icons.Default.CloudDone
-                            StorageDestination.TRASH -> Icons.Default.DeleteOutline
-                        },
-                        contentDescription = tab.shortTitle,
-                        tint = contentTint,
-                        modifier = Modifier.size(17.dp)
-                    )
+                    if (isLocalMerging) {
+                        CircularProgressIndicator(
+                            progress = { animatedMergeProgress },
+                            color = PeachAccent,
+                            trackColor = if (isSelected) ObsidianBackground else ElevatedSurface,
+                            strokeWidth = 2.dp,
+                            modifier = Modifier
+                                .size(16.dp)
+                                .testTag("library_local_tab_merge_progress")
+                        )
+                    } else {
+                        Icon(
+                            imageVector = when (tab) {
+                                StorageDestination.LOCAL -> Icons.Default.PhoneAndroid
+                                StorageDestination.CLOUD -> Icons.Default.CloudDone
+                                StorageDestination.TRASH -> Icons.Default.DeleteOutline
+                            },
+                            contentDescription = tab.shortTitle,
+                            tint = contentTint,
+                            modifier = Modifier.size(17.dp)
+                        )
+                    }
                     Spacer(modifier = Modifier.width(5.dp))
                     Text(
-                        text = tab.shortTitle,
+                        text = if (isLocalMerging) "Merging" else tab.shortTitle,
                         style = MaterialTheme.typography.titleSmall.copy(
-                            fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Medium
+                            fontWeight = if (isSelected || isLocalMerging) FontWeight.Bold else FontWeight.Medium
                         ),
                         color = contentTint,
-                        maxLines = 1
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
                     )
-                    Spacer(modifier = Modifier.width(5.dp))
-                    Box(
-                        contentAlignment = Alignment.Center,
-                        modifier = Modifier
-                            .clip(CircleShape)
-                            .background(if (isSelected) ObsidianBackground else ElevatedSurface)
-                            .padding(horizontal = 6.dp, vertical = 2.dp)
-                    ) {
-                        Text(
-                            text = count.toString(),
-                            style = TabularMonoStyle.copy(fontSize = 11.sp, fontWeight = FontWeight.Bold),
-                            color = if (isSelected) PeachAccent else SecondaryText,
-                            maxLines = 1
-                        )
+                    if (!isLocalMerging) {
+                        Spacer(modifier = Modifier.width(5.dp))
+                        Box(
+                            contentAlignment = Alignment.Center,
+                            modifier = Modifier
+                                .clip(CircleShape)
+                                .background(if (isSelected) ObsidianBackground else ElevatedSurface)
+                                .padding(horizontal = 6.dp, vertical = 2.dp)
+                        ) {
+                            Text(
+                                text = count.toString(),
+                                style = TabularMonoStyle.copy(fontSize = 11.sp, fontWeight = FontWeight.Bold),
+                                color = if (isSelected) PeachAccent else SecondaryText,
+                                maxLines = 1
+                            )
+                        }
                     }
                 }
             }

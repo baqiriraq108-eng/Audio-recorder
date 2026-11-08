@@ -73,13 +73,16 @@ import com.example.data.AudioFormatUtils
 import com.example.data.RecorderSettings
 import com.example.data.RecordingEntity
 import com.example.data.RecordingStatus
+import com.example.ui.components.AutoSizingActionButtonText
 import com.example.ui.components.StudioInteractiveWaveform
 import com.example.ui.components.UnifiedTrashConfirmDialog
 import com.example.ui.theme.DestructiveCrimson
 import com.example.ui.theme.DriveRecordFab
 import com.example.ui.theme.ElevatedSurface
+import com.example.ui.theme.ObsidianBackground
 import com.example.ui.theme.OnDriveRecordFab
 import com.example.ui.theme.OnPeachAccent
+import com.example.ui.theme.OutlineWarm
 import com.example.ui.theme.PeachAccent
 import com.example.ui.theme.PrimaryText
 import com.example.ui.theme.SecondaryText
@@ -223,6 +226,7 @@ fun RecorderScreen(
     showAppendSaveConfirmDialog: Boolean = false,
     onConfirmAppendSave: () -> Unit = {},
     onDismissAppendSaveConfirmDialog: () -> Unit = {},
+    onDiscardAppendSave: () -> Unit = onResetRecording,
     onToggleSkipSilence: (Boolean) -> Unit = {},
     onNavigateToSettings: () -> Unit = {},
     onRefreshAudioDevices: () -> Unit = {},
@@ -378,7 +382,7 @@ fun RecorderScreen(
                             Icon(
                                 imageVector = Icons.Default.Close,
                                 contentDescription = "Cancel append session",
-                                tint = SecondaryText,
+                                tint = PeachAccent,
                                 modifier = Modifier.size(16.dp)
                             )
                         }
@@ -561,7 +565,7 @@ fun RecorderScreen(
             val skipSilenceIconTint = when {
                 !canUseSilenceSkip -> SecondaryText.copy(alpha = 0.28f)
                 isSkipSilenceActive -> OnPeachAccent
-                isRecordingOrPaused -> PrimaryText
+                isRecordingOrPaused -> PeachAccent
                 else -> SecondaryText.copy(alpha = 0.4f)
             }
 
@@ -605,7 +609,7 @@ fun RecorderScreen(
                 Icon(
                     imageVector = if (status == RecordingStatus.PAUSED) Icons.Default.PlayArrow else Icons.Default.Pause,
                     contentDescription = if (status == RecordingStatus.PAUSED) "Resume Recording" else "Pause Recording",
-                    tint = if (canPauseResume) PrimaryText else SecondaryText.copy(alpha = 0.4f),
+                    tint = if (canPauseResume) PeachAccent else SecondaryText.copy(alpha = 0.4f),
                     modifier = Modifier.size(22.dp)
                 )
             }
@@ -694,7 +698,7 @@ fun RecorderScreen(
                 Icon(
                     imageVector = Icons.Default.BookmarkAdd,
                     contentDescription = "Add Bookmark Marker",
-                    tint = if (isRecordingOrPaused) PrimaryText else SecondaryText.copy(alpha = 0.4f),
+                    tint = if (isRecordingOrPaused) PeachAccent else SecondaryText.copy(alpha = 0.4f),
                     modifier = Modifier.size(22.dp)
                 )
             }
@@ -795,13 +799,37 @@ fun RecorderScreen(
 
                     Spacer(modifier = Modifier.height(20.dp))
 
-                    // Symmetric side-by-side equal-width button pill containers on top
+                    // Three equal-width side-by-side action buttons on top:
+                    // Left: Discard (reject & discard recording)
+                    // Center: Cancel (dismiss dialog & leave recording paused at exact timestamp)
+                    // Right: Save (finalize & save recording with title)
                     Row(
                         modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.spacedBy(12.dp),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        // Cancel button container (Left)
+                        // 1. Left: Discard button container
+                        Box(
+                            contentAlignment = Alignment.Center,
+                            modifier = Modifier
+                                .weight(1f)
+                                .height(48.dp)
+                                .clip(CircleShape)
+                                .background(TonalDarkBrown)
+                                .m3PressScale(
+                                    shape = CircleShape,
+                                    onClick = onDiscardAppendSave
+                                )
+                                .padding(horizontal = 8.dp)
+                                .testTag("append_confirm_discard_button")
+                        ) {
+                            AutoSizingActionButtonText(
+                                text = "Discard",
+                                color = PrimaryText
+                            )
+                        }
+
+                        // 2. Center: Cancel button container (keeps recording paused at exact timestamp)
                         Box(
                             contentAlignment = Alignment.Center,
                             modifier = Modifier
@@ -813,19 +841,16 @@ fun RecorderScreen(
                                     shape = CircleShape,
                                     onClick = onDismissAppendSaveConfirmDialog
                                 )
+                                .padding(horizontal = 8.dp)
                                 .testTag("append_confirm_cancel_button")
                         ) {
-                            Text(
+                            AutoSizingActionButtonText(
                                 text = "Cancel",
-                                style = MaterialTheme.typography.labelLarge.copy(
-                                    fontWeight = FontWeight.SemiBold,
-                                    fontSize = 15.sp
-                                ),
                                 color = PrimaryText
                             )
                         }
 
-                        // Save button container (Right)
+                        // 3. Right: Confirm button container
                         Box(
                             contentAlignment = Alignment.Center,
                             modifier = Modifier
@@ -841,14 +866,11 @@ fun RecorderScreen(
                                         onConfirmAppendSave()
                                     }
                                 )
+                                .padding(horizontal = 8.dp)
                                 .testTag("append_confirm_yes_save_button")
                         ) {
-                            Text(
+                            AutoSizingActionButtonText(
                                 text = "Confirm",
-                                style = MaterialTheme.typography.labelLarge.copy(
-                                    fontWeight = FontWeight.SemiBold,
-                                    fontSize = 15.sp
-                                ),
                                 color = PrimaryText
                             )
                         }
@@ -868,13 +890,14 @@ fun RecorderScreen(
                         shape = RoundedCornerShape(14.dp),
                         colors = androidx.compose.material3.OutlinedTextFieldDefaults.colors(
                             focusedBorderColor = PeachAccent,
-                            unfocusedBorderColor = Color(0xFF3D2E27),
+                            unfocusedBorderColor = OutlineWarm,
+                            cursorColor = PeachAccent,
                             focusedLabelColor = PrimaryText,
                             unfocusedLabelColor = SecondaryText,
                             focusedTextColor = PrimaryText,
                             unfocusedTextColor = PrimaryText,
-                            focusedContainerColor = com.example.ui.theme.ObsidianBackground,
-                            unfocusedContainerColor = com.example.ui.theme.ObsidianBackground
+                            focusedContainerColor = ObsidianBackground,
+                            unfocusedContainerColor = ObsidianBackground
                         ),
                         modifier = Modifier
                             .fillMaxWidth()

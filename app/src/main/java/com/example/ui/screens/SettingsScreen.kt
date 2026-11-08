@@ -69,7 +69,6 @@ import com.example.ui.theme.OnPeachAccent
 import com.example.ui.theme.PeachAccent
 import com.example.ui.theme.PrimaryText
 import com.example.ui.theme.SecondaryText
-import com.example.ui.theme.SuccessSage
 import com.example.ui.theme.TabularMonoStyle
 import com.example.ui.theme.TonalDarkBrown
 import com.example.ui.theme.WarmSecondarySurface
@@ -196,7 +195,7 @@ fun SettingsScreen(
                     Icon(
                         imageVector = Icons.Default.ChevronRight,
                         contentDescription = "Open Recording & Encoder Popup",
-                        tint = PrimaryText,
+                        tint = PeachAccent,
                         modifier = Modifier.size(20.dp)
                     )
                 }
@@ -361,7 +360,7 @@ fun SettingsScreen(
                         Icon(
                             imageVector = Icons.Default.KeyboardArrowDown,
                             contentDescription = if (isManualAccordionExpanded) "Collapse manual silence settings" else "Expand manual silence settings",
-                            tint = PrimaryText,
+                            tint = PeachAccent,
                             modifier = Modifier
                                 .size(24.dp)
                                 .rotate(chevronRotation)
@@ -855,7 +854,7 @@ private fun RecordingEncoderModalDialog(
                     Icon(
                         imageVector = Icons.Default.Mic,
                         contentDescription = "Recording & Encoder",
-                        tint = PrimaryText,
+                        tint = PeachAccent,
                         modifier = Modifier.size(22.dp)
                     )
                     Spacer(modifier = Modifier.width(8.dp))
@@ -892,14 +891,7 @@ private fun RecordingEncoderModalDialog(
                                 .weight(1f)
                                 .height(42.dp)
                                 .clip(CircleShape)
-                                .background(if (selected) TonalDarkBrown else ObsidianBackground)
-                                .let { mod ->
-                                    if (selected) {
-                                        mod.border(1.5.dp, PeachAccent, CircleShape)
-                                    } else {
-                                        mod
-                                    }
-                                }
+                                .background(if (selected) PeachAccent else ElevatedSurface)
                                 .m3PressScale(
                                     shape = CircleShape,
                                     onClick = {
@@ -910,10 +902,10 @@ private fun RecordingEncoderModalDialog(
                         ) {
                             Text(
                                 text = fmt.label,
-                                style = MaterialTheme.typography.labelLarge.copy(
+                                style = MaterialTheme.typography.labelMedium.copy(
                                     fontWeight = if (selected) FontWeight.Bold else FontWeight.Medium
                                 ),
-                                color = if (selected) PeachAccent else PrimaryText,
+                                color = if (selected) OnPeachAccent else PrimaryText,
                                 maxLines = 1,
                                 overflow = TextOverflow.Ellipsis
                             )
@@ -943,14 +935,7 @@ private fun RecordingEncoderModalDialog(
                                 .weight(1f)
                                 .height(38.dp)
                                 .clip(CircleShape)
-                                .background(if (selected) TonalDarkBrown else ObsidianBackground)
-                                .let { mod ->
-                                    if (selected) {
-                                        mod.border(1.5.dp, PeachAccent, CircleShape)
-                                    } else {
-                                        mod
-                                    }
-                                }
+                                .background(if (selected) PeachAccent else ElevatedSurface)
                                 .m3PressScale(
                                     shape = CircleShape,
                                     onClick = {
@@ -961,11 +946,11 @@ private fun RecordingEncoderModalDialog(
                         ) {
                             Text(
                                 text = label,
-                                style = TabularMonoStyle.copy(
+                                style = MaterialTheme.typography.labelMedium.copy(
                                     fontSize = 11.sp,
                                     fontWeight = if (selected) FontWeight.Bold else FontWeight.Medium
                                 ),
-                                color = if (selected) PeachAccent else PrimaryText,
+                                color = if (selected) OnPeachAccent else PrimaryText,
                                 maxLines = 1
                             )
                         }
@@ -998,14 +983,7 @@ private fun RecordingEncoderModalDialog(
                                 .weight(1f)
                                 .height(42.dp)
                                 .clip(CircleShape)
-                                .background(if (selected) TonalDarkBrown else ObsidianBackground)
-                                .let { mod ->
-                                    if (selected) {
-                                        mod.border(1.5.dp, PeachAccent, CircleShape)
-                                    } else {
-                                        mod
-                                    }
-                                }
+                                .background(if (selected) PeachAccent else ElevatedSurface)
                                 .m3PressScale(
                                     shape = CircleShape,
                                     onClick = {
@@ -1022,7 +1000,7 @@ private fun RecordingEncoderModalDialog(
                                     letterSpacing = (-0.3).sp,
                                     fontWeight = if (selected) FontWeight.Bold else FontWeight.Medium
                                 ),
-                                color = if (selected) PeachAccent else PrimaryText,
+                                color = if (selected) OnPeachAccent else PrimaryText,
                                 maxLines = 1,
                                 softWrap = false
                             )

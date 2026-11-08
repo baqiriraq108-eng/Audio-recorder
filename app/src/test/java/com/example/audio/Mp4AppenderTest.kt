@@ -306,5 +306,89 @@ class Mp4AppenderTest {
         assertEquals(seg1PcmBytes + seg2PcmBytes, repairedHeader.pcmDataBytes)
         assertEquals(0L, repairedHeader.pcmDataBytes % 2L)
     }
+
+    @Test
+    fun `mergeMultipleAudioFilesNonDestructive merges multiple M4A recordings natively into M4A without re-encoding`() {
+        val m4aTrack1 = File(tempDir, "m4a_track1.m4a")
+        val m4aTrack2 = File(tempDir, "m4a_track2.m4a")
+        val m4aTrack3 = File(tempDir, "m4a_track3.m4a")
+        createSampleM4aFile(m4aTrack1, sampleRate = 48000, channels = 2, frameCount = 10, moovBeforeMdat = false)
+        createSampleM4aFile(m4aTrack2, sampleRate = 48000, channels = 2, frameCount = 8, moovBeforeMdat = false)
+        createSampleM4aFile(m4aTrack3, sampleRate = 48000, channels = 2, frameCount = 6, moovBeforeMdat = false)
+
+        val origBytes1 = m4aTrack1.readBytes()
+        val origBytes2 = m4aTrack2.readBytes()
+        val origBytes3 = m4aTrack3.readBytes()
+
+        val outputMergedM4a = File(tempDir, "merged_tracks.m4a")
+        val mergeResult = WavFileTools.mergeMultipleAudioFilesNonDestructive(
+            sourceFiles = listOf(m4aTrack1, m4aTrack2, m4aTrack3),
+            outputFile = outputMergedM4a,
+            sampleRate = 48000,
+            channels = 2,
+            targetBitrate = 192_000
+        )
+
+        assertTrue("Native M4A multi-track merge must succeed", mergeResult.success)
+        assertEquals("M4A", mergeResult.format)
+        assertEquals("audio/mp4", mergeResult.mimeType)
+        assertEquals("m4a", mergeResult.finalFile.extension.lowercase())
+        assertFalse("Merged M4A file must not be a RIFF WAV container", WavFileTools.isRiffWaveFile(mergeResult.finalFile))
+        assertTrue("Merged M4A file must be a valid ISO BMFF / M4A container", Mp4BoxParser.isMp4File(mergeResult.finalFile))
+
+        val mergedMeta = Mp4BoxParser.parseM4a(mergeResult.finalFile)
+        assertNotNull(mergedMeta)
+        mergedMeta!!
+        assertEquals("Sample rate must be preserved from source M4A", 48000, mergedMeta.sampleRate)
+        assertEquals("Channel configuration must be preserved from source M4A", 2, mergedMeta.channelCount)
+        assertTrue("Merged M4A sample table must be consistent", mergedMeta.isSampleTableConsistent())
+        // 10 frames (track 1) + (8 - 1 priming skipped = 7 frames) + (6 - 1 priming skipped = 5 frames) = 22 frames
+        assertEquals(22, mergedMeta.sampleSizes.size)
+        assertEquals(22L, mergedMeta.totalSamplesFromStts)
+
+        // Verify original source M4A files remain 100% untouched byte-for-byte
+        assertArrayEquals(origBytes1, m4aTrack1.readBytes())
+        assertArrayEquals(origBytes2, m4aTrack2.readBytes())
+        assertArrayEquals(origBytes3, m4aTrack3.readBytes())
+    }
+
+    @Test
+    fun `concatenateAudioFilesPhysicallyToM4a processes all selected tracks in order with cumulative PTS offsetting and single final EOS`() {
+        val trackA = File(tempDir, "track_a_1s.wav")
+        val trackB = File(tempDir, "track_b_2s.wav")
+        val trackC = File(tempDir, "track_c_1s.wav")
+        WavFileTools.createStudioSampleAudioFile(outputFile = trackA, durationSeconds = 1, sampleRate = 22050)
+        WavFileTools.createStudioSampleAudioFile(outputFile = trackB, durationSeconds = 2, sampleRate = 44100)
+        WavFileTools.createStudioSampleAudioFile(outputFile = trackC, durationSeconds = 1, sampleRate = 22050)
+
+        // Merge in explicit user-selected order: trackB (2s) -> trackC (1s) -> trackA (1s) = 4s (4000ms)
+        val mergedM4a = File(tempDir, "merged_multi_order.m4a")
+        val result = WavFileTools.concatenateAudioFilesPhysicallyToM4a(
+            sourceFiles = listOf(trackB, trackC, trackA),
+            outputM4aFile = mergedM4a,
+            targetSampleRate = 44100,
+            targetChannels = 1,
+            targetBitrate = 128_000
+        )
+
+        assertTrue("Multi-track physical M4A concatenation must succeed", result.success)
+        assertEquals("M4A", result.format)
+        assertTrue("Merged M4A file must exist on disk", mergedM4a.exists())
+
+        val meta = Mp4BoxParser.parseM4a(mergedM4a)
+        assertNotNull(meta)
+        meta!!
+        assertTrue("Sample table must be consistent", meta.isSampleTableConsistent())
+        // 4 seconds at 44100Hz = 176,400 samples -> ~172-173 AAC frames (not just Track 1's ~86 frames!)
+        assertTrue(
+            "Merged M4A must contain frames from all 3 tracks (expected >= 165 frames, got ${meta.sampleSizes.size})",
+            meta.sampleSizes.size >= 165
+        )
+        assertTrue(
+            "Merged M4A duration (${meta.durationMs}ms) must equal sum of all 3 tracks (~4000ms), not just Track 1",
+            meta.durationMs in 3900L..4100L
+        )
+    }
 }
+
 

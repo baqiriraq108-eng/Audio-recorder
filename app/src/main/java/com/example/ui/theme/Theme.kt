@@ -53,10 +53,10 @@ private val WarmAudioDarkColorScheme = darkColorScheme(
     onSecondary = OnPeachAccent,
     secondaryContainer = ElevatedSurface,
     onSecondaryContainer = PrimaryText,
-    tertiary = SuccessSage,
+    tertiary = PeachAccent,
     onTertiary = ObsidianBackground,
-    tertiaryContainer = SuccessContainer,
-    onTertiaryContainer = SuccessSage,
+    tertiaryContainer = TonalDarkBrown,
+    onTertiaryContainer = PrimaryText,
     background = ObsidianBackground,
     onBackground = PrimaryText,
     surface = WarmSecondarySurface,
@@ -70,10 +70,10 @@ private val WarmAudioDarkColorScheme = darkColorScheme(
     surfaceContainerHighest = ElevatedSurfaceHigh,
     outline = OutlineWarm,
     outlineVariant = OutlineWarm,
-    error = DestructiveCrimson,
+    error = PeachAccent,
     onError = ObsidianBackground,
-    errorContainer = DestructiveContainer,
-    onErrorContainer = DestructiveCrimson
+    errorContainer = TonalDarkBrown,
+    onErrorContainer = PrimaryText
 )
 
 /**

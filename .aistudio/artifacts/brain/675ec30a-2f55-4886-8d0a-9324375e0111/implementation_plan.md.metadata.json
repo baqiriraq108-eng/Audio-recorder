@@ -1,6 +1,6 @@
 {
-  "summary": " Architectural and UI plan to fix the jumpy/dancing Dynamic Island recording capsule expansion by implementing a pure in-place geometric width, height, and corner-radius morph with internal content crossfading, strict top-center anchoring, and disabled system window animations (windowAnimations = 0).",
-  "updatedAt": "2026-11-07T01:01:56.891702138Z",
-  "requestFeedback": true,
-  "userFacing": true
+  "summary":  "Implementation plan for fixing Auto Sync when Local Storage (Device) is selected so that new recordings recorded while Auto Sync is enabled are written directly into the user's selected device folder (including SAF DocumentFile tree folders), without triggering Google Drive sign-in or retroactively syncing older recordings.",
+  "updatedAt":  "2026-11-08T17:28:40.179232837Z",
+  "requestFeedback":  true,
+  "userFacing":  true
 }

@@ -162,7 +162,7 @@ fun SavedRecordingPlayerScreen(
                 Icon(
                     imageVector = Icons.AutoMirrored.Filled.ArrowBack,
                     contentDescription = "Back to Library",
-                    tint = PrimaryText,
+                    tint = PeachAccent,
                     modifier = Modifier.size(20.dp)
                 )
             }
@@ -222,7 +222,7 @@ fun SavedRecordingPlayerScreen(
                 Text(
                     text = "$durationFormatted$savedFormatted",
                     style = PlayerSecondaryTimerStyle,
-                    color = if (showSavedTime) SuccessSage else SecondaryText,
+                    color = if (showSavedTime) PeachAccent else SecondaryText,
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis,
                     modifier = Modifier.testTag("player_secondary_timer")
@@ -429,7 +429,7 @@ fun SavedRecordingPlayerScreen(
                     Icon(
                         imageVector = Icons.Default.FastRewind,
                         contentDescription = "Rewind 3 seconds",
-                        tint = PrimaryText,
+                        tint = PeachAccent,
                         modifier = Modifier.size(22.dp)
                     )
                 }
@@ -485,7 +485,7 @@ fun SavedRecordingPlayerScreen(
                     Icon(
                         imageVector = Icons.Default.FastForward,
                         contentDescription = "Fast forward 3 seconds",
-                        tint = PrimaryText,
+                        tint = PeachAccent,
                         modifier = Modifier.size(22.dp)
                     )
                 }
@@ -561,7 +561,7 @@ fun SavedRecordingPlayerScreen(
             val skipSilenceIconTint = when {
                 !canUseSilenceSkip -> SecondaryText.copy(alpha = 0.28f)
                 isSkipSilenceActive -> OnPeachAccent
-                else -> SecondaryText.copy(alpha = 0.4f)
+                else -> PeachAccent
             }
 
             Row(

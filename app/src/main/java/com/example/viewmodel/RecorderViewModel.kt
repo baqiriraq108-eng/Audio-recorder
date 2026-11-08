@@ -92,7 +92,8 @@ data class ConversionJobState(
 @Immutable
 data class SilenceExportState(
     val source: RecordingEntity,
-    val isRunning: Boolean = true,
+    val isConfirmed: Boolean = false,
+    val isRunning: Boolean = false,
     val progress: Float = 0f,
     val completedTitle: String? = null
 )
@@ -358,8 +359,7 @@ class RecorderViewModel(application: Application) : AndroidViewModel(application
             refreshLocalPhoneFolders()
             refreshDriveFoldersAndQuota()
 
-            // Keep openedPlayerRecording synced if updated in Room DB, and run Auto-Sync if enabled and authenticated
-            var initialAutoSyncTriggered = false
+            // Keep openedPlayerRecording synced if updated in Room DB
             repository.allRecordings.collect { list ->
                 _isLibraryLoaded.value = true
                 val opened = _openedPlayerRecording.value
@@ -370,14 +370,6 @@ class RecorderViewModel(application: Application) : AndroidViewModel(application
                     } else {
                         closeSavedRecordingPlayer()
                     }
-                }
-
-                if (!initialAutoSyncTriggered &&
-                    _settings.value.driveAutoSync &&
-                    isDriveSessionReadyForUpload()
-                ) {
-                    initialAutoSyncTriggered = true
-                    autoSyncUnsyncedRecordings()
                 }
             }
         }
@@ -655,12 +647,12 @@ class RecorderViewModel(application: Application) : AndroidViewModel(application
             _recordingStatus.value != RecordingStatus.PAUSED
         ) return
 
-        // If appending to an existing recording, pause and display the "Append to Recording?" confirmation popup
-        if (_appendTarget.value != null) {
-            requestAppendSaveConfirmation()
-            return
-        }
+        // Pause at exact timestamp and display the 3-button Save confirmation dialog (Discard | Cancel | Save)
+        requestAppendSaveConfirmation()
+    }
 
+    @Suppress("unused")
+    private fun stopAndPromptLegacySaveSheet() {
         viewModelScope.launch {
             _recordingStatus.value = RecordingStatus.PROCESSING
             showAppendSaveConfirmationNotification()
@@ -775,6 +767,7 @@ class RecorderViewModel(application: Application) : AndroidViewModel(application
                             sampleRate = appendTargetItem.sampleRate,
                             channels = appendTargetItem.channels,
                             bitsPerSample = appendTargetItem.bitDepth,
+                            targetBitrate = (appendTargetItem.bitrate.takeIf { it > 0 } ?: 128) * 1000,
                             onProgress = { ratio ->
                                 _mergeProgress.value = (ratio * 100).toInt().coerceIn(0, 100)
                             }
@@ -837,9 +830,19 @@ class RecorderViewModel(application: Application) : AndroidViewModel(application
                             audioEngine.resetSessionDisplayState()
 
                             val shouldAutoUploadAppend = _settings.value.driveAutoSync &&
+                                _settings.value.defaultStorageDestination == StorageDestination.CLOUD &&
                                 isDriveSessionReadyForUpload()
+                            val shouldLocalAutoSyncAppend = _settings.value.driveAutoSync &&
+                                _settings.value.defaultStorageDestination == StorageDestination.LOCAL
                             if (shouldAutoUploadAppend) {
                                 syncRecordingToCloud(updatedEntity, isManualTrigger = false)
+                            } else if (shouldLocalAutoSyncAppend) {
+                                repository.syncFileToSelectedLocalFolder(
+                                    sourceFile = finalFile,
+                                    settings = _settings.value,
+                                    desiredFileName = finalFile.name
+                                )
+                                refreshLocalPhoneFolders()
                             }
                             postSnackbar("Saved & appended +${AudioFormatUtils.formatDurationCompact(finalDuration)} to \"$cleanTitle\"")
                         } else {
@@ -869,17 +872,26 @@ class RecorderViewModel(application: Application) : AndroidViewModel(application
             } else {
                 _showAppendSaveConfirmDialog.value = false
                 val format = _settings.value.defaultFormat
-                val safeFileName = cleanTitle.replace(Regex("[^A-Za-z0-9_\\-]"), "_")
-                    .take(36)
-                    .ifBlank { "Recording" }
-                val targetLocalDir = repository.getRecordingsDir(
-                    subFolderName = _settings.value.localFolderName,
-                    folderPath = _settings.value.localFolderPath
-                )
+                val targetDestination = _settings.value.defaultStorageDestination
+                val isLocalAutoSync = _settings.value.driveAutoSync &&
+                    targetDestination == StorageDestination.LOCAL
+                val shouldAutoUpload = _settings.value.driveAutoSync &&
+                    targetDestination == StorageDestination.CLOUD &&
+                    isDriveSessionReadyForUpload()
+
+                val targetLocalDir = if (isLocalAutoSync) {
+                    repository.getRecordingsDir(
+                        subFolderName = _settings.value.localFolderName,
+                        folderPath = _settings.value.localFolderPath
+                    )
+                } else {
+                    repository.getRecordingsDir()
+                }
                 targetLocalDir.mkdirs()
-                val finalFile = File(
-                    targetLocalDir,
-                    "${safeFileName}_${System.currentTimeMillis() % 10000}.${format.extension}"
+                val finalFile = repository.resolveUniqueLocalFile(
+                    targetDir = targetLocalDir,
+                    baseTitle = cleanTitle,
+                    extension = format.extension
                 )
                 withContext(Dispatchers.IO) {
                     val renamed = sessionFile.renameTo(finalFile)
@@ -891,6 +903,14 @@ class RecorderViewModel(application: Application) : AndroidViewModel(application
                     }
                 }
                 val actualFile = if (finalFile.exists()) finalFile else sessionFile
+                if (isLocalAutoSync) {
+                    repository.syncFileToSelectedLocalFolder(
+                        sourceFile = actualFile,
+                        settings = _settings.value,
+                        desiredFileName = actualFile.name
+                    )
+                    refreshLocalPhoneFolders()
+                }
                 val headerInfo = withContext(Dispatchers.IO) {
                     WavFileTools.readWavHeaderInfo(
                         file = actualFile,
@@ -910,8 +930,6 @@ class RecorderViewModel(application: Application) : AndroidViewModel(application
                         fallbackBitsPerSample = headerInfo.bitsPerSample
                     )
                 }
-                val shouldAutoUpload = _settings.value.driveAutoSync &&
-                    isDriveSessionReadyForUpload()
 
                 val entity = RecordingEntity(
                     title = cleanTitle,
@@ -931,7 +949,7 @@ class RecorderViewModel(application: Application) : AndroidViewModel(application
                     cloudFileId = null,
                     cloudSyncedAt = null,
                     driveFolderId = null,
-                    driveFolderName = null,
+                    driveFolderName = if (isLocalAutoSync) _settings.value.localFolderName else null,
                     tags = "Studio",
                     notes = ""
                 )
@@ -948,8 +966,10 @@ class RecorderViewModel(application: Application) : AndroidViewModel(application
 
                 if (shouldAutoUpload) {
                     syncRecordingToCloud(savedEntity, isManualTrigger = false)
+                } else if (isLocalAutoSync) {
+                    postSnackbar("Recording \"$cleanTitle\" saved to ${ StorageDestination.LOCAL.label } (${_settings.value.localFolderName})")
                 } else {
-                    postSnackbar("Recording \"$cleanTitle\" saved to Local Storage")
+                    postSnackbar("Recording \"$cleanTitle\" saved to Library")
                 }
             }
         } finally {
@@ -978,21 +998,38 @@ class RecorderViewModel(application: Application) : AndroidViewModel(application
             val effectivePeaks = pending.peaks
 
             val format = pending.selectedFormat
-            val safeFileName = cleanTitle.replace(Regex("[^A-Za-z0-9_\\-]"), "_")
-                .take(36)
-                .ifBlank { "Recording" }
-            val targetLocalDir = repository.getRecordingsDir(
-                subFolderName = _settings.value.localFolderName,
-                folderPath = _settings.value.localFolderPath
-            )
-            val finalFile = File(
-                targetLocalDir,
-                "${safeFileName}_${System.currentTimeMillis() % 10000}.${format.extension}"
+            val targetDestination = _settings.value.defaultStorageDestination
+            val isLocalAutoSync = _settings.value.driveAutoSync &&
+                targetDestination == StorageDestination.LOCAL
+            val shouldAutoUpload = _settings.value.driveAutoSync &&
+                targetDestination == StorageDestination.CLOUD &&
+                isDriveSessionReadyForUpload()
+
+            val targetLocalDir = if (isLocalAutoSync) {
+                repository.getRecordingsDir(
+                    subFolderName = _settings.value.localFolderName,
+                    folderPath = _settings.value.localFolderPath
+                )
+            } else {
+                repository.getRecordingsDir()
+            }
+            val finalFile = repository.resolveUniqueLocalFile(
+                targetDir = targetLocalDir,
+                baseTitle = cleanTitle,
+                extension = format.extension
             )
             withContext(Dispatchers.IO) {
                 repository.moveFileSafely(effectiveFile, finalFile)
             }
             val actualFile = if (finalFile.exists()) finalFile else effectiveFile
+            if (isLocalAutoSync) {
+                repository.syncFileToSelectedLocalFolder(
+                    sourceFile = actualFile,
+                    settings = _settings.value,
+                    desiredFileName = actualFile.name
+                )
+                refreshLocalPhoneFolders()
+            }
             val headerInfo = withContext(Dispatchers.IO) {
                 WavFileTools.readWavHeaderInfo(
                     file = actualFile,
@@ -1014,8 +1051,6 @@ class RecorderViewModel(application: Application) : AndroidViewModel(application
                     )
                 }
             }
-            val shouldAutoUpload = _settings.value.driveAutoSync &&
-                isDriveSessionReadyForUpload()
 
             // Strictly save new recordings to LOCAL first with unuploaded state (isCloudSynced = false, cloudFileId = null).
             // A recording is NEVER placed in the Cloud tab or marked green until a real Google Drive upload explicitly succeeds.
@@ -1037,7 +1072,7 @@ class RecorderViewModel(application: Application) : AndroidViewModel(application
                 cloudFileId = null,
                 cloudSyncedAt = null,
                 driveFolderId = null,
-                driveFolderName = null,
+                driveFolderName = if (isLocalAutoSync) _settings.value.localFolderName else null,
                 tags = "Studio",
                 notes = ""
             )
@@ -1054,8 +1089,10 @@ class RecorderViewModel(application: Application) : AndroidViewModel(application
 
             if (shouldAutoUpload) {
                 syncRecordingToCloud(savedEntity, isManualTrigger = false)
+            } else if (isLocalAutoSync) {
+                postSnackbar("Recording \"$cleanTitle\" saved to ${StorageDestination.LOCAL.label} (${_settings.value.localFolderName})")
             } else {
-                postSnackbar("Recording \"$cleanTitle\" saved to Local Storage")
+                postSnackbar("Recording \"$cleanTitle\" saved to Library")
             }
         }
     }
@@ -1465,10 +1502,14 @@ class RecorderViewModel(application: Application) : AndroidViewModel(application
                     )
                     repository.updateRecordingAndLinkedPaths(updatedEntity)
                     _openedPlayerRecording.value = updatedEntity
-                    if (_settings.value.driveAutoSync &&
-                        isDriveSessionReadyForUpload()
-                    ) {
-                        syncRecordingToCloud(updatedEntity, isManualTrigger = false)
+                    if (_settings.value.driveAutoSync) {
+                        if (_settings.value.defaultStorageDestination == StorageDestination.CLOUD &&
+                            isDriveSessionReadyForUpload()
+                        ) {
+                            syncRecordingToCloud(updatedEntity, isManualTrigger = false)
+                        } else if (_settings.value.defaultStorageDestination == StorageDestination.LOCAL) {
+                            repository.syncFileToSelectedLocalFolder(targetFile, _settings.value, targetFile.name)
+                        }
                     }
                     val currentSilence = _settings.value.silenceConfig
                     audioEngine.loadAndPlayFile(
@@ -1499,10 +1540,14 @@ class RecorderViewModel(application: Application) : AndroidViewModel(application
                         tags = "${recording.tags}, Trimmed".trim(',', ' ')
                     )
                     val newId = repository.insertRecording(newEntity)
-                    if (_settings.value.driveAutoSync &&
-                        isDriveSessionReadyForUpload()
-                    ) {
-                        syncRecordingToCloud(newEntity.copy(id = newId), isManualTrigger = false)
+                    if (_settings.value.driveAutoSync) {
+                        if (_settings.value.defaultStorageDestination == StorageDestination.CLOUD &&
+                            isDriveSessionReadyForUpload()
+                        ) {
+                            syncRecordingToCloud(newEntity.copy(id = newId), isManualTrigger = false)
+                        } else if (_settings.value.defaultStorageDestination == StorageDestination.LOCAL) {
+                            repository.syncFileToSelectedLocalFolder(targetFile, _settings.value, targetFile.name)
+                        }
                     }
                     postSnackbar("Saved trimmed copy \"$copyTitle\" (${AudioFormatUtils.formatDurationCompact(trimmedDurationMs)})")
                 }
@@ -1516,18 +1561,30 @@ class RecorderViewModel(application: Application) : AndroidViewModel(application
         silenceExportJob?.cancel()
         _silenceExportState.value = SilenceExportState(
             source = recording,
+            isConfirmed = false,
+            isRunning = false,
+            progress = 0f
+        )
+    }
+
+    fun startConfirmedSilenceExport() {
+        val current = _silenceExportState.value ?: return
+        val recording = current.source
+        silenceExportJob?.cancel()
+        _silenceExportState.value = current.copy(
+            isConfirmed = true,
             isRunning = true,
-            progress = 0.05f
+            progress = 0.02f
         )
         silenceExportJob = viewModelScope.launch {
             try {
                 val srcFile = File(recording.filePath)
                 val outTitle = "${recording.title} (No Silence)"
-                val safeName = outTitle.replace(Regex("[^A-Za-z0-9_\\-]"), "_").take(36)
                 val ext = srcFile.extension.ifBlank { AudioFormatOption.fromId(recording.format).extension }
-                val outFile = File(
-                    repository.getRecordingsDir(),
-                    "${safeName}_${System.currentTimeMillis() % 10000}.$ext"
+                val outFile = repository.resolveUniqueLocalFile(
+                    targetDir = repository.getRecordingsDir(),
+                    baseTitle = outTitle,
+                    extension = ext
                 )
                 val cfg = _settings.value.silenceConfig
                 val (effThreshDb, effMinDurMs, effPadMs) = cfg.resolveEffectiveParameters(recording.peakList)
@@ -1542,7 +1599,7 @@ class RecorderViewModel(application: Application) : AndroidViewModel(application
                         channels = recording.channels,
                         bitsPerSample = recording.bitDepth,
                         onProgress = { prog ->
-                            _silenceExportState.value = _silenceExportState.value?.copy(progress = prog)
+                            _silenceExportState.value = _silenceExportState.value?.copy(progress = prog.coerceIn(0f, 1f))
                         }
                     )
                 }
@@ -1576,17 +1633,21 @@ class RecorderViewModel(application: Application) : AndroidViewModel(application
                     notes = "Processed non-destructively (Threshold: ${effThreshDb.toInt()} dB, Min Duration: $effMinDurMs ms)."
                 )
                 val newId = repository.insertRecording(exportedEntity)
-                if (_settings.value.driveAutoSync &&
-                    isDriveSessionReadyForUpload()
-                ) {
-                    syncRecordingToCloud(exportedEntity.copy(id = newId), isManualTrigger = false)
+                if (_settings.value.driveAutoSync) {
+                    if (_settings.value.defaultStorageDestination == StorageDestination.CLOUD &&
+                        isDriveSessionReadyForUpload()
+                    ) {
+                        syncRecordingToCloud(exportedEntity.copy(id = newId), isManualTrigger = false)
+                    } else if (_settings.value.defaultStorageDestination == StorageDestination.LOCAL) {
+                        repository.syncFileToSelectedLocalFolder(outFile, _settings.value, outFile.name)
+                    }
                 }
                 _silenceExportState.value = _silenceExportState.value?.copy(
                     isRunning = false,
                     progress = 1.0f,
                     completedTitle = outTitle
                 )
-                postSnackbar("Exported \"$outTitle\"")
+                postSnackbar("Exported \"$outTitle\" to Local Storage")
             } catch (e: CancellationException) {
                 _silenceExportState.value = null
             } catch (e: Exception) {
@@ -1604,7 +1665,9 @@ class RecorderViewModel(application: Application) : AndroidViewModel(application
     // --- Library Management (Dual Tabs: Local vs. Cloud with Complete Data Isolation) ---
 
     fun selectLibraryStorageTab(tab: StorageDestination) {
-        _selectedRecordingIds.value = emptySet()
+        if (tab == StorageDestination.TRASH || _activeLibraryStorageTab.value == StorageDestination.TRASH) {
+            _selectedRecordingIds.value = emptySet()
+        }
         _activeLibraryStorageTab.value = tab
     }
 
@@ -1625,7 +1688,7 @@ class RecorderViewModel(application: Application) : AndroidViewModel(application
     }
 
     fun toggleRecordingSelection(id: Long) {
-        val current = _selectedRecordingIds.value.toMutableSet()
+        val current = LinkedHashSet(_selectedRecordingIds.value)
         if (!current.add(id)) {
             current.remove(id)
         }
@@ -1637,7 +1700,184 @@ class RecorderViewModel(application: Application) : AndroidViewModel(application
     }
 
     fun selectAllVisible() {
-        _selectedRecordingIds.value = filteredRecordings.value.map { it.id }.toSet()
+        val current = LinkedHashSet(_selectedRecordingIds.value)
+        filteredRecordings.value.forEach { current.add(it.id) }
+        _selectedRecordingIds.value = current
+    }
+
+    /**
+     * Non-destructively merges 2 or more selected recordings (across Local and Cloud tabs)
+     * in the exact chronological order selected by the user, saving the merged recording
+     * to Local storage while preserving all original source recordings untouched.
+     */
+    fun mergeSelectedRecordings(customTitle: String) {
+        val orderedIds = _selectedRecordingIds.value.toList()
+        if (orderedIds.size < 2) return
+
+        // Exit multi-selection mode smoothly and immediately
+        _selectedRecordingIds.value = emptySet()
+
+        val dateStamp = SimpleDateFormat("MMM d, HH:mm", Locale.US).format(Date())
+        val cleanTitle = customTitle.trim().ifBlank { "Merged Audio — $dateStamp" }
+
+        viewModelScope.launch(Dispatchers.IO + NonCancellable) {
+            try {
+                _mergeProgress.value = 0
+                val recordingsMap = allRecordings.value.associateBy { it.id }
+                // Strictly preserve exact chronological user selection order (do not sort by date or title)
+                val orderedItems = orderedIds.mapNotNull { id ->
+                    recordingsMap[id] ?: repository.getRecordingById(id)
+                }
+                if (orderedItems.size < 2) {
+                    postSnackbar("Unable to locate selected recordings")
+                    return@launch
+                }
+                val firstItem = orderedItems.first()
+                val firstSourceFile = File(firstItem.filePath)
+                val isM4aMerge = (!WavFileTools.isRiffWaveFile(firstSourceFile) && (
+                    com.example.audio.Mp4BoxParser.isMp4File(firstSourceFile) ||
+                        firstSourceFile.extension.equals("m4a", ignoreCase = true) ||
+                        firstItem.format.equals("M4A", ignoreCase = true)
+                    )) || orderedItems.any {
+                        it.format.equals("M4A", ignoreCase = true) || it.filePath.endsWith(".m4a", ignoreCase = true)
+                    }
+
+                val parsedM4aMeta = if (isM4aMerge && firstSourceFile.exists()) {
+                    com.example.audio.Mp4BoxParser.parseM4a(firstSourceFile)
+                } else {
+                    null
+                }
+                val effSampleRate = (parsedM4aMeta?.sampleRate?.takeIf { it > 0 } ?: firstItem.sampleRate).coerceAtLeast(8_000)
+                val effChannels = (parsedM4aMeta?.channelCount?.takeIf { it in 1..2 } ?: firstItem.channels).coerceIn(1, 2)
+                val effBitDepth = if (firstItem.bitDepth in listOf(16, 24, 32)) firstItem.bitDepth else 16
+                val effBitrateKbps = if (isM4aMerge) {
+                    firstItem.bitrate.takeIf { it > 0 }
+                        ?: if (parsedM4aMeta != null && parsedM4aMeta.durationMs > 0L && parsedM4aMeta.mdatDataSize > 0L) {
+                            ((parsedM4aMeta.mdatDataSize * 8L) / parsedM4aMeta.durationMs).toInt().coerceIn(32, 320)
+                        } else {
+                            _settings.value.defaultFormat.defaultBitrate.coerceIn(64, 320)
+                        }
+                } else {
+                    (effSampleRate * effBitDepth * effChannels / 1000).coerceAtLeast(64)
+                }
+
+                // 2. Destination & Library Integration (Local Storage Only):
+                // Save directly into the device's local audio directory and register under "Local"
+                val targetLocalDir = repository.getRecordingsDir(
+                    subFolderName = _settings.value.localFolderName,
+                    folderPath = _settings.value.localFolderPath
+                )
+                targetLocalDir.mkdirs()
+
+                val targetExtension = if (isM4aMerge) "m4a" else "wav"
+                val mergedFile = repository.resolveUniqueLocalFile(
+                    targetDir = targetLocalDir,
+                    baseTitle = cleanTitle,
+                    extension = targetExtension
+                )
+
+                val sourceFiles = orderedItems.map { File(it.filePath) }
+                val mergeResult = WavFileTools.mergeMultipleAudioFilesNonDestructive(
+                    sourceFiles = sourceFiles,
+                    outputFile = mergedFile,
+                    sampleRate = effSampleRate,
+                    channels = effChannels,
+                    bitsPerSample = effBitDepth,
+                    targetBitrate = effBitrateKbps * 1000,
+                    onProgress = { ratio ->
+                        _mergeProgress.value = (ratio * 85f).toInt().coerceIn(0, 85)
+                    }
+                )
+
+                if (mergeResult.success && mergeResult.finalFile.exists()) {
+                    _mergeProgress.value = 88
+                    val finalFile = mergeResult.finalFile
+                    val finalM4aMeta = if (mergeResult.format.equals("M4A", ignoreCase = true) ||
+                        finalFile.extension.equals("m4a", ignoreCase = true)
+                    ) {
+                        com.example.audio.Mp4BoxParser.parseM4a(finalFile)
+                    } else {
+                        null
+                    }
+                    val resolvedFormat = if (finalM4aMeta != null ||
+                        mergeResult.format.equals("M4A", ignoreCase = true) ||
+                        finalFile.extension.equals("m4a", ignoreCase = true)
+                    ) {
+                        "M4A"
+                    } else {
+                        "WAV"
+                    }
+                    val resolvedSampleRate = finalM4aMeta?.sampleRate?.takeIf { it > 0 } ?: effSampleRate
+                    val resolvedChannels = finalM4aMeta?.channelCount?.takeIf { it in 1..2 } ?: effChannels
+
+                    // Playback duration strictly equals mathematical sum of durations of all selected recordings
+                    val sumOfSourceDurations = orderedItems.sumOf { it.durationMs }.coerceAtLeast(1_000L)
+                    val combinedDuration = if (mergeResult.durationMs > 0L) {
+                        mergeResult.durationMs
+                    } else if (finalM4aMeta != null && finalM4aMeta.durationMs > 0L) {
+                        finalM4aMeta.durationMs
+                    } else {
+                        sumOfSourceDurations
+                    }
+
+                    val mergedPeaks = WavFileTools.extractWaveformFromFile(finalFile)
+                    _mergeProgress.value = 94
+                    val mergedSilenceMap = WavFileTools.generateSilenceMapIndex(
+                        sourceFile = finalFile,
+                        durationMs = combinedDuration,
+                        peaks = mergedPeaks,
+                        config = _settings.value.silenceConfig,
+                        fallbackSampleRate = resolvedSampleRate,
+                        fallbackChannels = resolvedChannels,
+                        fallbackBitsPerSample = effBitDepth
+                    )
+
+                    // Offset and combine bookmarks across tracks in selection order
+                    val combinedBookmarks = mutableListOf<Long>()
+                    var runningOffsetMs = 0L
+                    orderedItems.forEach { item ->
+                        val itemBookmarks = AudioFormatUtils.deserializeBookmarks(item.bookmarks)
+                        itemBookmarks.forEach { bm ->
+                            combinedBookmarks.add(runningOffsetMs + bm)
+                        }
+                        runningOffsetMs += item.durationMs
+                    }
+
+                    _mergeProgress.value = 100
+                    // Register exclusively into Local category
+                    val mergedEntity = RecordingEntity(
+                        title = cleanTitle,
+                        filePath = finalFile.absolutePath,
+                        durationMs = combinedDuration,
+                        format = resolvedFormat,
+                        sampleRate = resolvedSampleRate,
+                        bitDepth = effBitDepth,
+                        channels = resolvedChannels,
+                        bitrate = effBitrateKbps,
+                        sizeBytes = finalFile.length(),
+                        waveformPeaks = AudioFormatUtils.serializePeaks(mergedPeaks),
+                        bookmarks = AudioFormatUtils.serializeBookmarks(combinedBookmarks),
+                        silenceMap = AudioFormatUtils.serializeSilenceMap(mergedSilenceMap),
+                        storageLocation = StorageDestination.LOCAL.id,
+                        isCloudSynced = false,
+                        cloudFileId = null,
+                        cloudSyncedAt = null,
+                        driveFolderId = null,
+                        driveFolderName = null,
+                        tags = "Merged",
+                        notes = "Merged ${orderedItems.size} tracks: ${orderedItems.joinToString(", ") { it.title }}"
+                    )
+                    repository.insertRecording(mergedEntity)
+                    postSnackbar("Merged ${orderedItems.size} recordings into \"$cleanTitle\"")
+                } else {
+                    postSnackbar("Unable to merge selected recordings")
+                }
+            } catch (e: Exception) {
+                postSnackbar("Merge failed: ${e.localizedMessage ?: "Unknown error"}")
+            } finally {
+                _mergeProgress.value = null
+            }
+        }
     }
 
     fun deleteSelectedRecordings() {
@@ -1709,17 +1949,51 @@ class RecorderViewModel(application: Application) : AndroidViewModel(application
 
     fun renameRecording(recording: RecordingEntity, newTitle: String, newTags: String, newNotes: String) {
         val clean = newTitle.trim().ifBlank { recording.title }
-        viewModelScope.launch {
+        viewModelScope.launch(Dispatchers.IO) {
+            val currentFile = File(recording.filePath)
+            val updatedFile = if (currentFile.exists() && currentFile.parentFile != null) {
+                val ext = currentFile.extension.ifBlank { AudioFormatOption.fromId(recording.format).extension }
+                val newFileCandidate = repository.resolveUniqueLocalFile(
+                    targetDir = currentFile.parentFile!!,
+                    baseTitle = clean,
+                    extension = ext
+                )
+                if (newFileCandidate.absolutePath != currentFile.absolutePath) {
+                    if (repository.moveFileSafely(currentFile, newFileCandidate)) {
+                        newFileCandidate
+                    } else {
+                        currentFile
+                    }
+                } else {
+                    currentFile
+                }
+            } else {
+                currentFile
+            }
+
             val updated = recording.copy(
                 title = clean,
+                filePath = updatedFile.absolutePath,
                 tags = newTags.trim().ifBlank { "Studio" },
                 notes = newNotes.trim()
             )
-            repository.updateRecording(updated)
-            if (_openedPlayerRecording.value?.id == recording.id) {
-                _openedPlayerRecording.value = updated
+            repository.updateRecordingAndLinkedPaths(updated, currentFile.absolutePath)
+
+            if (_settings.value.driveAutoSync && _settings.value.defaultStorageDestination == StorageDestination.LOCAL) {
+                repository.syncFileToSelectedLocalFolder(
+                    sourceFile = updatedFile,
+                    settings = _settings.value,
+                    desiredFileName = updatedFile.name
+                )
+                refreshLocalPhoneFolders()
             }
-            postSnackbar("Updated \"${updated.title}\"")
+
+            withContext(Dispatchers.Main) {
+                if (_openedPlayerRecording.value?.id == recording.id) {
+                    _openedPlayerRecording.value = updated
+                }
+                postSnackbar("Updated \"${updated.title}\"")
+            }
         }
     }
 
@@ -1818,10 +2092,14 @@ class RecorderViewModel(application: Application) : AndroidViewModel(application
                         driveFolderName = null
                     )
                     repository.updateRecording(withStorage)
-                    if (_settings.value.driveAutoSync &&
-                        isDriveSessionReadyForUpload()
-                    ) {
-                        syncRecordingToCloud(withStorage, isManualTrigger = false)
+                    if (_settings.value.driveAutoSync) {
+                        if (_settings.value.defaultStorageDestination == StorageDestination.CLOUD &&
+                            isDriveSessionReadyForUpload()
+                        ) {
+                            syncRecordingToCloud(withStorage, isManualTrigger = false)
+                        } else if (_settings.value.defaultStorageDestination == StorageDestination.LOCAL) {
+                            repository.syncFileToSelectedLocalFolder(File(converted.filePath), _settings.value)
+                        }
                     }
                     _conversionState.value = null
                     postSnackbar("Converted to ${converted.format} (${converted.sampleRate / 1000.0} kHz)")
@@ -2262,6 +2540,7 @@ class RecorderViewModel(application: Application) : AndroidViewModel(application
         val updated = _settings.value.copy(
             localFolderName = folderName,
             localFolderPath = folderPath,
+            customStorageTreeUri = "",
             storageDirectoryLabel = folderPath
         )
         _settings.value = updated
@@ -2476,7 +2755,8 @@ class RecorderViewModel(application: Application) : AndroidViewModel(application
      */
     fun syncRecordingToCloud(
         recording: RecordingEntity,
-        isManualTrigger: Boolean = true
+        isManualTrigger: Boolean = true,
+        createCloudTabCopy: Boolean = false
     ) {
         if (_cloudSyncingIds.value.containsKey(recording.id)) return
 
@@ -2546,6 +2826,21 @@ class RecorderViewModel(application: Application) : AndroidViewModel(application
                     )
                     repository.updateRecordingAndLinkedPaths(updatedOriginal)
 
+                    if (createCloudTabCopy && currentEntity.storageLocation.equals(StorageDestination.LOCAL.id, ignoreCase = true)) {
+                        val cloudCopy = currentEntity.copy(
+                            id = 0,
+                            title = currentEntity.title,
+                            storageLocation = StorageDestination.CLOUD.id,
+                            isCloudSynced = true,
+                            cloudFileId = res.fileId,
+                            cloudSyncedAt = res.syncedAtMs,
+                            driveFolderId = res.folderId,
+                            driveFolderName = targetFolderName,
+                            driveWebViewLink = res.webViewLink
+                        )
+                        repository.insertRecording(cloudCopy)
+                    }
+
                     _cloudSyncingIds.value = _cloudSyncingIds.value - recording.id
 
                     val newToken = res.refreshedAccessToken.ifBlank { _settings.value.driveAccessToken }
@@ -2594,11 +2889,12 @@ class RecorderViewModel(application: Application) : AndroidViewModel(application
      * Copies a Local recording into Google Drive (Cloud tab) while keeping the original in Local tab.
      */
     fun copyRecordingToCloud(recording: RecordingEntity) {
-        syncRecordingToCloud(recording, isManualTrigger = true)
+        syncRecordingToCloud(recording, isManualTrigger = true, createCloudTabCopy = true)
     }
 
     /**
-     * Toggles Auto Sync and immediately synchronizes any unsynced local recordings when enabled.
+     * Toggles Auto Sync for new recordings according to the currently selected Save Location (Device or Cloud).
+     * Does not retroactively copy old recordings; only new recordings recorded after enabling are synced.
      */
     fun toggleAutoSync(enabled: Boolean) {
         val updated = _settings.value.copy(driveAutoSync = enabled)
@@ -2607,11 +2903,17 @@ class RecorderViewModel(application: Application) : AndroidViewModel(application
             repository.saveSettings(updated)
         }
         if (enabled) {
-            if (isDriveSessionReadyForUpload()) {
-                autoSyncUnsyncedRecordings()
+            if (updated.defaultStorageDestination == StorageDestination.CLOUD) {
+                if (!isDriveSessionReadyForUpload()) {
+                    connectGoogleDrive(getApplication())
+                } else {
+                    postSnackbar("Auto Sync enabled for Google Drive (${updated.driveFolderName})")
+                }
             } else {
-                connectGoogleDrive(getApplication())
+                postSnackbar("Auto Sync enabled for Device (${updated.localFolderName})")
             }
+        } else {
+            postSnackbar("Auto Sync disabled")
         }
     }
 
@@ -2620,6 +2922,7 @@ class RecorderViewModel(application: Application) : AndroidViewModel(application
      * skipping any recording that has already been uploaded.
      */
     fun autoSyncUnsyncedRecordings() {
+        if (_settings.value.defaultStorageDestination != StorageDestination.CLOUD) return
         if (!isDriveSessionReadyForUpload()) return
         val unsyncedLocal = localRecordings.value.filter { localRec ->
             !localRec.hasVerifiedCloudUpload

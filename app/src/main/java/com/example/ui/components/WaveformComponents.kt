@@ -68,11 +68,11 @@ fun AnimatedStatusBadge(
 ) {
     val dotColor by animateColorAsState(
         targetValue = when (status) {
-            RecordingStatus.READY -> SuccessSage
+            RecordingStatus.READY -> PeachAccent
             RecordingStatus.RECORDING -> WaveformPlayhead
-            RecordingStatus.PAUSED -> WarningAmber
+            RecordingStatus.PAUSED -> SecondaryText
             RecordingStatus.PROCESSING, RecordingStatus.SAVING -> WaveformPlayhead
-            RecordingStatus.ERROR -> DestructiveCrimson
+            RecordingStatus.ERROR -> PeachAccent
         },
         animationSpec = tween(250),
         label = "badge_dot_color"

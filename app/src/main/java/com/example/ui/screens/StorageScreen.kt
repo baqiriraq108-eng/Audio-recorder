@@ -108,11 +108,13 @@ import com.example.ui.theme.NavActiveContent
 import com.example.ui.theme.NavPillIndicator
 import com.example.ui.theme.ObsidianBackground
 import com.example.ui.theme.OnPeachAccent
+import com.example.ui.theme.OutlineWarm
 import com.example.ui.theme.PeachAccent
 import com.example.ui.theme.PrimaryText
 import com.example.ui.theme.SecondaryText
 import com.example.ui.theme.SuccessSage
 import com.example.ui.theme.TabularMonoStyle
+import com.example.ui.theme.TonalDarkBrown
 import com.example.ui.theme.WarmSecondarySurface
 import com.example.ui.theme.m3PressScale
 
@@ -505,7 +507,7 @@ fun StorageScreen(
 
                             Spacer(modifier = Modifier.height(3.dp))
 
-                            // Status Row: Green dot + "Connected" status
+                            // Status Row: Semantic Green dot + "Connected" status
                             Row(verticalAlignment = Alignment.CenterVertically) {
                                 Box(
                                     modifier = Modifier
@@ -869,8 +871,10 @@ fun StorageScreen(
                                     color = PrimaryText,
                                     maxLines = 1
                                 )
+                                val targetDestLabel = if (isCloudSelected) "Google Drive" else "Device"
+                                val targetDestFolder = if (isCloudSelected) settings.driveFolderName else settings.localFolderName
                                 Text(
-                                    text = "Sync New Recordings",
+                                    text = "Sync New Recordings to $targetDestLabel ($targetDestFolder)",
                                     style = MaterialTheme.typography.bodySmall,
                                     color = SecondaryText,
                                     maxLines = 1,
@@ -906,7 +910,8 @@ fun StorageScreen(
         ModalBottomSheet(
             onDismissRequest = { showAccountSheet = false },
             sheetState = sheetState,
-            containerColor = ElevatedSurface,
+            containerColor = WarmSecondarySurface,
+            contentColor = PrimaryText,
             shape = RoundedCornerShape(topStart = 24.dp, topEnd = 24.dp),
             dragHandle = {
                 Box(
@@ -940,7 +945,7 @@ fun StorageScreen(
                         Icon(
                             imageVector = Icons.Default.Close,
                             contentDescription = "Close sheet",
-                            tint = SecondaryText
+                            tint = PeachAccent
                         )
                     }
                 }
@@ -951,7 +956,7 @@ fun StorageScreen(
                     // Active Account Card (highlighted with PeachAccent border)
                     Surface(
                         shape = RoundedCornerShape(14.dp),
-                        color = WarmSecondarySurface,
+                        color = ElevatedSurface,
                         border = BorderStroke(1.5.dp, PeachAccent),
                         modifier = Modifier.fillMaxWidth()
                     ) {
@@ -966,7 +971,7 @@ fun StorageScreen(
                                 modifier = Modifier
                                     .size(42.dp)
                                     .clip(CircleShape)
-                                    .background(ElevatedSurface)
+                                    .background(ObsidianBackground)
                             ) {
                                 val initial = settings.driveAccountName
                                     .ifBlank { settings.driveAccountEmail }
@@ -1005,7 +1010,7 @@ fun StorageScreen(
                             Icon(
                                 imageVector = Icons.Default.CheckCircle,
                                 contentDescription = "Active account",
-                                tint = PeachAccent,
+                                tint = SuccessSage,
                                 modifier = Modifier.size(20.dp)
                             )
                         }
@@ -1031,12 +1036,12 @@ fun StorageScreen(
                             modifier = Modifier
                                 .size(36.dp)
                                 .clip(CircleShape)
-                                .background(WarmSecondarySurface)
+                                .background(ElevatedSurface)
                         ) {
                             Icon(
                                 imageVector = Icons.Default.Add,
                                 contentDescription = "Add account",
-                                tint = PrimaryText,
+                                tint = PeachAccent,
                                 modifier = Modifier.size(18.dp)
                             )
                         }
@@ -1049,7 +1054,7 @@ fun StorageScreen(
                     }
 
                     Spacer(modifier = Modifier.height(10.dp))
-                    HorizontalDivider(color = WarmSecondarySurface)
+                    HorizontalDivider(color = OutlineWarm)
                     Spacer(modifier = Modifier.height(10.dp))
 
                     // "Switch account" Row
@@ -1068,7 +1073,7 @@ fun StorageScreen(
                         Icon(
                             imageVector = Icons.Default.SwapHoriz,
                             contentDescription = "Switch account",
-                            tint = SecondaryText,
+                            tint = PeachAccent,
                             modifier = Modifier.size(22.dp)
                         )
                         Spacer(modifier = Modifier.width(14.dp))
@@ -1103,7 +1108,7 @@ fun StorageScreen(
                         Icon(
                             imageVector = Icons.Default.Settings,
                             contentDescription = "Manage accounts",
-                            tint = SecondaryText,
+                            tint = PeachAccent,
                             modifier = Modifier.size(22.dp)
                         )
                         Spacer(modifier = Modifier.width(14.dp))
@@ -1129,14 +1134,14 @@ fun StorageScreen(
                         Icon(
                             imageVector = Icons.Default.Logout,
                             contentDescription = "Disconnect account",
-                            tint = DestructiveCrimson,
+                            tint = PeachAccent,
                             modifier = Modifier.size(22.dp)
                         )
                         Spacer(modifier = Modifier.width(14.dp))
                         Text(
                             text = "Disconnect account",
                             style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Medium),
-                            color = DestructiveCrimson
+                            color = PrimaryText
                         )
                     }
                 } else {
@@ -1174,7 +1179,8 @@ fun StorageScreen(
         ModalBottomSheet(
             onDismissRequest = { showFolderSheet = false },
             sheetState = folderSheetState,
-            containerColor = ElevatedSurface,
+            containerColor = WarmSecondarySurface,
+            contentColor = PrimaryText,
             shape = RoundedCornerShape(topStart = 24.dp, topEnd = 24.dp),
             dragHandle = {
                 Box(
@@ -1205,7 +1211,7 @@ fun StorageScreen(
                             modifier = Modifier
                                 .size(34.dp)
                                 .clip(RoundedCornerShape(8.dp))
-                                .background(WarmSecondarySurface)
+                                .background(ElevatedSurface)
                         ) {
                             Icon(
                                 imageVector = Icons.Default.Folder,
@@ -1225,7 +1231,7 @@ fun StorageScreen(
                         Icon(
                             imageVector = Icons.Default.Close,
                             contentDescription = "Close sheet",
-                            tint = SecondaryText
+                            tint = PeachAccent
                         )
                     }
                 }
@@ -1235,7 +1241,7 @@ fun StorageScreen(
                 // Current Folder card
                 Surface(
                     shape = RoundedCornerShape(14.dp),
-                    color = WarmSecondarySurface,
+                    color = ElevatedSurface,
                     modifier = Modifier.fillMaxWidth()
                 ) {
                     Row(
@@ -1249,7 +1255,7 @@ fun StorageScreen(
                             modifier = Modifier
                                 .size(40.dp)
                                 .clip(RoundedCornerShape(10.dp))
-                                .background(ElevatedSurface)
+                                .background(ObsidianBackground)
                         ) {
                             Icon(
                                 imageVector = Icons.Default.FolderOpen,
@@ -1491,7 +1497,8 @@ fun DriveFolderPickerDialog(
     ) {
         Surface(
             shape = RoundedCornerShape(24.dp),
-            color = ElevatedSurface,
+            color = WarmSecondarySurface,
+            tonalElevation = 0.dp,
             modifier = Modifier
                 .fillMaxWidth(0.94f)
                 .testTag("drive_folder_picker_dialog")
@@ -1588,7 +1595,7 @@ fun DriveFolderPickerDialog(
                             .fillMaxWidth()
                             .padding(bottom = 12.dp)
                             .clip(RoundedCornerShape(14.dp))
-                            .background(WarmSecondarySurface)
+                            .background(ElevatedSurface)
                             .padding(12.dp)
                     ) {
                         Text(
@@ -1610,12 +1617,15 @@ fun DriveFolderPickerDialog(
                                 singleLine = true,
                                 shape = RoundedCornerShape(10.dp),
                                 colors = OutlinedTextFieldDefaults.colors(
-                                    focusedBorderColor = Color.Transparent,
-                                    unfocusedBorderColor = Color.Transparent,
+                                    focusedBorderColor = PeachAccent,
+                                    unfocusedBorderColor = OutlineWarm,
+                                    cursorColor = PeachAccent,
                                     focusedContainerColor = ObsidianBackground,
                                     unfocusedContainerColor = ObsidianBackground,
                                     focusedTextColor = PrimaryText,
-                                    unfocusedTextColor = PrimaryText
+                                    unfocusedTextColor = PrimaryText,
+                                    focusedPlaceholderColor = SecondaryText,
+                                    unfocusedPlaceholderColor = SecondaryText
                                 ),
                                 modifier = Modifier
                                     .weight(1f)
@@ -1651,7 +1661,7 @@ fun DriveFolderPickerDialog(
                         .fillMaxWidth()
                         .heightIn(min = 180.dp, max = 260.dp)
                         .clip(RoundedCornerShape(14.dp))
-                        .background(WarmSecondarySurface)
+                        .background(ElevatedSurface)
                         .padding(8.dp)
                 ) {
                     if (isLoading) {
@@ -1778,8 +1788,8 @@ fun DriveFolderPickerDialog(
                         elevation = ButtonDefaults.buttonElevation(0.dp, 0.dp, 0.dp),
                         contentPadding = PaddingValues(horizontal = 12.dp, vertical = 0.dp),
                         colors = ButtonDefaults.buttonColors(
-                            containerColor = WarmSecondarySurface,
-                            contentColor = PeachAccent
+                            containerColor = TonalDarkBrown,
+                            contentColor = PrimaryText
                         ),
                         modifier = Modifier
                             .height(42.dp)
@@ -1788,12 +1798,14 @@ fun DriveFolderPickerDialog(
                         Icon(
                             imageVector = Icons.Default.CreateNewFolder,
                             contentDescription = "New Folder",
+                            tint = PeachAccent,
                             modifier = Modifier.size(16.dp)
                         )
                         Spacer(modifier = Modifier.width(5.dp))
                         Text(
                             text = "New Folder",
                             style = MaterialTheme.typography.labelLarge,
+                            color = PrimaryText,
                             maxLines = 1,
                             softWrap = false
                         )
@@ -1808,7 +1820,7 @@ fun DriveFolderPickerDialog(
                             elevation = ButtonDefaults.buttonElevation(0.dp, 0.dp, 0.dp),
                             contentPadding = PaddingValues(horizontal = 16.dp, vertical = 0.dp),
                             colors = ButtonDefaults.buttonColors(
-                                containerColor = ObsidianBackground,
+                                containerColor = TonalDarkBrown,
                                 contentColor = PrimaryText
                             ),
                             modifier = Modifier
@@ -1818,6 +1830,7 @@ fun DriveFolderPickerDialog(
                             Text(
                                 text = "Close",
                                 style = MaterialTheme.typography.labelLarge,
+                                color = PrimaryText,
                                 maxLines = 1,
                                 softWrap = false
                             )
@@ -1852,8 +1865,8 @@ fun DriveFolderPickerDialog(
                             elevation = ButtonDefaults.buttonElevation(0.dp, 0.dp, 0.dp),
                             contentPadding = PaddingValues(horizontal = 14.dp, vertical = 0.dp),
                             colors = ButtonDefaults.buttonColors(
-                                containerColor = ObsidianBackground,
-                                contentColor = SecondaryText
+                                containerColor = TonalDarkBrown,
+                                contentColor = PrimaryText
                             ),
                             modifier = Modifier
                                 .height(42.dp)
@@ -1862,6 +1875,7 @@ fun DriveFolderPickerDialog(
                             Text(
                                 text = "Cancel",
                                 style = MaterialTheme.typography.labelLarge,
+                                color = PrimaryText,
                                 maxLines = 1,
                                 softWrap = false
                             )

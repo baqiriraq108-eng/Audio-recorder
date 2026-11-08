@@ -110,12 +110,33 @@ class AacEncoder(
         channelCount = channelCount
     )
     private var submittedPcmSamples: Long = 0L
+    private var cumulativePtsOffsetUs: Long = 0L
+    private var lastQueuedPtsUs: Long = -1L
     private var primingFramesRemainingToSkip: Int = if (skipPrimingFrame) 1 else 0
     private var totalPrimingFramesSkipped: Int = 0
     private var isStarted: Boolean = false
     private var useFallbackPacketizer: Boolean = false
     private val pcmCarryBuffer = ByteArray(AAC_FRAME_SAMPLES * 4)
     private var pcmCarryCount = 0
+
+    val currentCumulativePtsUs: Long
+        get() = computePresentationTimeUs(baseStartSamples + submittedPcmSamples) + cumulativePtsOffsetUs
+
+    val lastPresentationTimeUs: Long
+        get() = lastQueuedPtsUs
+
+    val encodedFrameCount: Int
+        get() = frameSizesList.size
+
+    /**
+     * Advances the cumulative PTS offset in microseconds when transitioning between tracks,
+     * ensuring strictly monotonically increasing timestamps across merged recordings.
+     */
+    fun advanceCumulativePtsOffsetUs(additionalOffsetUs: Long) {
+        if (additionalOffsetUs > 0L) {
+            cumulativePtsOffsetUs += additionalOffsetUs
+        }
+    }
 
     /**
      * Starts an encoding session writing raw AAC access units into [rawAccessUnitsFile].
@@ -128,6 +149,8 @@ class AacEncoder(
         rawOutputStream = FileOutputStream(rawAccessUnitsFile)
         frameSizesList.clear()
         submittedPcmSamples = 0L
+        cumulativePtsOffsetUs = 0L
+        lastQueuedPtsUs = -1L
         primingFramesRemainingToSkip = if (skipPrimingFrame) 1 else 0
         totalPrimingFramesSkipped = 0
         pcmCarryCount = 0
@@ -172,7 +195,8 @@ class AacEncoder(
     }
 
     /**
-     * Feeds raw 16-bit little-endian PCM bytes into the AAC encoder.
+     * Feeds raw 16-bit little-endian PCM bytes into the AAC encoder without signaling EOS,
+     * allowing multiple tracks to be fed back-to-back into a single continuous stream.
      */
     fun encodePcmBytes(pcmBytes: ByteArray, length: Int = pcmBytes.size) {
         if (!isStarted || length <= 0) return
@@ -194,20 +218,23 @@ class AacEncoder(
     }
 
     private fun submitOnePcmFrame(frameBytes: ByteArray, byteLength: Int) {
+        val rawPtsUs = computePresentationTimeUs(baseStartSamples + submittedPcmSamples) + cumulativePtsOffsetUs
+        val monotonicPtsUs = if (rawPtsUs <= lastQueuedPtsUs) lastQueuedPtsUs + 1L else rawPtsUs
+        lastQueuedPtsUs = monotonicPtsUs
+
         val codec = mediaCodec
         if (codec != null && !useFallbackPacketizer) {
             var queued = false
             var retries = 0
-            while (!queued && retries < 40) {
-                val inputIndex = codec.dequeueInputBuffer(5_000L)
+            while (!queued && retries < 80) {
+                val inputIndex = codec.dequeueInputBuffer(10_000L)
                 if (inputIndex >= 0) {
                     val inputBuffer = codec.getInputBuffer(inputIndex)
                     if (inputBuffer != null) {
                         inputBuffer.clear()
                         val cap = minOf(byteLength, inputBuffer.remaining())
                         inputBuffer.put(frameBytes, 0, cap)
-                        val ptsUs = computePresentationTimeUs(baseStartSamples + submittedPcmSamples)
-                        codec.queueInputBuffer(inputIndex, 0, cap, ptsUs, 0)
+                        codec.queueInputBuffer(inputIndex, 0, cap, monotonicPtsUs, 0)
                         submittedPcmSamples += AAC_FRAME_SAMPLES.toLong()
                         queued = true
                     }
@@ -235,16 +262,28 @@ class AacEncoder(
         val bufferInfo = MediaCodec.BufferInfo()
 
         if (eos) {
-            val inputIndex = codec.dequeueInputBuffer(10_000L)
-            if (inputIndex >= 0) {
-                val ptsUs = computePresentationTimeUs(baseStartSamples + submittedPcmSamples)
-                codec.queueInputBuffer(
-                    inputIndex,
-                    0,
-                    0,
-                    ptsUs,
-                    MediaCodec.BUFFER_FLAG_END_OF_STREAM
-                )
+            var eosQueued = false
+            var eosRetries = 0
+            while (!eosQueued && eosRetries < 40) {
+                val inputIndex = codec.dequeueInputBuffer(10_000L)
+                if (inputIndex >= 0) {
+                    val rawPtsUs = computePresentationTimeUs(baseStartSamples + submittedPcmSamples) + cumulativePtsOffsetUs
+                    val eosPtsUs = if (rawPtsUs <= lastQueuedPtsUs) lastQueuedPtsUs + 1L else rawPtsUs
+                    codec.queueInputBuffer(
+                        inputIndex,
+                        0,
+                        0,
+                        eosPtsUs,
+                        MediaCodec.BUFFER_FLAG_END_OF_STREAM
+                    )
+                    eosQueued = true
+                } else {
+                    val outIdx = codec.dequeueOutputBuffer(bufferInfo, 5_000L)
+                    if (outIdx >= 0) {
+                        processOutputBuffer(codec, outIdx, bufferInfo, outStream)
+                    }
+                    eosRetries++
+                }
             }
         }
 
@@ -253,40 +292,7 @@ class AacEncoder(
             val outIndex = codec.dequeueOutputBuffer(bufferInfo, if (eos) 10_000L else 0L)
             if (outIndex >= 0) {
                 emptyLoops = 0
-                val outBuf = codec.getOutputBuffer(outIndex)
-                val isCodecConfig = (bufferInfo.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0
-
-                if (isCodecConfig) {
-                    // Explicitly ignore BUFFER_FLAG_CODEC_CONFIG in mdat; save AudioSpecificConfig for esds
-                    if (outBuf != null && bufferInfo.size >= 2) {
-                        outBuf.position(bufferInfo.offset)
-                        outBuf.limit(bufferInfo.offset + bufferInfo.size)
-                        val cfg = ByteArray(bufferInfo.size)
-                        outBuf.get(cfg)
-                        codecConfigBytes = cfg
-                    }
-                } else if (outBuf != null && bufferInfo.size > 0) {
-                    outBuf.position(bufferInfo.offset)
-                    outBuf.limit(bufferInfo.offset + bufferInfo.size)
-                    val rawFrame = ByteArray(bufferInfo.size)
-                    outBuf.get(rawFrame)
-
-                    // Strip ADTS 7-byte or 9-byte header if any hardware encoder prepends it,
-                    // keeping strictly raw AAC access units for MP4 mdat
-                    val cleanAccessUnit = stripAdtsHeaderIfPresent(rawFrame)
-                    if (cleanAccessUnit.isNotEmpty()) {
-                        if (primingFramesRemainingToSkip > 0) {
-                            primingFramesRemainingToSkip--
-                            totalPrimingFramesSkipped++
-                        } else {
-                            outStream.write(cleanAccessUnit)
-                            frameSizesList.add(cleanAccessUnit.size)
-                        }
-                    }
-                }
-
-                val isStreamEos = (bufferInfo.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0
-                codec.releaseOutputBuffer(outIndex, false)
+                val isStreamEos = processOutputBuffer(codec, outIndex, bufferInfo, outStream)
                 if (isStreamEos) break
             } else if (outIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
                 val newFormat = codec.outputFormat
@@ -299,11 +305,54 @@ class AacEncoder(
             } else if (outIndex == MediaCodec.INFO_TRY_AGAIN_LATER) {
                 if (!eos) break
                 emptyLoops++
-                if (emptyLoops > 25) break
+                if (emptyLoops > 35) break
             } else {
                 break
             }
         }
+    }
+
+    private fun processOutputBuffer(
+        codec: MediaCodec,
+        outIndex: Int,
+        bufferInfo: MediaCodec.BufferInfo,
+        outStream: FileOutputStream
+    ): Boolean {
+        val outBuf = codec.getOutputBuffer(outIndex)
+        val isCodecConfig = (bufferInfo.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0
+
+        if (isCodecConfig) {
+            // Explicitly ignore BUFFER_FLAG_CODEC_CONFIG in mdat; save AudioSpecificConfig for esds
+            if (outBuf != null && bufferInfo.size >= 2) {
+                outBuf.position(bufferInfo.offset)
+                outBuf.limit(bufferInfo.offset + bufferInfo.size)
+                val cfg = ByteArray(bufferInfo.size)
+                outBuf.get(cfg)
+                codecConfigBytes = cfg
+            }
+        } else if (outBuf != null && bufferInfo.size > 0) {
+            outBuf.position(bufferInfo.offset)
+            outBuf.limit(bufferInfo.offset + bufferInfo.size)
+            val rawFrame = ByteArray(bufferInfo.size)
+            outBuf.get(rawFrame)
+
+            // Strip ADTS 7-byte or 9-byte header if any hardware encoder prepends it,
+            // keeping strictly raw AAC access units for MP4 mdat
+            val cleanAccessUnit = stripAdtsHeaderIfPresent(rawFrame)
+            if (cleanAccessUnit.isNotEmpty()) {
+                if (primingFramesRemainingToSkip > 0) {
+                    primingFramesRemainingToSkip--
+                    totalPrimingFramesSkipped++
+                } else {
+                    outStream.write(cleanAccessUnit)
+                    frameSizesList.add(cleanAccessUnit.size)
+                }
+            }
+        }
+
+        val isStreamEos = (bufferInfo.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0
+        codec.releaseOutputBuffer(outIndex, false)
+        return isStreamEos
     }
 
     private fun stripAdtsHeaderIfPresent(frame: ByteArray): ByteArray {

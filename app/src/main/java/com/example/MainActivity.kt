@@ -409,6 +409,9 @@ fun AudioRecorderStudioApp(viewModel: RecorderViewModel) {
             onSave = { title, skipSilenceOnSave ->
                 viewModel.confirmSaveSession(title, skipSilenceOnSave)
             },
+            onCancelKeepPaused = {
+                viewModel.dismissAppendSaveConfirmDialog()
+            },
             onDiscard = {
                 viewModel.discardPendingSession()
             }
@@ -419,6 +422,7 @@ fun AudioRecorderStudioApp(viewModel: RecorderViewModel) {
     silenceExportState?.let { exportState ->
         ExportWithoutSilenceDialog(
             state = exportState,
+            onConfirm = { viewModel.startConfirmedSilenceExport() },
             onDismiss = { viewModel.dismissSilenceExportModal() }
         )
     }
@@ -503,7 +507,12 @@ private fun RecorderDestination(
         onResetRecording = { viewModel.resetActiveRecording() },
         onCancelAppendMode = { viewModel.cancelContinueRecordingMode() },
         showAppendSaveConfirmDialog = showAppendSaveConfirmDialog,
-        onConfirmAppendSave = { viewModel.confirmAppendAndMergeRecording() },
+        onConfirmAppendSave = {
+            viewModel.confirmSaveFromNotification(
+                com.example.service.RecordingIslandOverlayManager.currentEditedRecordingTitle
+            )
+        },
+        onDiscardAppendSave = { viewModel.cancelSaveFromNotification() },
         onDismissAppendSaveConfirmDialog = { viewModel.dismissAppendSaveConfirmDialog() },
         onToggleSkipSilence = { viewModel.toggleSkipSilence(it) },
         onNavigateToSettings = onNavigateToSettings,
@@ -533,6 +542,7 @@ private fun LibraryDestination(viewModel: RecorderViewModel) {
     val selectedIds by viewModel.selectedRecordingIds.collectAsStateWithLifecycle()
     val cloudSyncingIds by viewModel.cloudSyncingIds.collectAsStateWithLifecycle()
     val downloadingCloudIds by viewModel.downloadingCloudIds.collectAsStateWithLifecycle()
+    val mergeProgress by viewModel.mergeProgress.collectAsStateWithLifecycle()
 
     LibraryScreen(
         activeStorageTab = activeLibraryStorageTab,
@@ -555,6 +565,7 @@ private fun LibraryDestination(viewModel: RecorderViewModel) {
         selectedIds = selectedIds,
         syncingIds = cloudSyncingIds,
         downloadingIds = downloadingCloudIds,
+        mergeProgress = mergeProgress,
         onSelectStorageTab = { viewModel.selectLibraryStorageTab(it) },
         onSearchQueryChange = { viewModel.updateSearchQuery(it) },
         onSelectFilter = { viewModel.selectFilterChip(it) },
@@ -565,6 +576,7 @@ private fun LibraryDestination(viewModel: RecorderViewModel) {
         onClearSelection = { viewModel.clearSelection() },
         onDeleteSelected = { viewModel.deleteSelectedRecordings() },
         onRestoreSelected = { viewModel.restoreSelectedRecordings() },
+        onMergeSelected = { customTitle -> viewModel.mergeSelectedRecordings(customTitle) },
         onEmptyTrash = { viewModel.emptyTrash() },
         onImportAudio = { uris, targetLocation ->
             viewModel.importAudioFiles(uris, targetLocation)

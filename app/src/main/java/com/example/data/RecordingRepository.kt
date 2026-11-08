@@ -62,16 +62,21 @@ class RecordingRepository(
 
         val directFile = if (recording.filePath.isNotBlank()) File(recording.filePath) else null
         val parentDir = directFile?.parentFile ?: getRecordingsDir()
+        val cleanTitleSanitized = recording.title.trim().replace(Regex("[\\\\/:*?\"<>|]"), "_")
         val baseName = directFile?.nameWithoutExtension
-            ?: recording.title.replace(Regex("[^A-Za-z0-9_\\-]"), "_").take(36)
+            ?: cleanTitleSanitized.ifBlank { "Recording" }
 
         // Candidates to search for the physical audio file
         val candidates = mutableListOf<File>()
 
-        // 1. Same directory with alternative extensions
+        // 1. Same directory with alternative extensions and exact title
         listOf("wav", "m4a", "aac", "flac", "mp3").forEach { ext ->
             candidates.add(File(parentDir, "$baseName.$ext"))
             candidates.add(File(getRecordingsDir(), "$baseName.$ext"))
+            if (cleanTitleSanitized != baseName) {
+                candidates.add(File(parentDir, "$cleanTitleSanitized.$ext"))
+                candidates.add(File(getRecordingsDir(), "$cleanTitleSanitized.$ext"))
+            }
         }
 
         // 2. Companion backup or temporary merged files
@@ -134,6 +139,67 @@ class RecordingRepository(
         }
         if (!target.exists()) target.mkdirs()
         return target
+    }
+
+    /**
+     * Synchronizes [sourceFile] into the user's selected local device folder when Local Auto Sync is enabled.
+     * Supports both Android SAF DocumentTree URIs (`customStorageTreeUri`) and selected internal folders.
+     */
+    suspend fun syncFileToSelectedLocalFolder(
+        sourceFile: File,
+        settings: RecorderSettings,
+        desiredFileName: String = sourceFile.name
+    ): Boolean = withContext(Dispatchers.IO) {
+        if (!sourceFile.exists() || sourceFile.length() <= 0L) return@withContext false
+        var synced = false
+
+        // 1. Ensure file is present in the selected internal subfolder if different from sourceFile's parent
+        try {
+            val targetInternalDir = getRecordingsDir(
+                subFolderName = settings.localFolderName,
+                folderPath = settings.localFolderPath
+            )
+            if (sourceFile.parentFile?.canonicalPath != targetInternalDir.canonicalPath) {
+                val destInternalFile = File(targetInternalDir, desiredFileName)
+                sourceFile.copyTo(destInternalFile, overwrite = true)
+                synced = destInternalFile.exists() && destInternalFile.length() > 0L
+            } else {
+                synced = true
+            }
+        } catch (_: Exception) {}
+
+        // 2. If user selected a folder via Android's native SAF folder picker (customStorageTreeUri), write file there
+        val treeUriStr = settings.customStorageTreeUri
+        if (treeUriStr.isNotBlank()) {
+            try {
+                val treeUri = Uri.parse(treeUriStr)
+                val treeDoc = androidx.documentfile.provider.DocumentFile.fromTreeUri(context, treeUri)
+                if (treeDoc != null && treeDoc.exists() && treeDoc.canWrite()) {
+                    val ext = desiredFileName.substringAfterLast('.', "m4a").lowercase(Locale.US)
+                    val mimeType = when (ext) {
+                        "wav" -> "audio/x-wav"
+                        "flac" -> "audio/flac"
+                        "aac" -> "audio/aac"
+                        else -> "audio/mp4"
+                    }
+                    treeDoc.findFile(desiredFileName)?.delete()
+                    val baseWithoutExt = desiredFileName.substringBeforeLast('.')
+                    treeDoc.findFile(baseWithoutExt)?.delete()
+                    val exportDoc = treeDoc.createFile(mimeType, desiredFileName)
+                        ?: treeDoc.createFile(mimeType, baseWithoutExt)
+                    if (exportDoc != null) {
+                        context.contentResolver.openOutputStream(exportDoc.uri)?.use { os ->
+                            sourceFile.inputStream().use { input ->
+                                input.copyTo(os)
+                            }
+                        }
+                        synced = true
+                    }
+                }
+            } catch (_: Exception) {}
+        }
+
+        synced
     }
 
 
@@ -616,13 +682,18 @@ class RecordingRepository(
         val cleanExt = extension.trim().trimStart('.').lowercase(Locale.US).ifBlank { "m4a" }
         val sanitizedBase = baseTitle.trim()
             .replace(Regex("[\\\\/:*?\"<>|]"), "_")
-            .take(64)
+            .take(128)
             .ifBlank { "Recording" }
+        val baseWithoutExt = if (sanitizedBase.endsWith(".$cleanExt", ignoreCase = true)) {
+            sanitizedBase.removeSuffix(".$cleanExt")
+        } else {
+            sanitizedBase
+        }
 
-        var candidate = File(targetDir, "$sanitizedBase.$cleanExt")
+        var candidate = File(targetDir, "$baseWithoutExt.$cleanExt")
         var counter = 1
         while (candidate.exists()) {
-            candidate = File(targetDir, "$sanitizedBase ($counter).$cleanExt")
+            candidate = File(targetDir, "$baseWithoutExt ($counter).$cleanExt")
             counter++
         }
         return candidate
@@ -796,6 +867,10 @@ class RecordingRepository(
                 newLocalEntity.copy(id = localId)
             }
 
+            if (settings.driveAutoSync && settings.defaultStorageDestination == StorageDestination.LOCAL) {
+                syncFileToSelectedLocalFolder(savedFile, settings, destinationFile.name)
+            }
+
             onProgress(1.0f)
             Result.success(localResultEntity)
         } catch (e: Exception) {
@@ -869,11 +944,8 @@ class RecordingRepository(
     ): Result<RecordingEntity> = withContext(Dispatchers.IO) {
         try {
             val srcFile = File(source.filePath)
-            val sanitizedTitle = source.title.replace(Regex("[^A-Za-z0-9_\\-]"), "_")
-            val outFile = File(
-                getRecordingsDir(),
-                "${sanitizedTitle}_${targetSampleRate}Hz_${System.currentTimeMillis() % 10000}.${targetFormat.extension}"
-            )
+            val convertedTitle = "${source.title} (${targetFormat.id})"
+            val outFile = resolveUniqueLocalFile(getRecordingsDir(), convertedTitle, targetFormat.extension)
 
             onProgress(0.10f)
 

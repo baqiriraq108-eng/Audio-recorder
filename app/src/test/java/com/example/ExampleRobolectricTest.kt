@@ -1724,6 +1724,203 @@ class ExampleRobolectricTest {
         val updatedInDb = dao.getRecordingById(insertedId)!!
         assertEquals(backupFile.absolutePath, updatedInDb.filePath)
     }
+
+    @Test
+    fun `verify centralized warm color token hierarchy and legacy state aliases use warm palette exclusively`() {
+        val warmTokens = setOf(
+            com.example.ui.theme.ObsidianBackground,
+            com.example.ui.theme.WarmSecondarySurface,
+            com.example.ui.theme.ElevatedSurface,
+            com.example.ui.theme.ElevatedSurfaceHigh,
+            com.example.ui.theme.TonalDarkBrown,
+            com.example.ui.theme.NavPillIndicator,
+            com.example.ui.theme.NavActiveContent,
+            com.example.ui.theme.NavInactiveContent,
+            com.example.ui.theme.DriveRecordFab,
+            com.example.ui.theme.PeachAccent,
+            com.example.ui.theme.PeachAccentSoft,
+            com.example.ui.theme.PeachAccentContainer,
+            com.example.ui.theme.OnPeachAccent,
+            com.example.ui.theme.OnDriveRecordFab,
+            com.example.ui.theme.PrimaryText,
+            com.example.ui.theme.SecondaryText,
+            com.example.ui.theme.OutlineWarm
+        )
+        assertTrue(warmTokens.contains(com.example.ui.theme.DestructiveCrimson))
+        assertTrue(warmTokens.contains(com.example.ui.theme.DestructiveContainer))
+        assertTrue(warmTokens.contains(com.example.ui.theme.SuccessContainer))
+        assertTrue(warmTokens.contains(com.example.ui.theme.WarningAmber))
+        assertEquals(androidx.compose.ui.graphics.Color(0xFF81C784), com.example.ui.theme.SuccessSage)
+        assertEquals(com.example.ui.theme.PeachAccent, com.example.ui.theme.DestructiveCrimson)
+    }
+
+    @Test
+    fun `verify three-button save dialog pauses recording and center cancel keeps recording paused`() {
+        val app = ApplicationProvider.getApplicationContext<android.app.Application>()
+        val vm = com.example.viewmodel.RecorderViewModel(app)
+        vm.startRecording()
+        org.robolectric.Shadows.shadowOf(android.os.Looper.getMainLooper()).idle()
+
+        // Trigger save from within the app -> pauses recording and opens 3-button confirmation dialog
+        vm.stopAndPromptSave()
+        org.robolectric.Shadows.shadowOf(android.os.Looper.getMainLooper()).idle()
+        assertEquals(
+            "Triggering save must pause the recording at the current timestamp",
+            com.example.data.RecordingStatus.PAUSED,
+            vm.recordingStatus.value
+        )
+        assertTrue(
+            "Triggering save must open the 3-button Save Confirmation dialog",
+            vm.showAppendSaveConfirmDialog.value
+        )
+
+        // Tap center Cancel button -> dismisses dialog and leaves recording PAUSED at exact timestamp
+        vm.dismissAppendSaveConfirmDialog()
+        org.robolectric.Shadows.shadowOf(android.os.Looper.getMainLooper()).idle()
+        org.junit.Assert.assertFalse(
+            "Center Cancel button must dismiss the save confirmation dialog",
+            vm.showAppendSaveConfirmDialog.value
+        )
+        assertEquals(
+            "Center Cancel button must neither save nor discard, leaving recording PAUSED",
+            com.example.data.RecordingStatus.PAUSED,
+            vm.recordingStatus.value
+        )
+
+        // Re-open dialog and tap Left Discard button -> discards recording and resets to READY
+        vm.stopAndPromptSave()
+        assertTrue(vm.showAppendSaveConfirmDialog.value)
+        vm.cancelSaveFromNotification()
+        org.robolectric.Shadows.shadowOf(android.os.Looper.getMainLooper()).idle()
+        assertEquals(
+            "Left Discard button must discard the recording and reset to READY",
+            com.example.data.RecordingStatus.READY,
+            vm.recordingStatus.value
+        )
+    }
+
+    @Test
+    fun `verify non-destructive multi-track audio merge in selection order across Local and Cloud tabs`() = runBlocking {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val mergeDir = File(context.cacheDir, "multi_merge_test").apply { mkdirs() }
+        val file1 = File(mergeDir, "track_one.wav")
+        val file2 = File(mergeDir, "track_two.wav")
+        val file3 = File(mergeDir, "track_three.wav")
+        WavFileTools.createStudioSampleAudioFile(file1, 1, 22050)
+        WavFileTools.createStudioSampleAudioFile(file2, 2, 22050)
+        WavFileTools.createStudioSampleAudioFile(file3, 1, 22050)
+        val origLen1 = file1.length()
+        val origLen2 = file2.length()
+        val origLen3 = file3.length()
+
+        val outputMergedFile = File(mergeDir, "merged_output.wav")
+        val mergeResult = WavFileTools.mergeMultipleAudioFilesNonDestructive(
+            sourceFiles = listOf(file2, file1, file3),
+            outputFile = outputMergedFile,
+            sampleRate = 22050,
+            channels = 1,
+            bitsPerSample = 16
+        )
+        org.junit.Assert.assertNotNull(mergeResult)
+        assertTrue(mergeResult!!.success)
+        assertTrue(outputMergedFile.exists())
+        assertTrue(
+            "Merged file duration (${mergeResult.durationMs}ms) must reflect combined 3 tracks (~4000ms)",
+            mergeResult.durationMs >= 3500L
+        )
+        // Verify original source files remain 100% untouched and preserved
+        assertTrue(file1.exists() && file1.length() == origLen1)
+        assertTrue(file2.exists() && file2.length() == origLen2)
+        assertTrue(file3.exists() && file3.length() == origLen3)
+
+        // Verify ViewModel multi-selection across Local and Cloud tabs preserves selection order
+        val app = ApplicationProvider.getApplicationContext<android.app.Application>()
+        val vm = com.example.viewmodel.RecorderViewModel(app)
+        val database = com.example.data.AppDatabase.getInstance(app)
+        val dao = database.recordingDao()
+
+        val rec1 = com.example.data.RecordingEntity(
+            title = "Track A",
+            filePath = file1.absolutePath,
+            sizeBytes = file1.length(),
+            durationMs = 1000L,
+            sampleRate = 22050,
+            bitDepth = 16,
+            channels = 1,
+            format = "WAV",
+            waveformPeaks = "0.2,0.5,0.3",
+            storageLocation = com.example.data.StorageDestination.LOCAL.id,
+            createdAt = System.currentTimeMillis()
+        )
+        val rec2 = com.example.data.RecordingEntity(
+            title = "Track B",
+            filePath = file2.absolutePath,
+            sizeBytes = file2.length(),
+            durationMs = 2000L,
+            sampleRate = 22050,
+            bitDepth = 16,
+            channels = 1,
+            format = "WAV",
+            waveformPeaks = "0.4,0.6,0.5",
+            storageLocation = com.example.data.StorageDestination.CLOUD.id,
+            createdAt = System.currentTimeMillis() + 1000L
+        )
+        val id1 = dao.insertRecording(rec1)
+        val id2 = dao.insertRecording(rec2)
+        org.robolectric.Shadows.shadowOf(android.os.Looper.getMainLooper()).idle()
+
+        // Select in reverse order: Track B (Cloud) then Track A (Local)
+        vm.selectLibraryStorageTab(com.example.data.StorageDestination.CLOUD)
+        vm.toggleRecordingSelection(id2)
+        vm.selectLibraryStorageTab(com.example.data.StorageDestination.LOCAL)
+        vm.toggleRecordingSelection(id1)
+
+        assertEquals(
+            "Multi-selection must persist across Local and Cloud tabs in exact user selection order",
+            listOf<Long>(id2, id1),
+            vm.selectedRecordingIds.value.toList()
+        )
+
+        // Perform merge
+        vm.mergeSelectedRecordings("EndToEnd Merged Track")
+        // Idle coroutines and looper
+        org.robolectric.Shadows.shadowOf(android.os.Looper.getMainLooper()).idle()
+        kotlinx.coroutines.delay(300)
+        org.robolectric.Shadows.shadowOf(android.os.Looper.getMainLooper()).idle()
+
+        // Verify multi-selection mode was cleanly exited
+        assertTrue(
+            "Multi-selection should be cleared after merge",
+            vm.selectedRecordingIds.value.isEmpty()
+        )
+
+        // Verify new merged recording registered in Room DB
+        val allRecs = dao.getAllRecordings().first()
+        val mergedEntity = allRecs.firstOrNull { it.title == "EndToEnd Merged Track" }
+        org.junit.Assert.assertNotNull("Merged entity must be registered in Room DB", mergedEntity)
+        val finalMerged = mergedEntity!!
+        assertEquals(
+            "Merged recording must be stored under Local category",
+            com.example.data.StorageDestination.LOCAL.id,
+            finalMerged.storageLocation
+        )
+        assertEquals(
+            "Merged file duration must strictly equal mathematical sum of source durations (1000ms + 2000ms = 3000ms)",
+            3000L,
+            finalMerged.durationMs
+        )
+        val mergedOnDisk = File(finalMerged.filePath)
+        assertTrue("Merged file must exist on disk in local directory", mergedOnDisk.exists())
+
+        // Verify source files and DB records remain untouched
+        assertTrue("Source file 1 must remain intact", file1.exists() && file1.length() == origLen1)
+        assertTrue("Source file 2 must remain intact", file2.exists() && file2.length() == origLen2)
+        val sourceDb1 = dao.getRecordingById(id1)
+        val sourceDb2 = dao.getRecordingById(id2)
+        org.junit.Assert.assertNotNull(sourceDb1)
+        org.junit.Assert.assertNotNull(sourceDb2)
+    }
 }
+
 
 
