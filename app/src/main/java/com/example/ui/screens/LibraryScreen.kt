@@ -107,6 +107,8 @@ import com.example.data.LibrarySortDirection
 import com.example.data.LibrarySortOption
 import com.example.data.RecordingEntity
 import com.example.data.StorageDestination
+import com.example.ui.components.CopyToCloudDirectionalIcon
+import com.example.ui.components.CopyToLocalDirectionalIcon
 import com.example.ui.components.EditRecordingDialog
 import com.example.ui.components.ImportCloudWithArrowIcon
 import com.example.ui.components.MergeRecordingsDialog
@@ -179,6 +181,7 @@ fun LibraryScreen(
     onSyncToCloud: (RecordingEntity) -> Unit,
     onDownloadFromCloud: (RecordingEntity) -> Unit = {},
     onCopyToCloud: (RecordingEntity) -> Unit = {},
+    onCopyToLocal: (RecordingEntity) -> Unit = onDownloadFromCloud,
     onRenameRecording: (RecordingEntity, String, String, String) -> Unit,
     onDeleteRecording: (RecordingEntity) -> Unit
 ) {
@@ -1081,9 +1084,9 @@ fun LibraryScreen(
                                                     DropdownMenuItem(
                                                         leadingIcon = {
                                                             Icon(
-                                                                imageVector = Icons.Default.ContentCopy,
-                                                                contentDescription = null,
-                                                                tint = PeachAccent
+                                                                imageVector = CopyToCloudDirectionalIcon,
+                                                                contentDescription = "Copy to Cloud",
+                                                                tint = Color.Unspecified
                                                             )
                                                         },
                                                         text = {
@@ -1151,9 +1154,9 @@ fun LibraryScreen(
                                                     DropdownMenuItem(
                                                         leadingIcon = {
                                                             Icon(
-                                                                imageVector = Icons.Default.ContentCopy,
-                                                                contentDescription = null,
-                                                                tint = PeachAccent
+                                                                imageVector = CopyToLocalDirectionalIcon,
+                                                                contentDescription = "Copy to Local",
+                                                                tint = Color.Unspecified
                                                             )
                                                         },
                                                         text = {
@@ -1165,7 +1168,7 @@ fun LibraryScreen(
                                                         },
                                                         onClick = {
                                                             menuExpanded = false
-                                                            onDownloadFromCloud(item)
+                                                            onCopyToLocal(item)
                                                         },
                                                         modifier = Modifier.testTag("menu_copy_to_local_${item.id}")
                                                     )

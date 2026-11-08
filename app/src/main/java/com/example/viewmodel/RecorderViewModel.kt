@@ -2827,18 +2827,24 @@ class RecorderViewModel(application: Application) : AndroidViewModel(application
                     repository.updateRecordingAndLinkedPaths(updatedOriginal)
 
                     if (createCloudTabCopy && currentEntity.storageLocation.equals(StorageDestination.LOCAL.id, ignoreCase = true)) {
-                        val cloudCopy = currentEntity.copy(
-                            id = 0,
-                            title = currentEntity.title,
-                            storageLocation = StorageDestination.CLOUD.id,
-                            isCloudSynced = true,
-                            cloudFileId = res.fileId,
-                            cloudSyncedAt = res.syncedAtMs,
-                            driveFolderId = res.folderId,
-                            driveFolderName = targetFolderName,
-                            driveWebViewLink = res.webViewLink
-                        )
-                        repository.insertRecording(cloudCopy)
+                        val existingCloud = cloudRecordings.value.firstOrNull { candidate ->
+                            candidate.cloudFileId == res.fileId ||
+                                (candidate.title == currentEntity.title && candidate.durationMs == currentEntity.durationMs)
+                        }
+                        if (existingCloud == null) {
+                            val cloudCopy = currentEntity.copy(
+                                id = 0,
+                                title = currentEntity.title,
+                                storageLocation = StorageDestination.CLOUD.id,
+                                isCloudSynced = true,
+                                cloudFileId = res.fileId,
+                                cloudSyncedAt = res.syncedAtMs,
+                                driveFolderId = res.folderId,
+                                driveFolderName = targetFolderName,
+                                driveWebViewLink = res.webViewLink
+                            )
+                            repository.insertRecording(cloudCopy)
+                        }
                     }
 
                     _cloudSyncingIds.value = _cloudSyncingIds.value - recording.id
@@ -2886,10 +2892,58 @@ class RecorderViewModel(application: Application) : AndroidViewModel(application
     }
 
     /**
-     * Copies a Local recording into Google Drive (Cloud tab) while keeping the original in Local tab.
+     * Directly copies a Local recording file into Cloud storage (Cloud tab) while keeping the original in Local tab,
+     * without re-decoding or duplicating existing entries.
      */
     fun copyRecordingToCloud(recording: RecordingEntity) {
-        syncRecordingToCloud(recording, isManualTrigger = true, createCloudTabCopy = true)
+        viewModelScope.launch {
+            val activeSettings = _settings.value
+            val targetFolderId = activeSettings.driveFolderId.ifBlank { "root" }
+            val targetFolderName = activeSettings.driveFolderName.ifBlank { "My Drive" }
+            val res = repository.copyRecordingFileToTarget(
+                source = recording,
+                targetStorageLocation = StorageDestination.CLOUD,
+                driveFolderId = targetFolderId,
+                driveFolderName = targetFolderName,
+                settings = activeSettings
+            )
+            res.fold(
+                onSuccess = { copiedEntity ->
+                    if (isDriveSessionReadyForUpload()) {
+                        syncRecordingToCloud(copiedEntity, isManualTrigger = false, createCloudTabCopy = false)
+                    }
+                    postSnackbar("Copied \"${recording.title}\" to Cloud Storage")
+                },
+                onFailure = { err ->
+                    postSnackbar("Copy failed: ${err.localizedMessage ?: "Unable to copy file"}")
+                }
+            )
+        }
+    }
+
+    /**
+     * Directly copies a Cloud recording file into Local storage (Local tab) while keeping the original in Cloud tab,
+     * without re-decoding or duplicating existing entries.
+     */
+    fun copyRecordingToLocal(recording: RecordingEntity) {
+        viewModelScope.launch {
+            val activeSettings = _settings.value
+            val res = repository.copyRecordingFileToTarget(
+                source = recording,
+                targetStorageLocation = StorageDestination.LOCAL,
+                driveFolderId = recording.driveFolderId,
+                driveFolderName = recording.driveFolderName,
+                settings = activeSettings
+            )
+            res.fold(
+                onSuccess = {
+                    postSnackbar("Copied \"${recording.title}\" to Local Storage")
+                },
+                onFailure = {
+                    downloadCloudRecordingToLocal(recording)
+                }
+            )
+        }
     }
 
     /**

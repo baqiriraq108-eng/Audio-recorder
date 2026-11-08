@@ -1,6 +1,6 @@
 {
-  "summary":  "Implementation plan for fixing Auto Sync when Local Storage (Device) is selected so that new recordings recorded while Auto Sync is enabled are written directly into the user's selected device folder (including SAF DocumentFile tree folders), without triggering Google Drive sign-in or retroactively syncing older recordings.",
-  "updatedAt":  "2026-11-08T17:28:40.179232837Z",
+  "summary":  "خطة تنفيذ النسخ المباشر للملفات الصوتية بين التخزين المحلي والسحابي دون إعادة فك التشفير، مع تصميم أيقونات مخصصة تتضمن سهم اتجاه نحو وجهة التخزين وفق نظام الألوان الموحد.",
+  "updatedAt":  "2026-11-08T21:28:16.754667710Z",
   "requestFeedback":  true,
   "userFacing":  true
 }

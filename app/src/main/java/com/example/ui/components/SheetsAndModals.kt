@@ -1394,6 +1394,97 @@ val ImportCloudWithArrowIcon: ImageVector by lazy {
 }
 
 /**
+ * Two-tone directional Copy-to-Cloud icon where the destination Cloud silhouette is [PeachAccent]
+ * and the inner directional arrow in [CloudArrowBrown] points toward the Cloud tab (rightward).
+ */
+val CopyToCloudDirectionalIcon: ImageVector by lazy {
+    ImageVector.Builder(
+        name = "CopyToCloudDirectional",
+        defaultWidth = 24.dp,
+        defaultHeight = 24.dp,
+        viewportWidth = 24f,
+        viewportHeight = 24f
+    ).apply {
+        // 1. Solid Cloud Body in PeachAccent
+        path(
+            fill = SolidColor(PeachAccent),
+            pathFillType = PathFillType.NonZero
+        ) {
+            moveTo(19.35f, 10.04f)
+            curveTo(18.67f, 6.59f, 15.64f, 4f, 12f, 4f)
+            curveTo(9.11f, 4f, 6.6f, 5.64f, 5.35f, 8.04f)
+            curveTo(2.34f, 8.36f, 0f, 10.91f, 0f, 14f)
+            curveTo(0f, 17.31f, 2.69f, 20f, 6f, 20f)
+            horizontalLineTo(19f)
+            curveTo(21.76f, 20f, 24f, 17.76f, 24f, 15f)
+            curveTo(24f, 12.36f, 21.95f, 10.22f, 19.35f, 10.04f)
+            close()
+        }
+        // 2. Rightward Arrow pointing toward Cloud Storage in CloudArrowBrown
+        path(
+            fill = SolidColor(CloudArrowBrown),
+            pathFillType = PathFillType.NonZero
+        ) {
+            moveTo(17.5f, 13.5f)
+            lineTo(13f, 9.5f)
+            verticalLineTo(12f)
+            horizontalLineTo(7.5f)
+            verticalLineTo(15f)
+            horizontalLineTo(13f)
+            verticalLineTo(17.5f)
+            close()
+        }
+    }.build()
+}
+
+/**
+ * Two-tone directional Copy-to-Local icon where the destination Local Storage folder/device body is [PeachAccent]
+ * and the inner directional arrow in [CloudArrowBrown] points toward the Local tab (leftward).
+ */
+val CopyToLocalDirectionalIcon: ImageVector by lazy {
+    ImageVector.Builder(
+        name = "CopyToLocalDirectional",
+        defaultWidth = 24.dp,
+        defaultHeight = 24.dp,
+        viewportWidth = 24f,
+        viewportHeight = 24f
+    ).apply {
+        // 1. Solid Local Storage Folder Body in PeachAccent
+        path(
+            fill = SolidColor(PeachAccent),
+            pathFillType = PathFillType.NonZero
+        ) {
+            moveTo(10f, 4f)
+            lineTo(12f, 6f)
+            horizontalLineTo(20f)
+            curveTo(21.1f, 6f, 22f, 6.9f, 22f, 8f)
+            verticalLineTo(18f)
+            curveTo(22f, 19.1f, 21.1f, 20f, 20f, 20f)
+            horizontalLineTo(4f)
+            curveTo(2.9f, 20f, 2f, 19.1f, 2f, 18f)
+            verticalLineTo(6f)
+            curveTo(2f, 4.9f, 2.9f, 4f, 4f, 4f)
+            horizontalLineTo(10f)
+            close()
+        }
+        // 2. Leftward Arrow pointing toward Local Storage in CloudArrowBrown
+        path(
+            fill = SolidColor(CloudArrowBrown),
+            pathFillType = PathFillType.NonZero
+        ) {
+            moveTo(6.5f, 13f)
+            lineTo(11f, 9f)
+            verticalLineTo(11.5f)
+            horizontalLineTo(17.5f)
+            verticalLineTo(14.5f)
+            horizontalLineTo(11f)
+            verticalLineTo(17f)
+            close()
+        }
+    }.build()
+}
+
+/**
  * Custom vector icon combining the hollow/outlined Trash Bin silhouette from the Trash tab
  * (with a rectangular center cutout showing the container background) and 3 horizontal
  * side sweep lines in [PeachAccent], proportioned to fill the 24x24 viewport.

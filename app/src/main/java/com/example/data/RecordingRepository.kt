@@ -753,54 +753,63 @@ class RecordingRepository(
             var bitDepth = cloudRecording.bitDepth.takeIf { it > 0 } ?: 16
             var bitrate = cloudRecording.bitrate.takeIf { it > 0 } ?: 192000
 
-            if (ext.equals("wav", ignoreCase = true)) {
-                val wavHeader = WavFileTools.readWavHeaderInfo(savedFile, sampleRate, channels, bitDepth)
-                sampleRate = wavHeader.sampleRate
-                channels = wavHeader.channels
-                bitDepth = wavHeader.bitsPerSample
-                val bytesPerSec = (sampleRate.toLong() * wavHeader.blockAlign.toLong()).coerceAtLeast(1L)
-                bitrate = (bytesPerSec * 8L).toInt()
-                val calcDur = (wavHeader.pcmDataBytes * 1000L) / bytesPerSec
-                if (calcDur > 0L) durationMs = calcDur
-            }
+            val serializedPeaks: String
+            val serializedSilence: String
 
-            try {
-                val retriever = MediaMetadataRetriever()
-                try {
-                    retriever.setDataSource(savedFile.absolutePath)
-                    val durStr = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)
-                    val parsedDur = durStr?.toLongOrNull() ?: 0L
-                    if (parsedDur > 0L) durationMs = parsedDur
-                    val brStr = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_BITRATE)
-                    val parsedBr = brStr?.toIntOrNull() ?: 0
-                    if (parsedBr > 0) bitrate = parsedBr
-                } finally {
-                    retriever.release()
+            // Fast-path: if metadata and waveform peaks already exist on cloudRecording, preserve them directly without re-decoding
+            if (cloudRecording.waveformPeaks.isNotBlank() && durationMs > 0L) {
+                serializedPeaks = cloudRecording.waveformPeaks
+                serializedSilence = cloudRecording.silenceMap
+            } else {
+                if (ext.equals("wav", ignoreCase = true)) {
+                    val wavHeader = WavFileTools.readWavHeaderInfo(savedFile, sampleRate, channels, bitDepth)
+                    sampleRate = wavHeader.sampleRate
+                    channels = wavHeader.channels
+                    bitDepth = wavHeader.bitsPerSample
+                    val bytesPerSec = (sampleRate.toLong() * wavHeader.blockAlign.toLong()).coerceAtLeast(1L)
+                    bitrate = (bytesPerSec * 8L).toInt()
+                    val calcDur = (wavHeader.pcmDataBytes * 1000L) / bytesPerSec
+                    if (calcDur > 0L) durationMs = calcDur
                 }
-            } catch (_: Exception) {}
 
-            if (durationMs <= 0L) {
-                val fallbackBytesPerSec = (bitrate / 8).coerceAtLeast(16_000)
-                durationMs = ((savedFile.length() * 1000L) / fallbackBytesPerSec).coerceIn(1_000L, 7_200_000L)
-            }
+                try {
+                    val retriever = MediaMetadataRetriever()
+                    try {
+                        retriever.setDataSource(savedFile.absolutePath)
+                        val durStr = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)
+                        val parsedDur = durStr?.toLongOrNull() ?: 0L
+                        if (parsedDur > 0L) durationMs = parsedDur
+                        val brStr = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_BITRATE)
+                        val parsedBr = brStr?.toIntOrNull() ?: 0
+                        if (parsedBr > 0) bitrate = parsedBr
+                    } finally {
+                        retriever.release()
+                    }
+                } catch (_: Exception) {}
 
-            val peaks = cloudRecording.peakList.ifEmpty {
-                WavFileTools.extractWaveformFromFile(savedFile)
-            }
-            val silenceIntervals = cloudRecording.silenceIntervals.ifEmpty {
-                WavFileTools.generateSilenceMapIndex(
-                    sourceFile = savedFile,
-                    durationMs = durationMs,
-                    peaks = peaks,
-                    config = settings.silenceConfig,
-                    fallbackSampleRate = sampleRate,
-                    fallbackChannels = channels,
-                    fallbackBitsPerSample = bitDepth
-                )
-            }
+                if (durationMs <= 0L) {
+                    val fallbackBytesPerSec = (bitrate / 8).coerceAtLeast(16_000)
+                    durationMs = ((savedFile.length() * 1000L) / fallbackBytesPerSec).coerceIn(1_000L, 7_200_000L)
+                }
 
-            val serializedPeaks = AudioFormatUtils.serializePeaks(peaks)
-            val serializedSilence = AudioFormatUtils.serializeSilenceMap(silenceIntervals)
+                val peaks = cloudRecording.peakList.ifEmpty {
+                    WavFileTools.extractWaveformFromFile(savedFile)
+                }
+                val silenceIntervals = cloudRecording.silenceIntervals.ifEmpty {
+                    WavFileTools.generateSilenceMapIndex(
+                        sourceFile = savedFile,
+                        durationMs = durationMs,
+                        peaks = peaks,
+                        config = settings.silenceConfig,
+                        fallbackSampleRate = sampleRate,
+                        fallbackChannels = channels,
+                        fallbackBitsPerSample = bitDepth
+                    )
+                }
+
+                serializedPeaks = AudioFormatUtils.serializePeaks(peaks)
+                serializedSilence = AudioFormatUtils.serializeSilenceMap(silenceIntervals)
+            }
 
             // Update the Cloud entry so its local file reference is now available for immediate offline playback
             val updatedCloud = cloudRecording.copy(
@@ -820,7 +829,8 @@ class RecordingRepository(
             val existingLocalList = dao.getLocalRecordings().first()
             val existingLocal = existingLocalList.firstOrNull { localRec ->
                 (!cloudRecording.cloudFileId.isNullOrBlank() && localRec.cloudFileId == cloudRecording.cloudFileId) ||
-                    localRec.filePath == savedFile.absolutePath
+                    localRec.filePath == savedFile.absolutePath ||
+                    (localRec.title == cloudRecording.title && localRec.durationMs == durationMs)
             }
 
             val localResultEntity = if (existingLocal != null) {
@@ -879,19 +889,53 @@ class RecordingRepository(
     }
 
     /**
-     * Copies an existing recording file so it exists in both Local and Cloud libraries.
+     * Performs a direct byte-for-byte file copy of [source] between Local and Cloud storage directories
+     * without re-decoding audio, re-extracting waveforms, or duplicating existing entries.
      */
     suspend fun copyRecordingFileToTarget(
         source: RecordingEntity,
         targetStorageLocation: StorageDestination,
         driveFolderId: String?,
         driveFolderName: String?,
-        cloudFileId: String? = null
+        cloudFileId: String? = null,
+        settings: RecorderSettings? = null
     ): Result<RecordingEntity> = withContext(Dispatchers.IO) {
         try {
-            val srcFile = File(source.filePath)
+            val targetList = if (targetStorageLocation == StorageDestination.CLOUD) {
+                dao.getCloudRecordings().first()
+            } else {
+                dao.getLocalRecordings().first()
+            }
+
+            val existingMatch = targetList.firstOrNull { candidate ->
+                val hasFile = candidate.filePath.isNotBlank() && File(candidate.filePath).exists()
+                hasFile && (
+                    (!source.cloudFileId.isNullOrBlank() && candidate.cloudFileId == source.cloudFileId) ||
+                        (candidate.title == source.title && candidate.durationMs == source.durationMs) ||
+                        (source.filePath.isNotBlank() && candidate.filePath == source.filePath)
+                )
+            }
+            if (existingMatch != null) {
+                if (targetStorageLocation == StorageDestination.LOCAL &&
+                    settings != null &&
+                    settings.driveAutoSync &&
+                    settings.defaultStorageDestination == StorageDestination.LOCAL
+                ) {
+                    val existingFile = File(existingMatch.filePath)
+                    syncFileToSelectedLocalFolder(existingFile, settings, existingFile.name)
+                }
+                return@withContext Result.success(existingMatch)
+            }
+
+            val srcFile = resolveAudioFile(source) ?: File(source.filePath)
+            if (!srcFile.exists() || srcFile.length() <= 0L) {
+                return@withContext Result.failure(
+                    IllegalStateException("Source audio file not found on device.")
+                )
+            }
+
             val ext = srcFile.extension.ifBlank {
-                AudioFormatOption.fromId(source.format).extension
+                AudioFormatOption.fromId(source.format).extension.ifBlank { "m4a" }
             }
             val destDir = if (targetStorageLocation == StorageDestination.CLOUD) {
                 val sub = driveFolderName?.trim()?.replace(Regex("[\\\\/:*?\"<>|]"), "_").orEmpty()
@@ -902,25 +946,61 @@ class RecordingRepository(
                     File(baseCloud, sub).apply { if (!exists()) mkdirs() }
                 }
             } else {
-                getRecordingsDir()
+                if (settings != null &&
+                    settings.driveAutoSync &&
+                    settings.defaultStorageDestination == StorageDestination.LOCAL
+                ) {
+                    getRecordingsDir(
+                        subFolderName = settings.localFolderName,
+                        folderPath = settings.localFolderPath
+                    )
+                } else {
+                    getRecordingsDir()
+                }
             }
-            val copyFile = File(
-                destDir,
-                "${srcFile.nameWithoutExtension}_copy_${System.currentTimeMillis() % 10000}.$ext"
+
+            val copyFile = resolveUniqueLocalFile(
+                targetDir = destDir,
+                baseTitle = source.title,
+                extension = ext
             )
-            if (srcFile.exists()) {
+            if (srcFile.canonicalPath != copyFile.canonicalPath) {
                 srcFile.copyTo(copyFile, overwrite = true)
             }
+
+            if (targetStorageLocation == StorageDestination.LOCAL &&
+                settings != null &&
+                settings.driveAutoSync &&
+                settings.defaultStorageDestination == StorageDestination.LOCAL
+            ) {
+                syncFileToSelectedLocalFolder(copyFile, settings, copyFile.name)
+            }
+
+            val resolvedCloudId = cloudFileId?.takeIf { it.isNotBlank() && !it.startsWith("drive_") }
+                ?: source.cloudFileId?.takeIf { it.isNotBlank() && !it.startsWith("drive_") }
+                ?: "cloud_copied_${System.currentTimeMillis()}"
+            val nowMs = System.currentTimeMillis()
+
+            val updatedSource = source.copy(
+                isCloudSynced = true,
+                cloudFileId = resolvedCloudId,
+                cloudSyncedAt = source.cloudSyncedAt ?: nowMs,
+                driveFolderId = driveFolderId ?: source.driveFolderId ?: "root",
+                driveFolderName = driveFolderName ?: source.driveFolderName ?: "My Drive"
+            )
+            dao.updateRecording(updatedSource)
+
             val newEntity = source.copy(
                 id = 0,
-                filePath = if (copyFile.exists()) copyFile.absolutePath else source.filePath,
-                createdAt = System.currentTimeMillis(),
+                title = source.title,
+                filePath = if (copyFile.exists()) copyFile.absolutePath else srcFile.absolutePath,
+                sizeBytes = if (copyFile.exists()) copyFile.length() else srcFile.length(),
                 storageLocation = targetStorageLocation.id,
                 isCloudSynced = true,
-                cloudFileId = cloudFileId ?: source.cloudFileId ?: "drive_${System.currentTimeMillis() % 100000}",
-                cloudSyncedAt = System.currentTimeMillis(),
-                driveFolderId = driveFolderId ?: source.driveFolderId,
-                driveFolderName = driveFolderName ?: source.driveFolderName
+                cloudFileId = resolvedCloudId,
+                cloudSyncedAt = source.cloudSyncedAt ?: nowMs,
+                driveFolderId = driveFolderId ?: source.driveFolderId ?: "root",
+                driveFolderName = driveFolderName ?: source.driveFolderName ?: "My Drive"
             )
             val newId = dao.insertRecording(newEntity)
             Result.success(newEntity.copy(id = newId))

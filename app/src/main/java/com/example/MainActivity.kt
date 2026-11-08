@@ -608,6 +608,9 @@ private fun LibraryDestination(viewModel: RecorderViewModel) {
         onCopyToCloud = { rec ->
             viewModel.copyRecordingToCloud(rec)
         },
+        onCopyToLocal = { rec ->
+            viewModel.copyRecordingToLocal(rec)
+        },
         onRenameRecording = { rec, title, tags, notes ->
             viewModel.renameRecording(rec, title, tags, notes)
         },
