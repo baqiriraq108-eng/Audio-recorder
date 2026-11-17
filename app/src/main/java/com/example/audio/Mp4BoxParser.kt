@@ -566,6 +566,18 @@ object Mp4BoxParser {
         return byteArrayOf(b0.toByte(), b1.toByte())
     }
 
+    /**
+     * Checks whether two `AudioSpecificConfig` byte arrays represent the same core AAC configuration,
+     * tolerating optional trailing SBR/PS sync-extension bytes emitted by some hardware `MediaCodec`s
+     * when the 2-byte ISO 14496-3 header matches.
+     */
+    fun areAudioSpecificConfigsCompatible(a: ByteArray, b: ByteArray): Boolean {
+        if (a.isEmpty() || b.isEmpty()) return true
+        if (a.contentEquals(b)) return true
+        if (a.size >= 2 && b.size >= 2 && a[0] == b[0] && a[1] == b[1]) return true
+        return false
+    }
+
     private fun parseStts(bytes: ByteArray, payloadOffset: Int, payloadSize: Int): List<SttsEntry> {
         if (payloadSize < 8) return emptyList()
         val bb = ByteBuffer.wrap(bytes, payloadOffset, payloadSize).order(ByteOrder.BIG_ENDIAN)
@@ -1103,14 +1115,49 @@ object Mp4BoxParser {
         val version = raw[payloadOff].toInt() and 0xFF
         val bb = ByteBuffer.wrap(raw).order(ByteOrder.BIG_ENDIAN)
         val entryCount = bb.getInt(payloadOff + 4)
-        if (entryCount >= 1) {
+        if (entryCount == 1) {
             if (version == 1 && raw.size >= payloadOff + 8 + 20) {
                 bb.putLong(payloadOff + 8, newMvhdDuration)
+                return raw
             } else if (version == 0 && raw.size >= payloadOff + 8 + 12 && newMvhdDuration <= 0xFFFFFFFFL) {
                 bb.putInt(payloadOff + 8, newMvhdDuration.toInt())
+                return raw
+            }
+        } else if (entryCount > 1) {
+            val stride = if (version == 1) 20 else 12
+            if (raw.size >= payloadOff + 8 + entryCount * stride && (version == 1 || newMvhdDuration <= 0xFFFFFFFFL)) {
+                var targetEntryIdx = entryCount - 1
+                for (i in 0 until entryCount) {
+                    val entryOff = payloadOff + 8 + i * stride
+                    val mediaTime = if (version == 1) bb.getLong(entryOff + 8) else bb.getInt(entryOff + 4).toLong()
+                    if (mediaTime >= 0L) {
+                        targetEntryIdx = i
+                    }
+                }
+                val patchOff = payloadOff + 8 + targetEntryIdx * stride
+                if (version == 1) {
+                    bb.putLong(patchOff, newMvhdDuration)
+                } else {
+                    bb.putInt(patchOff, newMvhdDuration.toInt())
+                }
+                return raw
             }
         }
-        return raw
+        // Fallback: build a clean single-entry elst spanning the entire updated movie duration
+        val useV1 = newMvhdDuration > 0xFFFFFFFFL
+        val out = ByteBuffer.allocate(8 + (if (useV1) 20 else 12)).order(ByteOrder.BIG_ENDIAN)
+        out.putInt(if (useV1) 0x01000000 else 0) // version + flags
+        out.putInt(1) // entry_count = 1
+        if (useV1) {
+            out.putLong(newMvhdDuration)
+            out.putLong(0L) // media_time = 0
+        } else {
+            out.putInt(newMvhdDuration.toInt())
+            out.putInt(0) // media_time = 0
+        }
+        out.putShort(1) // media_rate_integer = 1
+        out.putShort(0) // media_rate_fraction = 0
+        return buildBox("elst", out.array())
     }
 
     private fun patchMdiaBox(

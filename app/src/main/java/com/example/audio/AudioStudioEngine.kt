@@ -625,16 +625,22 @@ class AudioStudioEngine(private val context: Context) {
         }
     }
 
+    private data class HardwareCaptureSession(
+        val audioRecord: AudioRecord,
+        val actualSampleRate: Int,
+        val actualChannels: Int,
+        val chunkShorts: Int
+    )
+
     @SuppressLint("MissingPermission")
     private fun createAndStartAudioRecord(
         audioManager: AudioManager?,
         preferredHeadset: AudioDeviceInfo?,
         effectiveSampleRate: Int,
-        channelConfig: Int,
-        minBufSize: Int,
+        effectiveChannels: Int,
         echoCancellationEnabled: Boolean,
         noiseSuppressionEnabled: Boolean
-    ): AudioRecord? {
+    ): HardwareCaptureSession? {
         applyHardwareInputRouting(audioManager, preferredHeadset, null)
 
         val audioSources = resolvePrioritizedAudioSources(
@@ -643,23 +649,77 @@ class AudioStudioEngine(private val context: Context) {
             noiseSuppressionEnabled = noiseSuppressionEnabled
         )
 
+        val isBtHeadset = isBluetoothHeadsetDevice(preferredHeadset)
+        val safeTargetRate = effectiveSampleRate.coerceIn(8000, 96000)
+        val safeTargetChannels = effectiveChannels.coerceIn(1, 2)
+
+        val candidateConfigs = buildList {
+            add(safeTargetRate to safeTargetChannels)
+            if (safeTargetChannels != 1) {
+                add(safeTargetRate to 1)
+            }
+            if (isBtHeadset) {
+                // Bluetooth SCO / HFP voice uplinks commonly operate at 16 kHz or 8 kHz Mono
+                add(16000 to 1)
+                add(8000 to 1)
+                add(48000 to 1)
+                add(44100 to 1)
+                add(32000 to 1)
+                add(24000 to 1)
+            } else {
+                add(48000 to safeTargetChannels)
+                add(44100 to safeTargetChannels)
+                add(48000 to 1)
+                add(44100 to 1)
+                add(32000 to 1)
+                add(24000 to 1)
+                add(16000 to 1)
+                add(8000 to 1)
+            }
+        }.distinct()
+
         var audioRecord: AudioRecord? = null
-        for (source in audioSources) {
-            try {
-                val candidate = AudioRecord(
-                    source,
-                    effectiveSampleRate,
-                    channelConfig,
-                    AudioFormat.ENCODING_PCM_16BIT,
-                    minBufSize * 2
-                )
-                if (candidate.state == AudioRecord.STATE_INITIALIZED) {
-                    audioRecord = candidate
-                    break
+        var negotiatedRate = safeTargetRate
+        var negotiatedChannels = safeTargetChannels
+
+        outer@ for (source in audioSources) {
+            for ((candidateRate, candidateCh) in candidateConfigs) {
+                val chConfig = if (candidateCh == 2) {
+                    AudioFormat.CHANNEL_IN_STEREO
                 } else {
-                    candidate.release()
+                    AudioFormat.CHANNEL_IN_MONO
                 }
-            } catch (_: Exception) {}
+                val rawMinBuf = try {
+                    AudioRecord.getMinBufferSize(
+                        candidateRate,
+                        chConfig,
+                        AudioFormat.ENCODING_PCM_16BIT
+                    )
+                } catch (_: Exception) {
+                    -1
+                }
+                if (!isRobolectricRuntime && rawMinBuf <= 0) {
+                    continue
+                }
+                val minBufSize = rawMinBuf.coerceAtLeast(4096)
+                try {
+                    val candidate = AudioRecord(
+                        source,
+                        candidateRate,
+                        chConfig,
+                        AudioFormat.ENCODING_PCM_16BIT,
+                        minBufSize * 2
+                    )
+                    if (candidate.state == AudioRecord.STATE_INITIALIZED) {
+                        audioRecord = candidate
+                        negotiatedRate = candidateRate
+                        negotiatedChannels = candidateCh
+                        break@outer
+                    } else {
+                        candidate.release()
+                    }
+                } catch (_: Exception) {}
+            }
         }
 
         if (audioRecord != null && audioRecord.state == AudioRecord.STATE_INITIALIZED) {
@@ -701,7 +761,14 @@ class AudioStudioEngine(private val context: Context) {
 
             // Re-assert preferredDevice immediately after startRecording() so OEM HALs lock onto the headset
             applyHardwareInputRouting(audioManager, preferredHeadset, audioRecord)
-            return audioRecord
+            val rawShorts = ((negotiatedRate * negotiatedChannels) / 20).coerceAtLeast(512)
+            val alignedShorts = rawShorts - (rawShorts % negotiatedChannels.coerceAtLeast(1))
+            return HardwareCaptureSession(
+                audioRecord = audioRecord,
+                actualSampleRate = negotiatedRate,
+                actualChannels = negotiatedChannels,
+                chunkShorts = alignedShorts.coerceAtLeast(256)
+            )
         } else {
             activeAudioRecord = null
             return null
@@ -733,7 +800,7 @@ class AudioStudioEngine(private val context: Context) {
         _activeAudioDeviceName.value = formatInputDeviceLabel(initialPreferredHeadset)
 
         // If appending to an existing M4A file, parse its esds/mdhd/stsd before encoding
-        // so AudioRecord and MediaCodec match its exact sampleRate, channelCount, and PTS timeline.
+        // so the output stream matches its exact sampleRate and channelCount.
         val baseM4aMeta = if (baseM4aForAppend != null && baseM4aForAppend.exists()) {
             Mp4BoxParser.parseM4a(baseM4aForAppend)
         } else null
@@ -745,16 +812,17 @@ class AudioStudioEngine(private val context: Context) {
                 aacObjectType = baseM4aMeta.aacObjectType
             )
 
-        val effectiveSampleRate = if (canMatchBaseM4a && baseM4aMeta != null) {
+        val effectiveSampleRate = (if (canMatchBaseM4a && baseM4aMeta != null) {
             baseM4aMeta.sampleRate
         } else {
             sampleRate
-        }
-        val effectiveChannels = if (canMatchBaseM4a && baseM4aMeta != null) {
+        }).coerceIn(8000, 96000)
+
+        val effectiveChannels = (if (canMatchBaseM4a && baseM4aMeta != null) {
             baseM4aMeta.channelCount
         } else {
             channels
-        }
+        }).coerceIn(1, 2)
 
         currentSessionFile = outputFile
         currentSampleRate = effectiveSampleRate
@@ -770,57 +838,83 @@ class AudioStudioEngine(private val context: Context) {
 
         recordingJob = engineScope.launch(Dispatchers.IO) {
             outputFile.parentFile?.mkdirs()
-            val channelConfig = if (effectiveChannels == 2) {
-                AudioFormat.CHANNEL_IN_STEREO
-            } else {
-                AudioFormat.CHANNEL_IN_MONO
-            }
-            val minBufSize = AudioRecord.getMinBufferSize(
-                effectiveSampleRate,
-                channelConfig,
-                AudioFormat.ENCODING_PCM_16BIT
-            ).coerceAtLeast(4096)
 
-            var audioRecord: AudioRecord? = createAndStartAudioRecord(
+            var captureSession: HardwareCaptureSession? = createAndStartAudioRecord(
                 audioManager = audioManager,
                 preferredHeadset = initialPreferredHeadset,
                 effectiveSampleRate = effectiveSampleRate,
-                channelConfig = channelConfig,
-                minBufSize = minBufSize,
+                effectiveChannels = effectiveChannels,
                 echoCancellationEnabled = echoCancellationEnabled,
                 noiseSuppressionEnabled = noiseSuppressionEnabled
             )
+            var activeResampler: WavFileTools.PcmResampler? = captureSession?.let { session ->
+                if (session.actualSampleRate != effectiveSampleRate) {
+                    WavFileTools.PcmResampler(
+                        srcSampleRate = session.actualSampleRate,
+                        targetSampleRate = effectiveSampleRate,
+                        channels = effectiveChannels
+                    )
+                } else null
+            }
 
-            suspend fun rebindAudioRecordSeamlessly(): AudioRecord? {
+            suspend fun rebindAudioRecordSeamlessly(): HardwareCaptureSession? {
                 releaseAudioEffects()
                 try {
-                    audioRecord?.stop()
+                    captureSession?.audioRecord?.stop()
                 } catch (_: Exception) {}
                 try {
-                    audioRecord?.release()
+                    captureSession?.audioRecord?.release()
                 } catch (_: Exception) {}
                 activeAudioRecord = null
                 val latestPreferred = audioManager?.let { findPreferredHeadsetInputDevice(it) }
                 _activeAudioDeviceName.value = formatInputDeviceLabel(latestPreferred)
-                return createAndStartAudioRecord(
+                val newSession = createAndStartAudioRecord(
                     audioManager = audioManager,
                     preferredHeadset = latestPreferred,
                     effectiveSampleRate = effectiveSampleRate,
-                    channelConfig = channelConfig,
-                    minBufSize = minBufSize,
+                    effectiveChannels = effectiveChannels,
                     echoCancellationEnabled = activeEchoCancellationEnabled,
                     noiseSuppressionEnabled = activeNoiseSuppressionEnabled
                 )
+                activeResampler = newSession?.let { session ->
+                    if (session.actualSampleRate != effectiveSampleRate) {
+                        WavFileTools.PcmResampler(
+                            srcSampleRate = session.actualSampleRate,
+                            targetSampleRate = effectiveSampleRate,
+                            channels = effectiveChannels
+                        )
+                    } else null
+                }
+                return newSession
             }
 
             val isAacSession = outputFile.extension.equals("m4a", ignoreCase = true) ||
                 outputFile.extension.equals("aac", ignoreCase = true)
-            val rawShorts = ((effectiveSampleRate * effectiveChannels) / 20).coerceAtLeast(1024) // ~50ms frame
-            val chunkShorts = rawShorts - (rawShorts % effectiveChannels.coerceAtLeast(1))
-            val shortBuffer = ShortArray(chunkShorts)
-            val byteBuffer = ByteBuffer.allocate(chunkShorts * 2).order(ByteOrder.LITTLE_ENDIAN)
+            val fallbackChunkShorts = (((effectiveSampleRate * effectiveChannels) / 20).coerceAtLeast(1024)).let {
+                it - (it % effectiveChannels.coerceAtLeast(1))
+            }
+            var shortBuffer = ShortArray(captureSession?.chunkShorts ?: fallbackChunkShorts)
             var totalBytesWritten = 0L
             var consecutiveReadFailures = 0
+
+            fun convertCapturedShortsToTargetPcmBytes(readShorts: Int): ByteArray {
+                val hwChannels = (captureSession?.actualChannels ?: effectiveChannels).coerceIn(1, 2)
+                val alignedShorts = (readShorts - (readShorts % hwChannels)).coerceAtLeast(0)
+                if (alignedShorts <= 0) return ByteArray(0)
+
+                val rawBytes = ByteArray(alignedShorts * 2)
+                ByteBuffer.wrap(rawBytes).order(ByteOrder.LITTLE_ENDIAN).asShortBuffer().put(shortBuffer, 0, alignedShorts)
+
+                val channelMatched = if (hwChannels != effectiveChannels) {
+                    WavFileTools.convertPcmChannels(rawBytes, hwChannels, effectiveChannels)
+                } else {
+                    rawBytes
+                }
+                val resampled = activeResampler?.resampleChunk(channelMatched) ?: channelMatched
+                val blockAlign = (effectiveChannels * 2).coerceAtLeast(2)
+                val validLen = resampled.size - (resampled.size % blockAlign)
+                return if (validLen == resampled.size) resampled else resampled.copyOf(validLen.coerceAtLeast(0))
+            }
 
             try {
                 if (isAacSession) {
@@ -829,8 +923,8 @@ class AudioStudioEngine(private val context: Context) {
                         sampleRate = effectiveSampleRate,
                         channelCount = effectiveChannels,
                         bitrate = 128_000,
-                        baseStartSamples = baseM4aMeta?.totalDurationSamples ?: 0L,
-                        skipPrimingFrame = baseM4aForAppend != null
+                        baseStartSamples = 0L,
+                        skipPrimingFrame = false
                     )
                     aacEncoder.start(rawAacTemp)
 
@@ -843,35 +937,53 @@ class AudioStudioEngine(private val context: Context) {
                             }
 
                             if (needsAudioRecordRebind.getAndSet(false)) {
-                                audioRecord = rebindAudioRecordSeamlessly()
+                                captureSession = rebindAudioRecordSeamlessly()
+                                val reqShorts = captureSession?.chunkShorts ?: fallbackChunkShorts
+                                if (shortBuffer.size < reqShorts) shortBuffer = ShortArray(reqShorts)
                                 consecutiveReadFailures = 0
+                            }
+
+                            val currentRecord = captureSession?.audioRecord
+                            val targetReadShorts = captureSession?.chunkShorts ?: fallbackChunkShorts
+                            if (shortBuffer.size < targetReadShorts) {
+                                shortBuffer = ShortArray(targetReadShorts)
                             }
 
                             var readSamples = 0
                             try {
-                                if (audioRecord != null && audioRecord.recordingState == AudioRecord.RECORDSTATE_RECORDING) {
-                                    readSamples = audioRecord.read(shortBuffer, 0, chunkShorts)
+                                if (currentRecord != null && currentRecord.recordingState == AudioRecord.RECORDSTATE_RECORDING) {
+                                    readSamples = currentRecord.read(shortBuffer, 0, targetReadShorts)
                                 }
                             } catch (_: Exception) {
                                 readSamples = -1
                             }
 
+                            if (!_isRecording.value) break
+                            if (_isPaused.value) continue
+
                             if (readSamples <= 0) {
-                                if (!_isRecording.value && totalBytesWritten > 0L) break
                                 consecutiveReadFailures++
-                                if (!isRobolectricRuntime && (readSamples < 0 || consecutiveReadFailures >= 6)) {
-                                    audioRecord = rebindAudioRecordSeamlessly()
-                                    consecutiveReadFailures = 0
+                                if (!isRobolectricRuntime) {
+                                    if (readSamples < 0 || consecutiveReadFailures >= 6) {
+                                        captureSession = rebindAudioRecordSeamlessly()
+                                        consecutiveReadFailures = 0
+                                    }
+                                    delay(25L)
+                                    continue
+                                } else {
+                                    readSamples = targetReadShorts
+                                    shortBuffer.fill(0)
+                                    delay(48L)
                                 }
-                                readSamples = chunkShorts
-                                shortBuffer.fill(0)
-                                delay(48L)
                             } else {
                                 consecutiveReadFailures = 0
                             }
 
-                            aacEncoder.encodePcmSamples(shortBuffer, readSamples)
-                            totalBytesWritten += (readSamples * 2)
+                            val targetPcmBytes = convertCapturedShortsToTargetPcmBytes(readSamples)
+                            if (targetPcmBytes.isNotEmpty()) {
+                                aacEncoder.encodePcmBytes(targetPcmBytes, targetPcmBytes.size)
+                                totalBytesWritten += targetPcmBytes.size.toLong()
+                            }
 
                             val (db, normPeak) = WavFileTools.calculateRmsAndPeak(shortBuffer, readSamples)
                             _liveDb.value = db
@@ -899,41 +1011,54 @@ class AudioStudioEngine(private val context: Context) {
                             }
 
                             if (needsAudioRecordRebind.getAndSet(false)) {
-                                audioRecord = rebindAudioRecordSeamlessly()
+                                captureSession = rebindAudioRecordSeamlessly()
+                                val reqShorts = captureSession?.chunkShorts ?: fallbackChunkShorts
+                                if (shortBuffer.size < reqShorts) shortBuffer = ShortArray(reqShorts)
                                 consecutiveReadFailures = 0
+                            }
+
+                            val currentRecord = captureSession?.audioRecord
+                            val targetReadShorts = captureSession?.chunkShorts ?: fallbackChunkShorts
+                            if (shortBuffer.size < targetReadShorts) {
+                                shortBuffer = ShortArray(targetReadShorts)
                             }
 
                             var readSamples = 0
                             try {
-                                if (audioRecord != null && audioRecord.recordingState == AudioRecord.RECORDSTATE_RECORDING) {
-                                    readSamples = audioRecord.read(shortBuffer, 0, chunkShorts)
+                                if (currentRecord != null && currentRecord.recordingState == AudioRecord.RECORDSTATE_RECORDING) {
+                                    readSamples = currentRecord.read(shortBuffer, 0, targetReadShorts)
                                 }
                             } catch (_: Exception) {
                                 readSamples = -1
                             }
 
+                            if (!_isRecording.value) break
+                            if (_isPaused.value) continue
+
                             if (readSamples <= 0) {
-                                if (!_isRecording.value && totalBytesWritten > 0L) break
                                 consecutiveReadFailures++
-                                if (!isRobolectricRuntime && (readSamples < 0 || consecutiveReadFailures >= 6)) {
-                                    audioRecord = rebindAudioRecordSeamlessly()
-                                    consecutiveReadFailures = 0
+                                if (!isRobolectricRuntime) {
+                                    if (readSamples < 0 || consecutiveReadFailures >= 6) {
+                                        captureSession = rebindAudioRecordSeamlessly()
+                                        consecutiveReadFailures = 0
+                                    }
+                                    delay(25L)
+                                    continue
+                                } else {
+                                    readSamples = targetReadShorts
+                                    shortBuffer.fill(0)
+                                    delay(48L)
                                 }
-                                readSamples = chunkShorts
-                                shortBuffer.fill(0)
-                                delay(48L)
                             } else {
                                 consecutiveReadFailures = 0
                             }
 
-                            // Write PCM bytes to disk untouched (100% original audio preserved — never cut)
-                            byteBuffer.clear()
-                            for (i in 0 until readSamples) {
-                                byteBuffer.putShort(shortBuffer[i])
+                            // Write PCM bytes to disk matched to effectiveSampleRate & effectiveChannels
+                            val targetPcmBytes = convertCapturedShortsToTargetPcmBytes(readSamples)
+                            if (targetPcmBytes.isNotEmpty()) {
+                                fos.write(targetPcmBytes, 0, targetPcmBytes.size)
+                                totalBytesWritten += targetPcmBytes.size.toLong()
                             }
-                            val bytesCount = readSamples * 2
-                            fos.write(byteBuffer.array(), 0, bytesCount)
-                            totalBytesWritten += bytesCount
 
                             // Compute RMS dB & peak (read-only)
                             val (db, normPeak) = WavFileTools.calculateRmsAndPeak(shortBuffer, readSamples)
@@ -954,10 +1079,10 @@ class AudioStudioEngine(private val context: Context) {
                 }
             } finally {
                 try {
-                    audioRecord?.stop()
+                    captureSession?.audioRecord?.stop()
                 } catch (_: Exception) {}
                 try {
-                    audioRecord?.release()
+                    captureSession?.audioRecord?.release()
                 } catch (_: Exception) {}
                 activeAudioRecord = null
             }

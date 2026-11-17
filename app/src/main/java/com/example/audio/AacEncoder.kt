@@ -62,15 +62,39 @@ class AacEncoder(
             if (!canEncodeWithParameters(metadata.sampleRate, metadata.channelCount, metadata.aacObjectType)) {
                 return null
             }
+            val safeBitrate = clampBitrateForAacLc(
+                rawBitrate = targetBitrate,
+                sampleRate = metadata.sampleRate,
+                channelCount = metadata.channelCount
+            )
             val encoder = AacEncoder(
                 sampleRate = metadata.sampleRate,
                 channelCount = metadata.channelCount,
-                bitrate = targetBitrate,
+                bitrate = safeBitrate,
                 aacProfile = metadata.aacObjectType,
                 baseStartSamples = metadata.totalDurationSamples,
                 skipPrimingFrame = true
             )
             return encoder to metadata
+        }
+
+        /**
+         * Normalizes and clamps [rawBitrate] (handling accidental kbps or 1000x-multiplied bps values)
+         * into the valid AAC-LC bitrate range supported by Android's FDK-AAC / hardware MediaCodec
+         * for the given [sampleRate] and [channelCount] (including 8 kHz / 16 kHz Bluetooth SCO rates).
+         */
+        fun clampBitrateForAacLc(rawBitrate: Int, sampleRate: Int, channelCount: Int): Int {
+            val normalized = when {
+                rawBitrate <= 0 -> 128_000
+                rawBitrate in 1..1000 -> rawBitrate * 1000
+                rawBitrate > 1_000_000 && (rawBitrate / 1000) in 16_000..320_000 -> rawBitrate / 1000
+                else -> rawBitrate
+            }
+            val safeRate = sampleRate.coerceIn(8000, 48000)
+            val safeChannels = channelCount.coerceIn(1, 2)
+            val minBitrate = (safeRate * safeChannels / 2).coerceIn(16_000, 64_000)
+            val maxBitrate = (safeRate * safeChannels * 5).coerceIn(32_000, 320_000)
+            return normalized.coerceIn(minBitrate, maxBitrate)
         }
 
         fun isJvmOrRobolectricTest(): Boolean {
@@ -120,7 +144,7 @@ class AacEncoder(
     private var pcmCarryCount = 0
 
     val currentCumulativePtsUs: Long
-        get() = computePresentationTimeUs(baseStartSamples + submittedPcmSamples) + cumulativePtsOffsetUs
+        get() = computePresentationTimeUs(submittedPcmSamples) + cumulativePtsOffsetUs
 
     val lastPresentationTimeUs: Long
         get() = lastQueuedPtsUs
@@ -156,22 +180,36 @@ class AacEncoder(
         pcmCarryCount = 0
 
         if (!isJvmOrRobolectricTest()) {
-            try {
-                val format = MediaFormat.createAudioFormat(
-                    MediaFormat.MIMETYPE_AUDIO_AAC,
-                    sampleRate,
-                    channelCount
-                ).apply {
-                    setInteger(MediaFormat.KEY_AAC_PROFILE, aacProfile)
-                    setInteger(MediaFormat.KEY_BIT_RATE, bitrate)
-                    setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, 16384)
+            val safeBitrate = clampBitrateForAacLc(bitrate, sampleRate, channelCount)
+            val fallbackBitrate = (sampleRate.coerceIn(8000, 48000) * channelCount.coerceIn(1, 2) * 3)
+                .coerceIn(24_000, 128_000)
+            val candidateBitrates = listOf(safeBitrate, fallbackBitrate, 64_000).distinct()
+            var configuredCodec: MediaCodec? = null
+            for (candidateRate in candidateBitrates) {
+                var codec: MediaCodec? = null
+                try {
+                    val format = MediaFormat.createAudioFormat(
+                        MediaFormat.MIMETYPE_AUDIO_AAC,
+                        sampleRate,
+                        channelCount
+                    ).apply {
+                        setInteger(MediaFormat.KEY_AAC_PROFILE, aacProfile)
+                        setInteger(MediaFormat.KEY_BIT_RATE, candidateRate)
+                        setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, 16384)
+                    }
+                    codec = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_AUDIO_AAC)
+                    codec.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+                    codec.start()
+                    configuredCodec = codec
+                    break
+                } catch (_: Exception) {
+                    try { codec?.release() } catch (_: Exception) {}
                 }
-                val codec = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_AUDIO_AAC)
-                codec.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
-                codec.start()
-                mediaCodec = codec
+            }
+            if (configuredCodec != null) {
+                mediaCodec = configuredCodec
                 useFallbackPacketizer = false
-            } catch (_: Exception) {
+            } else {
                 mediaCodec = null
                 useFallbackPacketizer = true
             }
@@ -182,8 +220,7 @@ class AacEncoder(
     }
 
     /**
-     * Feeds 16-bit little-endian PCM samples into the AAC encoder in 1024-sample frame increments,
-     * sequencing presentation timestamps (`PTS`) starting from [baseStartSamples].
+     * Feeds 16-bit little-endian PCM samples into the AAC encoder in 1024-sample frame increments.
      */
     fun encodePcmSamples(shortBuffer: ShortArray, sampleCount: Int) {
         if (!isStarted || sampleCount <= 0) return
@@ -218,7 +255,7 @@ class AacEncoder(
     }
 
     private fun submitOnePcmFrame(frameBytes: ByteArray, byteLength: Int) {
-        val rawPtsUs = computePresentationTimeUs(baseStartSamples + submittedPcmSamples) + cumulativePtsOffsetUs
+        val rawPtsUs = computePresentationTimeUs(submittedPcmSamples) + cumulativePtsOffsetUs
         val monotonicPtsUs = if (rawPtsUs <= lastQueuedPtsUs) lastQueuedPtsUs + 1L else rawPtsUs
         lastQueuedPtsUs = monotonicPtsUs
 
@@ -256,6 +293,22 @@ class AacEncoder(
         return (totalSamplesAtFrameStart * 1_000_000L) / safeRate
     }
 
+    private fun updateCodecConfigIfNeeded(candidateAsc: ByteArray) {
+        if (candidateAsc.size < 2) return
+        val canonicalAsc = Mp4BoxParser.buildAudioSpecificConfig(
+            audioObjectType = aacProfile,
+            sampleRate = sampleRate,
+            channelCount = channelCount
+        )
+        // Keep the canonical 2-byte AudioSpecificConfig when the core 2-byte header matches,
+        // avoiding spurious 5-byte SBR sync-extension length mismatches during lossless M4A append.
+        codecConfigBytes = if (candidateAsc[0] == canonicalAsc[0] && candidateAsc[1] == canonicalAsc[1]) {
+            canonicalAsc
+        } else {
+            candidateAsc.copyOfRange(0, 2)
+        }
+    }
+
     private fun drainEncoderOutput(eos: Boolean) {
         val codec = mediaCodec ?: return
         val outStream = rawOutputStream ?: return
@@ -267,7 +320,7 @@ class AacEncoder(
             while (!eosQueued && eosRetries < 40) {
                 val inputIndex = codec.dequeueInputBuffer(10_000L)
                 if (inputIndex >= 0) {
-                    val rawPtsUs = computePresentationTimeUs(baseStartSamples + submittedPcmSamples) + cumulativePtsOffsetUs
+                    val rawPtsUs = computePresentationTimeUs(submittedPcmSamples) + cumulativePtsOffsetUs
                     val eosPtsUs = if (rawPtsUs <= lastQueuedPtsUs) lastQueuedPtsUs + 1L else rawPtsUs
                     codec.queueInputBuffer(
                         inputIndex,
@@ -296,11 +349,11 @@ class AacEncoder(
                 if (isStreamEos) break
             } else if (outIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
                 val newFormat = codec.outputFormat
-                val csd0 = newFormat.getByteBuffer("csd-0")
+                val csd0 = newFormat.getByteBuffer("csd-0")?.duplicate()
                 if (csd0 != null && csd0.remaining() >= 2) {
                     val cfg = ByteArray(csd0.remaining())
                     csd0.get(cfg)
-                    codecConfigBytes = cfg
+                    updateCodecConfigIfNeeded(cfg)
                 }
             } else if (outIndex == MediaCodec.INFO_TRY_AGAIN_LATER) {
                 if (!eos) break
@@ -328,7 +381,7 @@ class AacEncoder(
                 outBuf.limit(bufferInfo.offset + bufferInfo.size)
                 val cfg = ByteArray(bufferInfo.size)
                 outBuf.get(cfg)
-                codecConfigBytes = cfg
+                updateCodecConfigIfNeeded(cfg)
             }
         } else if (outBuf != null && bufferInfo.size > 0) {
             outBuf.position(bufferInfo.offset)
@@ -557,7 +610,9 @@ class AacEncoder(
     }
 
     /**
-     * Convenience helper that encodes a 16-bit PCM WAV file into an [EncodedAacSegment] or standalone `.m4a`.
+     * Convenience helper that encodes a 16-bit PCM WAV file into an [EncodedAacSegment],
+     * automatically converting channels and resampling if the WAV header differs from
+     * this encoder's target [sampleRate] or [channelCount].
      */
     fun encodeWavFileToSegment(
         wavFile: File,
@@ -566,24 +621,60 @@ class AacEncoder(
     ): EncodedAacSegment? {
         if (!wavFile.exists() || wavFile.length() <= 44L) return null
         return try {
-            val pcmOffset = if (WavFileTools.isRiffWaveFile(wavFile)) {
-                WavFileTools.locatePcmDataOffset(wavFile)
+            val isRiff = WavFileTools.isRiffWaveFile(wavFile)
+            val wavHeader = if (isRiff) {
+                WavFileTools.readWavHeaderInfo(wavFile, sampleRate, channelCount, 16)
             } else {
-                0L
+                WavHeaderInfo(
+                    sampleRate = sampleRate,
+                    channels = channelCount,
+                    bitsPerSample = 16,
+                    bytesPerSample = 2,
+                    blockAlign = channelCount * 2,
+                    pcmDataBytes = wavFile.length()
+                )
             }
-            val totalPcmBytes = (wavFile.length() - pcmOffset).coerceAtLeast(0L)
+            val srcChannels = wavHeader.channels.coerceIn(1, 2)
+            val srcRate = wavHeader.sampleRate.coerceIn(8000, 192000)
+            val srcBlockAlign = (srcChannels * 2).coerceAtLeast(2)
+
+            val (pcmOffset, boundedPcmBytes) = if (isRiff) {
+                WavFileTools.locatePcmDataChunkBounds(wavFile, srcBlockAlign)
+            } else {
+                0L to ((wavFile.length() / srcBlockAlign) * srcBlockAlign)
+            }
+            val totalPcmBytes = boundedPcmBytes.coerceAtLeast(0L)
             if (totalPcmBytes <= 0L) return null
+
+            val resampler = if (srcRate != sampleRate) {
+                WavFileTools.PcmResampler(srcRate, sampleRate, channelCount)
+            } else null
 
             start(rawAacOutputFile)
             RandomAccessFile(wavFile, "r").use { raf ->
                 raf.seek(pcmOffset)
-                val buf = ByteArray(16384)
+                val alignedBufSize = 16384 - (16384 % srcBlockAlign)
+                val buf = ByteArray(alignedBufSize)
+                var remaining = totalPcmBytes
                 var readTotal = 0L
-                while (true) {
-                    val r = raf.read(buf)
+                while (remaining > 0L) {
+                    val toRead = minOf(buf.size.toLong(), remaining).toInt()
+                    val r = raf.read(buf, 0, toRead)
                     if (r <= 0) break
-                    encodePcmBytes(buf, r)
-                    readTotal += r
+                    val alignedRead = r - (r % srcBlockAlign)
+                    if (alignedRead <= 0) break
+                    val rawChunk = if (alignedRead == buf.size) buf else buf.copyOf(alignedRead)
+                    val chConverted = if (srcChannels != channelCount) {
+                        WavFileTools.convertPcmChannels(rawChunk, srcChannels, channelCount)
+                    } else {
+                        rawChunk
+                    }
+                    val finalChunk = resampler?.resampleChunk(chConverted) ?: chConverted
+                    if (finalChunk.isNotEmpty()) {
+                        encodePcmBytes(finalChunk, finalChunk.size)
+                    }
+                    remaining -= alignedRead.toLong()
+                    readTotal += alignedRead.toLong()
                     onProgress?.invoke((readTotal.toFloat() / totalPcmBytes.toFloat()).coerceIn(0f, 1f))
                 }
             }

@@ -1920,7 +1920,127 @@ class ExampleRobolectricTest {
         org.junit.Assert.assertNotNull(sourceDb1)
         org.junit.Assert.assertNotNull(sourceDb2)
     }
+
+    @Test
+    fun `verify end-to-end Continue Recording and Confirm Save merges old and new audio for both WAV and M4A`() = runBlocking {
+        val app = ApplicationProvider.getApplicationContext<android.app.Application>()
+        val vm = com.example.viewmodel.RecorderViewModel(app)
+        val database = com.example.data.AppDatabase.getInstance(app)
+        val dao = database.recordingDao()
+        val recDir = vm.repository.getRecordingsDir().apply { mkdirs() }
+
+        // 1. Test continuing an existing M4A recording end-to-end through RecorderViewModel
+        val baseM4aFile = File(recDir, "existing_m4a_lecture.m4a")
+        val rawAac = File(recDir, "existing_m4a_lecture.raw.aac")
+        val initEncoder = com.example.audio.AacEncoder(sampleRate = 44100, channelCount = 1, bitrate = 192_000)
+        initEncoder.start(rawAac)
+        val twoSecShorts = ShortArray(44100 * 2) { idx -> ((idx % 100) * 120).toShort() }
+        initEncoder.encodePcmSamples(twoSecShorts, twoSecShorts.size)
+        val initSeg = initEncoder.finish()
+        assertTrue(initEncoder.writeStandaloneM4aFile(initSeg, baseM4aFile))
+        rawAac.delete()
+
+        val initialM4aMeta = com.example.audio.Mp4BoxParser.parseM4a(baseM4aFile)!!
+        val initialM4aDurationMs = initialM4aMeta.durationMs
+        val initialM4aSize = baseM4aFile.length()
+        assertTrue(initialM4aDurationMs >= 1900L)
+
+        val m4aEntityId = dao.insertRecording(
+            com.example.data.RecordingEntity(
+                title = "M4A Studio Session",
+                filePath = baseM4aFile.absolutePath,
+                durationMs = initialM4aDurationMs,
+                format = "M4A",
+                sampleRate = 44100,
+                bitDepth = 16,
+                channels = 1,
+                bitrate = 192_000,
+                sizeBytes = initialM4aSize,
+                waveformPeaks = "0.3,0.6,0.4",
+                storageLocation = com.example.data.StorageDestination.LOCAL.id
+            )
+        )
+        val savedM4aEntity = dao.getRecordingById(m4aEntityId)!!
+
+        // Start continuation recording on the M4A item
+        vm.startContinueRecordingFlow(savedM4aEntity)
+        vm.startRecording()
+        kotlinx.coroutines.delay(250)
+        org.robolectric.Shadows.shadowOf(android.os.Looper.getMainLooper()).idle()
+
+        // Confirm & merge continuation
+        vm.confirmAppendAndMergeRecording("M4A Studio Session")
+        for (i in 0 until 20) {
+            kotlinx.coroutines.delay(50)
+            org.robolectric.Shadows.shadowOf(android.os.Looper.getMainLooper()).idle()
+            if (vm.mergeProgress.value == null && (dao.getRecordingById(m4aEntityId)?.appendedCount ?: 0) >= 1) {
+                break
+            }
+        }
+
+        val updatedM4aEntity = dao.getRecordingById(m4aEntityId)!!
+        assertEquals(1, updatedM4aEntity.appendedCount)
+        assertTrue(
+            "Updated M4A duration (${updatedM4aEntity.durationMs}ms) must be strictly greater than original (${initialM4aDurationMs}ms)",
+            updatedM4aEntity.durationMs > initialM4aDurationMs
+        )
+        val mergedM4aMeta = com.example.audio.Mp4BoxParser.parseM4a(File(updatedM4aEntity.filePath))
+        org.junit.Assert.assertNotNull("Merged M4A file must remain a valid, uncorrupted M4A container", mergedM4aMeta)
+        assertTrue(mergedM4aMeta!!.isSampleTableConsistent())
+        assertTrue(
+            "Merged M4A sample count (${mergedM4aMeta.sampleSizes.size}) must exceed original (${initialM4aMeta.sampleSizes.size})",
+            mergedM4aMeta.sampleSizes.size > initialM4aMeta.sampleSizes.size
+        )
+
+        // 2. Test continuing an existing WAV recording end-to-end through RecorderViewModel
+        val baseWavFile = File(recDir, "existing_wav_lecture.wav")
+        WavFileTools.createStudioSampleAudioFile(baseWavFile, durationSeconds = 2, sampleRate = 44100)
+        val initialWavSize = baseWavFile.length()
+
+        val wavEntityId = dao.insertRecording(
+            com.example.data.RecordingEntity(
+                title = "WAV Studio Session",
+                filePath = baseWavFile.absolutePath,
+                durationMs = 2000L,
+                format = "WAV",
+                sampleRate = 44100,
+                bitDepth = 16,
+                channels = 1,
+                bitrate = 705_600,
+                sizeBytes = initialWavSize,
+                waveformPeaks = "0.4,0.5,0.7",
+                storageLocation = com.example.data.StorageDestination.LOCAL.id
+            )
+        )
+        val savedWavEntity = dao.getRecordingById(wavEntityId)!!
+
+        vm.startContinueRecordingFlow(savedWavEntity)
+        vm.startRecording()
+        kotlinx.coroutines.delay(250)
+        org.robolectric.Shadows.shadowOf(android.os.Looper.getMainLooper()).idle()
+
+        vm.confirmAppendAndMergeRecording("WAV Studio Session")
+        for (i in 0 until 20) {
+            kotlinx.coroutines.delay(50)
+            org.robolectric.Shadows.shadowOf(android.os.Looper.getMainLooper()).idle()
+            if (vm.mergeProgress.value == null && (dao.getRecordingById(wavEntityId)?.appendedCount ?: 0) >= 1) {
+                break
+            }
+        }
+
+        val updatedWavEntity = dao.getRecordingById(wavEntityId)!!
+        assertEquals(1, updatedWavEntity.appendedCount)
+        assertTrue(
+            "Updated WAV duration (${updatedWavEntity.durationMs}ms) must exceed original (2000ms)",
+            updatedWavEntity.durationMs > 2000L
+        )
+        assertTrue(
+            "Updated WAV file size (${File(updatedWavEntity.filePath).length()}) must exceed original ($initialWavSize)",
+            File(updatedWavEntity.filePath).length() > initialWavSize
+        )
+    }
 }
+
 
 
 

@@ -389,6 +389,102 @@ class Mp4AppenderTest {
             meta.durationMs in 3900L..4100L
         )
     }
+
+    @Test
+    fun `appendAudioFilesUniversal merges M4A and WAV continuations across Phone Mic and Bluetooth SCO sample rates`() {
+        // 1. Base M4A recorded via Phone Mic (44100 Hz Mono, ~2 seconds)
+        val baseM4a = File(tempDir, "phone_base.m4a")
+        createSampleM4aFile(baseM4a, sampleRate = 44100, channels = 1, frameCount = 86, moovBeforeMdat = false)
+        val baseMetaBefore = Mp4BoxParser.parseM4a(baseM4a)!!
+        assertEquals(86, baseMetaBefore.sampleSizes.size)
+
+        // Continuation #1 recorded via Bluetooth SCO Mic (16000 Hz Mono WAV, 2 seconds)
+        val btContinuationWav = File(tempDir, "append_segment_bt.wav")
+        WavFileTools.createStudioSampleAudioFile(
+            outputFile = btContinuationWav,
+            durationSeconds = 2,
+            sampleRate = 16000
+        )
+
+        // Also pass a 1000x-multiplied bitrate (192_000_000) to verify clampBitrateForAacLc protection
+        val appendRes1 = WavFileTools.appendAudioFilesUniversal(
+            originalFile = baseM4a,
+            appendedPcmFile = btContinuationWav,
+            sampleRate = 44100,
+            channels = 1,
+            bitsPerSample = 16,
+            targetBitrate = 192_000 * 1000
+        )
+        assertTrue("M4A + 16kHz Bluetooth WAV continuation must succeed", appendRes1.success)
+        assertEquals("M4A", appendRes1.format)
+
+        val metaAfter1 = Mp4BoxParser.parseM4a(baseM4a)
+        assertNotNull(metaAfter1)
+        metaAfter1!!
+        assertTrue(metaAfter1.isSampleTableConsistent())
+        assertTrue(metaAfter1.areAllChunksInsideMdat())
+        // 86 original frames + ~85 resampled frames from 2s @ 16kHz->44.1kHz = ~171 frames (~3970ms)
+        assertTrue(
+            "Merged M4A must include both original and Bluetooth continuation frames (got ${metaAfter1.sampleSizes.size})",
+            metaAfter1.sampleSizes.size >= 165
+        )
+        assertTrue(
+            "Merged M4A duration (${metaAfter1.durationMs}ms) must reflect combined ~4 seconds",
+            metaAfter1.durationMs in 3800L..4200L
+        )
+
+        // Continuation #2 on the same M4A via Phone Mic (48000 Hz WAV, 1 second)
+        val phoneContinuationWav = File(tempDir, "append_segment_phone2.wav")
+        WavFileTools.createStudioSampleAudioFile(
+            outputFile = phoneContinuationWav,
+            durationSeconds = 1,
+            sampleRate = 48000
+        )
+        val appendRes2 = WavFileTools.appendAudioFilesUniversal(
+            originalFile = baseM4a,
+            appendedPcmFile = phoneContinuationWav,
+            sampleRate = 44100,
+            channels = 1,
+            bitsPerSample = 16,
+            targetBitrate = 192_000
+        )
+        assertTrue("Second M4A continuation must succeed", appendRes2.success)
+        val metaAfter2 = Mp4BoxParser.parseM4a(baseM4a)!!
+        assertTrue(metaAfter2.isSampleTableConsistent())
+        assertTrue(
+            "After second continuation, total duration (${metaAfter2.durationMs}ms) must be ~5 seconds",
+            metaAfter2.durationMs in 4700L..5300L
+        )
+
+        // 2. WAV base recording (44100 Hz Mono, 2 seconds) continued with 16000 Hz Bluetooth WAV (2 seconds)
+        val baseWav = File(tempDir, "phone_base.wav")
+        WavFileTools.createStudioSampleAudioFile(outputFile = baseWav, durationSeconds = 2, sampleRate = 44100)
+        val btWavSeg = File(tempDir, "bt_seg.wav")
+        WavFileTools.createStudioSampleAudioFile(outputFile = btWavSeg, durationSeconds = 2, sampleRate = 16000)
+
+        val wavAppendRes = WavFileTools.appendAudioFilesUniversal(
+            originalFile = baseWav,
+            appendedPcmFile = btWavSeg,
+            sampleRate = 44100,
+            channels = 1,
+            bitsPerSample = 16
+        )
+        assertTrue("WAV + 16kHz Bluetooth WAV continuation must succeed", wavAppendRes.success)
+        val mergedWavHeader = WavFileTools.readWavHeaderInfo(baseWav)
+        assertEquals(44100, mergedWavHeader.sampleRate)
+        assertEquals(1, mergedWavHeader.channels)
+        assertTrue(
+            "Merged WAV duration (${wavAppendRes.durationMs}ms) must reflect combined 4 seconds",
+            wavAppendRes.durationMs in 3900L..4100L
+        )
+
+        // 3. Verify clampBitrateForAacLc stays within hardware bounds for 8kHz, 16kHz, 44.1kHz, and 48kHz
+        assertEquals(40_000, AacEncoder.clampBitrateForAacLc(192_000, 8000, 1))
+        assertEquals(80_000, AacEncoder.clampBitrateForAacLc(192_000, 16000, 1))
+        assertEquals(192_000, AacEncoder.clampBitrateForAacLc(192_000_000, 44100, 1))
+        assertEquals(192_000, AacEncoder.clampBitrateForAacLc(192, 48000, 2))
+    }
 }
+
 
 

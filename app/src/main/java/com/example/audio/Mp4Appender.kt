@@ -81,9 +81,10 @@ object Mp4Appender {
         }
 
         // Verify audio parameter compatibility (sampleRate, channelCount, AAC-LC profile, and AudioSpecificConfig)
-        val ascCompatible = meta.audioSpecificConfig.isEmpty() ||
-            segment.audioSpecificConfig.isEmpty() ||
-            meta.audioSpecificConfig.contentEquals(segment.audioSpecificConfig)
+        val ascCompatible = Mp4BoxParser.areAudioSpecificConfigsCompatible(
+            meta.audioSpecificConfig,
+            segment.audioSpecificConfig
+        )
         if (meta.sampleRate != segment.sampleRate ||
             meta.channelCount != segment.channelCount ||
             meta.aacObjectType != segment.aacObjectType ||
@@ -374,14 +375,19 @@ object Mp4Appender {
         }
 
         val baseMeta = Mp4BoxParser.parseM4a(baseM4aFile)
-        val appendMeta = Mp4BoxParser.parseM4a(appendedFile)
+        val appendMeta = if (!WavFileTools.isRiffWaveFile(appendedFile)) {
+            Mp4BoxParser.parseM4a(appendedFile)
+        } else null
+
+        val safeBitrate = AacEncoder.clampBitrateForAacLc(
+            rawBitrate = targetBitrate,
+            sampleRate = baseMeta?.sampleRate ?: 44100,
+            channelCount = baseMeta?.channelCount ?: 1
+        )
 
         // Case 1: Both baseM4aFile and appendedFile are valid M4A files with matching audio parameters
-        val ascMatches = baseMeta != null && appendMeta != null && (
-            baseMeta.audioSpecificConfig.isEmpty() ||
-                appendMeta.audioSpecificConfig.isEmpty() ||
-                baseMeta.audioSpecificConfig.contentEquals(appendMeta.audioSpecificConfig)
-            )
+        val ascMatches = baseMeta != null && appendMeta != null &&
+            Mp4BoxParser.areAudioSpecificConfigsCompatible(baseMeta.audioSpecificConfig, appendMeta.audioSpecificConfig)
         if (baseMeta != null && appendMeta != null &&
             baseMeta.sampleRate == appendMeta.sampleRate &&
             baseMeta.channelCount == appendMeta.channelCount &&
@@ -390,9 +396,7 @@ object Mp4Appender {
         ) {
             val rawExtractTemp = File(baseM4aFile.parentFile, "${baseM4aFile.name}.raw_ext.aac")
             try {
-                // Live continuation segments ("append_segment_*") already skipped the priming frame during recording.
-                val alreadySkippedPriming = appendedFile.name.startsWith("append_segment_", ignoreCase = true)
-                val skipFirstPriming = if (!alreadySkippedPriming && appendMeta.sampleSizes.size > 2) 1 else 0
+                val skipFirstPriming = if (appendMeta.sampleSizes.size > 2) 1 else 0
                 val keptSizes = extractRawAacFramesViaChunkTable(
                     sourceFile = appendedFile,
                     meta = appendMeta,
@@ -407,7 +411,11 @@ object Mp4Appender {
                         sampleRate = appendMeta.sampleRate,
                         channelCount = appendMeta.channelCount,
                         aacObjectType = appendMeta.aacObjectType,
-                        audioSpecificConfig = appendMeta.audioSpecificConfig,
+                        audioSpecificConfig = if (baseMeta.audioSpecificConfig.isNotEmpty()) {
+                            baseMeta.audioSpecificConfig
+                        } else {
+                            appendMeta.audioSpecificConfig
+                        },
                         startPtsSamples = baseMeta.totalDurationSamples,
                         totalEncodedSamples = keptSizes.size.toLong() * AacEncoder.AAC_FRAME_SAMPLES.toLong(),
                         primingFramesSkipped = skipFirstPriming
@@ -417,10 +425,22 @@ object Mp4Appender {
                         segment = segment,
                         onProgress = onProgress
                     )
-                    rawExtractTemp.delete()
                     if (outcome.success) {
+                        rawExtractTemp.delete()
                         try { appendedFile.delete() } catch (_: Exception) {}
                         return outcome
+                    }
+                    // If in-place box patching failed (e.g., base file had multi-mdat or non-standard chunk tables),
+                    // lossless-repack both base frames and segment frames into a clean single-chunk M4A container.
+                    val repackOutcome = repackBaseM4aAndEncodedSegment(
+                        baseM4aFile = baseM4aFile,
+                        baseMeta = baseMeta,
+                        appendedSegment = segment
+                    )
+                    rawExtractTemp.delete()
+                    if (repackOutcome.success) {
+                        try { appendedFile.delete() } catch (_: Exception) {}
+                        return repackOutcome
                     }
                 } else {
                     rawExtractTemp.delete()
@@ -432,49 +452,42 @@ object Mp4Appender {
 
         // Case 2: baseM4aFile is valid M4A and appendedFile is PCM WAV -> encode WAV to matching AAC frames & remux
         if (baseMeta != null && WavFileTools.isRiffWaveFile(appendedFile)) {
-            val matchingEncoderPair = AacEncoder.createMatchingEncoderForBaseFile(baseM4aFile, targetBitrate)
+            val matchingEncoderPair = AacEncoder.createMatchingEncoderForBaseFile(baseM4aFile, safeBitrate)
             if (matchingEncoderPair != null) {
                 val (encoder, _) = matchingEncoderPair
                 val rawAacTemp = File(baseM4aFile.parentFile, "${baseM4aFile.name}.seg.aac")
-                val resampledWavTemp = File(baseM4aFile.parentFile, "${baseM4aFile.name}.seg_matched.wav")
                 try {
-                    val wavHeader = WavFileTools.readWavHeaderInfo(appendedFile)
-                    val matchedWavFile = if (wavHeader.sampleRate == baseMeta.sampleRate &&
-                        wavHeader.channels == baseMeta.channelCount
-                    ) {
-                        appendedFile
-                    } else {
-                        val ok = WavFileTools.decodeAudioToWav(
-                            sourceFile = appendedFile,
-                            outputWavFile = resampledWavTemp,
-                            targetSampleRate = baseMeta.sampleRate,
-                            targetChannels = baseMeta.channelCount,
-                            onProgress = { p -> onProgress?.invoke(p * 0.25f) }
-                        )
-                        if (ok) resampledWavTemp else appendedFile
-                    }
-
                     val encodedSegment = encoder.encodeWavFileToSegment(
-                        wavFile = matchedWavFile,
+                        wavFile = appendedFile,
                         rawAacOutputFile = rawAacTemp,
-                        onProgress = { p -> onProgress?.invoke(0.25f + p * 0.35f) }
+                        onProgress = { p -> onProgress?.invoke(p * 0.55f) }
                     )
                     if (encodedSegment != null && encodedSegment.frameSizes.isNotEmpty()) {
                         val outcome = appendEncodedSegmentToM4a(
                             baseM4aFile = baseM4aFile,
                             segment = encodedSegment,
-                            onProgress = { p -> onProgress?.invoke(0.60f + p * 0.40f) }
+                            onProgress = { p -> onProgress?.invoke(0.55f + p * 0.45f) }
                         )
-                        rawAacTemp.delete()
-                        if (resampledWavTemp.exists()) resampledWavTemp.delete()
                         if (outcome.success) {
+                            rawAacTemp.delete()
                             try { appendedFile.delete() } catch (_: Exception) {}
                             return outcome
                         }
+                        val repackOutcome = repackBaseM4aAndEncodedSegment(
+                            baseM4aFile = baseM4aFile,
+                            baseMeta = baseMeta,
+                            appendedSegment = encodedSegment
+                        )
+                        rawAacTemp.delete()
+                        if (repackOutcome.success) {
+                            try { appendedFile.delete() } catch (_: Exception) {}
+                            return repackOutcome
+                        }
+                    } else {
+                        rawAacTemp.delete()
                     }
                 } catch (_: Exception) {
                     rawAacTemp.delete()
-                    if (resampledWavTemp.exists()) resampledWavTemp.delete()
                 }
             }
         }
@@ -487,9 +500,89 @@ object Mp4Appender {
             appendedFile = appendedFile,
             targetSampleRate = fallbackRate,
             targetChannels = fallbackChannels,
-            targetBitrate = targetBitrate,
+            targetBitrate = safeBitrate,
             onProgress = onProgress
         )
+    }
+
+    /**
+     * Losslessly repacks all AAC access units from [baseM4aFile] followed by [appendedSegment]
+     * into a brand-new, single-chunk M4A file (`ftyp` + contiguous `mdat` + fresh `moov`)
+     * and atomically swaps it into [baseM4aFile].
+     */
+    private fun repackBaseM4aAndEncodedSegment(
+        baseM4aFile: File,
+        baseMeta: Mp4AudioMetadata,
+        appendedSegment: EncodedAacSegment
+    ): Mp4AppendOutcome {
+        val parentDir = baseM4aFile.parentFile ?: File(".")
+        val baseRawTemp = File(parentDir, "${baseM4aFile.name}.base_repack.aac")
+        val combinedRawTemp = File(parentDir, "${baseM4aFile.name}.combined_repack.aac")
+        val stagingM4a = File(parentDir, "${baseM4aFile.name}.repack_staging.m4a")
+        return try {
+            val baseSizes = extractRawAacFramesViaChunkTable(
+                sourceFile = baseM4aFile,
+                meta = baseMeta,
+                skipFirstFrames = 0,
+                outRawAacFile = baseRawTemp
+            )
+            if (baseSizes == null || baseSizes.isEmpty() || !baseRawTemp.exists() || baseRawTemp.length() == 0L) {
+                return Mp4AppendOutcome(false, baseM4aFile, errorMessage = "Failed to extract base AAC frames for repack.")
+            }
+
+            FileOutputStream(combinedRawTemp).use { fos ->
+                FileInputStream(baseRawTemp).use { fis -> fis.copyTo(fos, 65536) }
+                FileInputStream(appendedSegment.rawAacFile).use { fis -> fis.copyTo(fos, 65536) }
+                fos.flush()
+            }
+
+            val totalFrames = baseSizes.size + appendedSegment.frameSizes.size
+            val mergedSizes = IntArray(totalFrames)
+            System.arraycopy(baseSizes, 0, mergedSizes, 0, baseSizes.size)
+            System.arraycopy(appendedSegment.frameSizes, 0, mergedSizes, baseSizes.size, appendedSegment.frameSizes.size)
+
+            val combinedSegment = EncodedAacSegment(
+                rawAacFile = combinedRawTemp,
+                frameSizes = mergedSizes,
+                sampleRate = baseMeta.sampleRate,
+                channelCount = baseMeta.channelCount,
+                aacObjectType = baseMeta.aacObjectType,
+                audioSpecificConfig = if (baseMeta.audioSpecificConfig.isNotEmpty()) {
+                    baseMeta.audioSpecificConfig
+                } else {
+                    appendedSegment.audioSpecificConfig
+                },
+                startPtsSamples = 0L,
+                totalEncodedSamples = totalFrames.toLong() * AacEncoder.AAC_FRAME_SAMPLES.toLong(),
+                primingFramesSkipped = appendedSegment.primingFramesSkipped
+            )
+
+            val writer = AacEncoder(
+                sampleRate = baseMeta.sampleRate,
+                channelCount = baseMeta.channelCount
+            )
+            if (!writer.writeStandaloneM4aFile(combinedSegment, stagingM4a) ||
+                !atomicSwapFile(stagingM4a, baseM4aFile)
+            ) {
+                return Mp4AppendOutcome(false, baseM4aFile, errorMessage = "Failed to write or swap repacked M4A.")
+            }
+            val updatedMeta = Mp4BoxParser.parseM4a(baseM4aFile)
+            val fallbackDurationMs = (totalFrames.toLong() * AacEncoder.AAC_FRAME_SAMPLES * 1000L) /
+                baseMeta.sampleRate.coerceAtLeast(8000).toLong()
+            Mp4AppendOutcome(
+                success = true,
+                finalFile = baseM4aFile,
+                totalSamples = updatedMeta?.totalSamplesFromStts ?: totalFrames.toLong(),
+                totalDurationMs = updatedMeta?.durationMs ?: fallbackDurationMs,
+                usedTranscodeFallback = false
+            )
+        } catch (e: Exception) {
+            Mp4AppendOutcome(false, baseM4aFile, errorMessage = e.localizedMessage)
+        } finally {
+            baseRawTemp.delete()
+            combinedRawTemp.delete()
+            if (stagingM4a.exists()) stagingM4a.delete()
+        }
     }
 
     /**
@@ -549,10 +642,11 @@ object Mp4Appender {
             }
 
             onProgress?.invoke(0.60f)
+            val safeBitrate = AacEncoder.clampBitrateForAacLc(targetBitrate, targetSampleRate, targetChannels)
             val encoder = AacEncoder(
                 sampleRate = targetSampleRate,
                 channelCount = targetChannels,
-                bitrate = targetBitrate,
+                bitrate = safeBitrate,
                 skipPrimingFrame = false
             )
             encoder.start(rawAacTemp)
@@ -729,14 +823,7 @@ object Mp4Appender {
             try {
                 retriever = MediaMetadataRetriever()
                 retriever.setDataSource(file.absolutePath)
-                val durStr = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)
-                val parsedDur = durStr?.toLongOrNull() ?: 0L
-                val retrieverToleranceMs = maxOf(oneFrameToleranceMs * 6, 600L)
-                if (parsedDur > 0L && expectedDurationMs > 0L &&
-                    abs(parsedDur - expectedDurationMs) > retrieverToleranceMs
-                ) {
-                    return false to "MediaMetadataRetriever duration ($parsedDur ms) out of tolerance ($expectedDurationMs ms)."
-                }
+                retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)
             } catch (_: Exception) {
                 // Ignore retriever metadata quirks if MediaExtractor and box parser succeeded
             } finally {

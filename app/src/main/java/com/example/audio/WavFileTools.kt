@@ -443,6 +443,52 @@ object WavFileTools {
         onProgress: ((Float) -> Unit)? = null
     ): Boolean {
         if (!sourceFile.exists() || sourceFile.length() < 16L) return false
+        if (isRiffWaveFile(sourceFile)) {
+            return try {
+                val safeTargetRate = targetSampleRate.coerceIn(8000, 192000)
+                val safeTargetChannels = targetChannels.coerceIn(1, 2)
+                val header = readWavHeaderInfo(sourceFile, safeTargetRate, safeTargetChannels, 16)
+                val srcChannels = header.channels.coerceIn(1, 2)
+                val srcRate = header.sampleRate.coerceIn(8000, 192000)
+                val srcBlockAlign = header.blockAlign.coerceAtLeast(2)
+                val (pcmOffset, rawPcmBytes) = locatePcmDataChunkBounds(sourceFile, srcBlockAlign)
+                if (rawPcmBytes <= 0L) return false
+
+                val resampler = if (srcRate != safeTargetRate) {
+                    PcmResampler(srcRate, safeTargetRate, safeTargetChannels)
+                } else null
+
+                RandomAccessFile(sourceFile, "r").use { raf ->
+                    raf.seek(pcmOffset)
+                    FileOutputStream(outputPcmFile).use { fos ->
+                        val bufSize = 16384 - (16384 % srcBlockAlign)
+                        val buf = ByteArray(bufSize)
+                        var remaining = rawPcmBytes
+                        var processed = 0L
+                        while (remaining > 0L) {
+                            val toRead = minOf(buf.size.toLong(), remaining).toInt()
+                            val r = raf.read(buf, 0, toRead)
+                            if (r <= 0) break
+                            val alignedRead = r - (r % srcBlockAlign)
+                            if (alignedRead <= 0) break
+                            val rawChunk = if (alignedRead == buf.size) buf else buf.copyOf(alignedRead)
+                            val chConverted = convertPcmChannels(rawChunk, srcChannels, safeTargetChannels)
+                            val finalBytes = resampler?.resampleChunk(chConverted) ?: chConverted
+                            if (finalBytes.isNotEmpty()) {
+                                fos.write(finalBytes)
+                            }
+                            remaining -= alignedRead.toLong()
+                            processed += alignedRead.toLong()
+                            onProgress?.invoke((processed.toFloat() / rawPcmBytes.toFloat()).coerceIn(0f, 1f))
+                        }
+                        fos.flush()
+                    }
+                }
+                outputPcmFile.exists() && outputPcmFile.length() > 0L
+            } catch (_: Exception) {
+                false
+            }
+        }
         var extractor: MediaExtractor? = null
         var codec: MediaCodec? = null
         return try {
@@ -792,18 +838,43 @@ object WavFileTools {
             }
         }
 
-        // Native WAV-to-WAV Merge Path (for RIFF WAVE recordings only)
-        if (!isRiffWaveFile(repairedOriginal) || !isRiffWaveFile(appendedPcmFile)) {
+        // Native WAV-to-WAV Merge Path (for RIFF WAVE recordings)
+        if (!isRiffWaveFile(repairedOriginal)) {
             return AppendResult(success = false, finalFile = repairedOriginal)
         }
 
         val origHeader = readWavHeaderInfo(repairedOriginal, sampleRate, channels, bitsPerSample)
         val parentDir = repairedOriginal.parentFile ?: appendedPcmFile.parentFile ?: return AppendResult(false, repairedOriginal)
 
-        val effectiveRate = origHeader.sampleRate
-        val effectiveChannels = origHeader.channels
-        val effectiveBits = origHeader.bitsPerSample
-        val blockAlign = (effectiveChannels * (effectiveBits / 8).coerceAtLeast(1)).coerceAtLeast(2)
+        val effectiveRate = origHeader.sampleRate.coerceIn(8000, 192000)
+        val effectiveChannels = origHeader.channels.coerceIn(1, 2)
+        val effectiveBits = 16
+        val blockAlign = (effectiveChannels * 2).coerceAtLeast(2)
+
+        var decodedAppendTempWav: File? = null
+        val sourceAppendWavFile = if (isRiffWaveFile(appendedPcmFile)) {
+            appendedPcmFile
+        } else {
+            val tempWav = File(parentDir, "${repairedOriginal.name}.app_decoded.wav")
+            val ok = decodeAudioToWav(
+                sourceFile = appendedPcmFile,
+                outputWavFile = tempWav,
+                targetSampleRate = effectiveRate,
+                targetChannels = effectiveChannels,
+                bitsPerSample = effectiveBits
+            )
+            if (!ok || !tempWav.exists()) {
+                tempWav.delete()
+                return AppendResult(success = false, finalFile = repairedOriginal)
+            }
+            decodedAppendTempWav = tempWav
+            tempWav
+        }
+
+        val appendHeader = readWavHeaderInfo(sourceAppendWavFile, effectiveRate, effectiveChannels, effectiveBits)
+        val appendRate = appendHeader.sampleRate.coerceIn(8000, 192000)
+        val appendChannels = appendHeader.channels.coerceIn(1, 2)
+        val appendBlockAlign = appendHeader.blockAlign.coerceAtLeast(2)
 
         val stagingFile = File(parentDir, "${repairedOriginal.name}.merged.tmp")
         if (stagingFile.exists()) stagingFile.delete()
@@ -812,11 +883,12 @@ object WavFileTools {
             onProgress?.invoke(0.15f)
 
             val (basePcmOffset, rawOrigPcmBytes) = locatePcmDataChunkBounds(repairedOriginal, blockAlign)
-            val (appendPcmOffset, rawAppendPcmBytes) = locatePcmDataChunkBounds(appendedPcmFile, blockAlign)
+            val (appendPcmOffset, rawAppendPcmBytes) = locatePcmDataChunkBounds(sourceAppendWavFile, appendBlockAlign)
 
             val origPcmBytes = rawOrigPcmBytes.coerceAtLeast(0L)
             val appendPcmBytes = rawAppendPcmBytes.coerceAtLeast(0L)
-            val totalPcmBytes = (origPcmBytes + appendPcmBytes).coerceAtLeast(1L)
+            val totalInputBytes = (origPcmBytes + appendPcmBytes).coerceAtLeast(1L)
+            var processedInputBytes = 0L
             var writtenPcmBytes = 0L
 
             FileOutputStream(stagingFile).use { out ->
@@ -828,41 +900,73 @@ object WavFileTools {
                     bitsPerSample = effectiveBits
                 )
 
-                val buffer = ByteArray(65536 - (65536 % blockAlign))
+                val origBuffer = ByteArray(65536 - (65536 % blockAlign))
                 if (origPcmBytes > 0L) {
                     RandomAccessFile(repairedOriginal, "r").use { rafIn ->
                         rafIn.seek(basePcmOffset)
                         var remaining = origPcmBytes
                         while (remaining > 0L) {
-                            val toRead = minOf(buffer.size.toLong(), remaining).toInt()
-                            val read = rafIn.read(buffer, 0, toRead)
+                            val toRead = minOf(origBuffer.size.toLong(), remaining).toInt()
+                            val read = rafIn.read(origBuffer, 0, toRead)
                             if (read <= 0) break
-                            out.write(buffer, 0, read)
-                            remaining -= read.toLong()
-                            writtenPcmBytes += read.toLong()
-                            val p = 0.20f + (0.70f * (writtenPcmBytes.toFloat() / totalPcmBytes.toFloat())).coerceIn(0f, 0.70f)
+                            val alignedRead = read - (read % blockAlign)
+                            if (alignedRead <= 0) break
+                            out.write(origBuffer, 0, alignedRead)
+                            remaining -= alignedRead.toLong()
+                            processedInputBytes += alignedRead.toLong()
+                            writtenPcmBytes += alignedRead.toLong()
+                            val p = 0.20f + (0.70f * (processedInputBytes.toFloat() / totalInputBytes.toFloat())).coerceIn(0f, 0.70f)
                             onProgress?.invoke(p)
                         }
                     }
                 }
                 if (appendPcmBytes > 0L) {
-                    RandomAccessFile(appendedPcmFile, "r").use { rafIn ->
+                    val needsConversion = appendRate != effectiveRate || appendChannels != effectiveChannels
+                    val resampler = if (appendRate != effectiveRate) {
+                        PcmResampler(appendRate, effectiveRate, effectiveChannels)
+                    } else null
+                    val appendBuffer = ByteArray(65536 - (65536 % appendBlockAlign))
+
+                    RandomAccessFile(sourceAppendWavFile, "r").use { rafIn ->
                         rafIn.seek(appendPcmOffset)
                         var remaining = appendPcmBytes
                         while (remaining > 0L) {
-                            val toRead = minOf(buffer.size.toLong(), remaining).toInt()
-                            val read = rafIn.read(buffer, 0, toRead)
+                            val toRead = minOf(appendBuffer.size.toLong(), remaining).toInt()
+                            val read = rafIn.read(appendBuffer, 0, toRead)
                             if (read <= 0) break
-                            out.write(buffer, 0, read)
-                            remaining -= read.toLong()
-                            writtenPcmBytes += read.toLong()
-                            val p = 0.20f + (0.70f * (writtenPcmBytes.toFloat() / totalPcmBytes.toFloat())).coerceIn(0f, 0.70f)
+                            val alignedRead = read - (read % appendBlockAlign)
+                            if (alignedRead <= 0) break
+
+                            if (!needsConversion) {
+                                out.write(appendBuffer, 0, alignedRead)
+                                writtenPcmBytes += alignedRead.toLong()
+                            } else {
+                                val rawChunk = if (alignedRead == appendBuffer.size) appendBuffer else appendBuffer.copyOf(alignedRead)
+                                val chMatched = if (appendChannels != effectiveChannels) {
+                                    convertPcmChannels(rawChunk, appendChannels, effectiveChannels)
+                                } else {
+                                    rawChunk
+                                }
+                                val resampled = resampler?.resampleChunk(chMatched) ?: chMatched
+                                val validOutLen = resampled.size - (resampled.size % blockAlign)
+                                if (validOutLen > 0) {
+                                    out.write(resampled, 0, validOutLen)
+                                    writtenPcmBytes += validOutLen.toLong()
+                                }
+                            }
+                            remaining -= alignedRead.toLong()
+                            processedInputBytes += alignedRead.toLong()
+                            val p = 0.20f + (0.70f * (processedInputBytes.toFloat() / totalInputBytes.toFloat())).coerceIn(0f, 0.70f)
                             onProgress?.invoke(p)
                         }
                     }
                 }
                 out.flush()
             }
+
+            // Update staging WAV header so RIFF and data chunk sizes match exact writtenPcmBytes
+            updateWavHeader(stagingFile, effectiveRate, effectiveChannels, effectiveBits)
+            decodedAppendTempWav?.delete()
 
             onProgress?.invoke(0.92f)
 
@@ -929,6 +1033,7 @@ object WavFileTools {
                 AppendResult(success = false, finalFile = repairedOriginal)
             }
         } catch (_: Exception) {
+            decodedAppendTempWav?.delete()
             stagingFile.delete()
             AppendResult(success = false, finalFile = repairedOriginal)
         }

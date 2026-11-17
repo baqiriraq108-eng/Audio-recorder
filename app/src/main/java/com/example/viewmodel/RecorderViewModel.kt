@@ -501,8 +501,7 @@ class RecorderViewModel(application: Application) : AndroidViewModel(application
                 appendTargetItem.filePath.endsWith(".m4a", ignoreCase = true)
             )
         val tempFileName = if (appendTargetItem != null) {
-            val ext = if (isM4aAppend) "m4a" else "wav"
-            "append_segment_${System.currentTimeMillis()}.$ext"
+            "append_segment_${System.currentTimeMillis()}.wav"
         } else {
             "session_${System.currentTimeMillis()}.${currentSettings.defaultFormat.extension}"
         }
@@ -761,13 +760,19 @@ class RecorderViewModel(application: Application) : AndroidViewModel(application
                     try {
                         _mergeProgress.value = 0
                         val origFile = File(appendTargetItem.filePath)
+                        val rawBitrate = appendTargetItem.bitrate.takeIf { it > 0 } ?: 192_000
+                        val safeTargetBitrate = com.example.audio.AacEncoder.clampBitrateForAacLc(
+                            rawBitrate = rawBitrate,
+                            sampleRate = appendTargetItem.sampleRate,
+                            channelCount = appendTargetItem.channels
+                        )
                         val appendResult = WavFileTools.appendAudioFilesUniversal(
                             originalFile = origFile,
                             appendedPcmFile = sessionFile,
                             sampleRate = appendTargetItem.sampleRate,
                             channels = appendTargetItem.channels,
                             bitsPerSample = appendTargetItem.bitDepth,
-                            targetBitrate = (appendTargetItem.bitrate.takeIf { it > 0 } ?: 128) * 1000,
+                            targetBitrate = safeTargetBitrate,
                             onProgress = { ratio ->
                                 _mergeProgress.value = (ratio * 100).toInt().coerceIn(0, 100)
                             }
@@ -786,6 +791,22 @@ class RecorderViewModel(application: Application) : AndroidViewModel(application
                                 fallbackCombinedDuration
                             }
                             val updatedFileSize = finalFile.length()
+                            val isMergedM4a = appendResult.format.equals("M4A", ignoreCase = true) ||
+                                finalFile.extension.equals("m4a", ignoreCase = true)
+                            val mergedM4aMeta = if (isMergedM4a) {
+                                com.example.audio.Mp4BoxParser.parseM4a(finalFile)
+                            } else null
+                            val mergedWavHeader = if (!isMergedM4a) {
+                                WavFileTools.readWavHeaderInfo(
+                                    file = finalFile,
+                                    fallbackSampleRate = appendTargetItem.sampleRate,
+                                    fallbackChannels = appendTargetItem.channels,
+                                    fallbackBitsPerSample = appendTargetItem.bitDepth
+                                )
+                            } else null
+                            val resolvedRate = mergedM4aMeta?.sampleRate ?: mergedWavHeader?.sampleRate ?: appendTargetItem.sampleRate
+                            val resolvedChannels = mergedM4aMeta?.channelCount ?: mergedWavHeader?.channels ?: appendTargetItem.channels
+                            val resolvedBits = mergedWavHeader?.bitsPerSample ?: appendTargetItem.bitDepth
 
                             // Immediately persist new duration, file size, and unsynced status so Local and Cloud
                             // Library lists refresh without delay.
@@ -793,6 +814,9 @@ class RecorderViewModel(application: Application) : AndroidViewModel(application
                                 title = cleanTitle,
                                 filePath = finalFile.absolutePath,
                                 format = appendResult.format,
+                                sampleRate = resolvedRate,
+                                channels = resolvedChannels,
+                                bitDepth = resolvedBits,
                                 durationMs = combinedDuration,
                                 sizeBytes = updatedFileSize,
                                 bookmarks = AudioFormatUtils.serializeBookmarks(capturedBookmarks),
@@ -812,9 +836,9 @@ class RecorderViewModel(application: Application) : AndroidViewModel(application
                                 durationMs = combinedDuration,
                                 peaks = mergedPeaks,
                                 config = _settings.value.silenceConfig,
-                                fallbackSampleRate = appendTargetItem.sampleRate,
-                                fallbackChannels = appendTargetItem.channels,
-                                fallbackBitsPerSample = appendTargetItem.bitDepth
+                                fallbackSampleRate = resolvedRate,
+                                fallbackChannels = resolvedChannels,
+                                fallbackBitsPerSample = resolvedBits
                             )
                             val updatedEntity = immediateEntity.copy(
                                 sizeBytes = finalFile.length().takeIf { it > 0L } ?: updatedFileSize,
