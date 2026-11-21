@@ -339,96 +339,177 @@ object WavFileTools {
         private val targetSampleRate: Int,
         private val channels: Int
     ) {
-        private val ratio = srcSampleRate.toDouble() / targetSampleRate.toDouble()
+        private val safeChannels = channels.coerceIn(1, 2)
+        private val ratio = srcSampleRate.coerceAtLeast(1).toDouble() / targetSampleRate.coerceAtLeast(1).toDouble()
         private var resamplePos = 0.0
         private var carryOverLeft: Short = 0
         private var carryOverRight: Short = 0
         private var hasCarryOver = false
 
+        fun reset() {
+            resamplePos = 0.0
+            carryOverLeft = 0
+            carryOverRight = 0
+            hasCarryOver = false
+        }
+
         fun resampleChunk(inputPcmBytes: ByteArray): ByteArray {
             if (srcSampleRate == targetSampleRate || inputPcmBytes.isEmpty()) return inputPcmBytes
-            val bytesPerFrame = channels * 2
+            val bytesPerFrame = safeChannels * 2
             val inputFrameCount = inputPcmBytes.size / bytesPerFrame
-            if (inputFrameCount == 0) return ByteArray(0)
+            if (inputFrameCount <= 0) return ByteArray(0)
 
             val inLeft = ShortArray(inputFrameCount)
-            val inRight = if (channels == 2) ShortArray(inputFrameCount) else null
+            val inRight = if (safeChannels == 2) ShortArray(inputFrameCount) else null
 
             for (i in 0 until inputFrameCount) {
                 val base = i * bytesPerFrame
                 val lLo = inputPcmBytes[base].toInt() and 0xFF
                 val lHi = inputPcmBytes[base + 1].toInt()
                 inLeft[i] = ((lHi shl 8) or lLo).toShort()
-                if (channels == 2 && inRight != null) {
+                if (safeChannels == 2 && inRight != null) {
                     val rLo = inputPcmBytes[base + 2].toInt() and 0xFF
                     val rHi = inputPcmBytes[base + 3].toInt()
                     inRight[i] = ((rHi shl 8) or rLo).toShort()
                 }
             }
 
-            val outFrames = ArrayList<Pair<Short, Short>>()
+            // Pre-allocate primitive output buffer sized generously for the chunk ratio
+            val estimatedFrames = (kotlin.math.ceil((inputFrameCount + 2.0) / ratio).toInt()).coerceAtLeast(4)
+            var outBytes = ByteArray(estimatedFrames * bytesPerFrame)
+            var outFrameCount = 0
             var pos = resamplePos
+            val maxReadablePos = (inputFrameCount - 1).toDouble()
 
-            while (true) {
-                val index0 = pos.toInt()
-                val frac = pos - index0
+            while (pos < maxReadablePos) {
+                val index0 = kotlin.math.floor(pos).toInt()
+                val frac = pos - index0.toDouble()
 
-                val s0Left: Short
-                val s1Left: Short
-                val s0Right: Short
-                val s1Right: Short
+                val s0Left: Int
+                val s1Left: Int
+                val s0Right: Int
+                val s1Right: Int
 
                 if (index0 < 0) {
-                    s0Left = if (hasCarryOver) carryOverLeft else inLeft[0]
-                    s1Left = inLeft[0]
-                    s0Right = if (hasCarryOver) carryOverRight else (inRight?.get(0) ?: 0)
-                    s1Right = inRight?.get(0) ?: 0
-                } else if (index0 < inputFrameCount - 1) {
-                    s0Left = inLeft[index0]
-                    s1Left = inLeft[index0 + 1]
-                    s0Right = inRight?.get(index0) ?: 0
-                    s1Right = inRight?.get(index0 + 1) ?: 0
-                } else if (index0 == inputFrameCount - 1) {
-                    s0Left = inLeft[index0]
-                    s1Left = inLeft[index0]
-                    s0Right = inRight?.get(index0) ?: 0
-                    s1Right = inRight?.get(index0) ?: 0
-                    if (frac > 0.999) break
+                    s0Left = (if (hasCarryOver) carryOverLeft else inLeft[0]).toInt()
+                    s1Left = inLeft[0].toInt()
+                    s0Right = (if (hasCarryOver) carryOverRight else (inRight?.get(0) ?: 0)).toInt()
+                    s1Right = (inRight?.get(0) ?: 0).toInt()
                 } else {
-                    break
+                    val nextIdx = (index0 + 1).coerceAtMost(inputFrameCount - 1)
+                    s0Left = inLeft[index0].toInt()
+                    s1Left = inLeft[nextIdx].toInt()
+                    s0Right = (inRight?.get(index0) ?: 0).toInt()
+                    s1Right = (inRight?.get(nextIdx) ?: 0).toInt()
                 }
 
-                val interpLeft = (s0Left.toInt() * (1.0 - frac) + s1Left.toInt() * frac)
-                    .toInt().coerceIn(-32768, 32767).toShort()
-                val interpRight = if (channels == 2) {
-                    (s0Right.toInt() * (1.0 - frac) + s1Right.toInt() * frac)
-                        .toInt().coerceIn(-32768, 32767).toShort()
-                } else 0.toShort()
+                val interpLeft = kotlin.math.round(s0Left + (s1Left - s0Left) * frac)
+                    .toInt().coerceIn(-32768, 32767)
 
-                outFrames.add(interpLeft to interpRight)
+                val neededBytes = (outFrameCount + 1) * bytesPerFrame
+                if (neededBytes > outBytes.size) {
+                    outBytes = outBytes.copyOf((outBytes.size * 2).coerceAtLeast(neededBytes))
+                }
+                val base = outFrameCount * bytesPerFrame
+                outBytes[base] = (interpLeft and 0xFF).toByte()
+                outBytes[base + 1] = ((interpLeft shr 8) and 0xFF).toByte()
+
+                if (safeChannels == 2) {
+                    val interpRight = kotlin.math.round(s0Right + (s1Right - s0Right) * frac)
+                        .toInt().coerceIn(-32768, 32767)
+                    outBytes[base + 2] = (interpRight and 0xFF).toByte()
+                    outBytes[base + 3] = ((interpRight shr 8) and 0xFF).toByte()
+                }
+
+                outFrameCount++
                 pos += ratio
             }
 
             carryOverLeft = inLeft[inputFrameCount - 1]
-            if (channels == 2 && inRight != null) {
+            if (safeChannels == 2 && inRight != null) {
                 carryOverRight = inRight[inputFrameCount - 1]
             }
             hasCarryOver = true
-            resamplePos = pos - inputFrameCount
+            resamplePos = pos - inputFrameCount.toDouble()
 
-            val outputBytes = ByteArray(outFrames.size * bytesPerFrame)
-            for (i in outFrames.indices) {
-                val (l, r) = outFrames[i]
-                val base = i * bytesPerFrame
-                outputBytes[base] = (l.toInt() and 0xFF).toByte()
-                outputBytes[base + 1] = ((l.toInt() shr 8) and 0xFF).toByte()
-                if (channels == 2) {
-                    outputBytes[base + 2] = (r.toInt() and 0xFF).toByte()
-                    outputBytes[base + 3] = ((r.toInt() shr 8) and 0xFF).toByte()
-                }
-            }
-            return outputBytes
+            val exactByteLen = outFrameCount * bytesPerFrame
+            return if (exactByteLen == outBytes.size) outBytes else outBytes.copyOf(exactByteLen)
         }
+    }
+
+    /**
+     * Applies a brief half-cosine micro-fade-in (default ~8 ms) to the leading frames of a 16-bit
+     * little-endian PCM buffer so an incoming microphone stream starts cleanly from zero with zero
+     * DC-offset step or audible splice click.
+     */
+    fun applyMicroFadeIn(
+        pcmBytes: ByteArray,
+        sampleRate: Int,
+        channels: Int,
+        fadeDurationMs: Int = 8
+    ): ByteArray {
+        val safeChannels = channels.coerceIn(1, 2)
+        val bytesPerFrame = safeChannels * 2
+        val totalFrames = pcmBytes.size / bytesPerFrame
+        if (totalFrames <= 1 || fadeDurationMs <= 0 || sampleRate <= 0) return pcmBytes
+
+        val requestedFrames = ((sampleRate.toLong() * fadeDurationMs.toLong()) / 1000L).toInt().coerceAtLeast(2)
+        val fadeFrames = minOf(requestedFrames, totalFrames)
+        val denom = (fadeFrames - 1).coerceAtLeast(1).toDouble()
+        val result = pcmBytes.copyOf()
+
+        for (frame in 0 until fadeFrames) {
+            val gain = 0.5 * (1.0 - cos(Math.PI * frame.toDouble() / denom))
+            val frameBase = frame * bytesPerFrame
+            for (ch in 0 until safeChannels) {
+                val samplePos = frameBase + ch * 2
+                val lo = result[samplePos].toInt() and 0xFF
+                val hi = result[samplePos + 1].toInt()
+                val rawSample = ((hi shl 8) or lo).toShort().toInt()
+                val faded = kotlin.math.round(rawSample * gain).toInt().coerceIn(-32768, 32767)
+                result[samplePos] = (faded and 0xFF).toByte()
+                result[samplePos + 1] = ((faded shr 8) and 0xFF).toByte()
+            }
+        }
+        return result
+    }
+
+    /**
+     * Applies a brief half-cosine micro-fade-out (default ~8 ms) to the trailing frames of a 16-bit
+     * little-endian PCM buffer so an outgoing microphone stream tapers smoothly to zero right before
+     * a mid-recording microphone handoff.
+     */
+    fun applyMicroFadeOut(
+        pcmBytes: ByteArray,
+        sampleRate: Int,
+        channels: Int,
+        fadeDurationMs: Int = 8
+    ): ByteArray {
+        val safeChannels = channels.coerceIn(1, 2)
+        val bytesPerFrame = safeChannels * 2
+        val totalFrames = pcmBytes.size / bytesPerFrame
+        if (totalFrames <= 1 || fadeDurationMs <= 0 || sampleRate <= 0) return pcmBytes
+
+        val requestedFrames = ((sampleRate.toLong() * fadeDurationMs.toLong()) / 1000L).toInt().coerceAtLeast(2)
+        val fadeFrames = minOf(requestedFrames, totalFrames)
+        val startFrame = totalFrames - fadeFrames
+        val denom = (fadeFrames - 1).coerceAtLeast(1).toDouble()
+        val result = pcmBytes.copyOf()
+
+        for (offset in 0 until fadeFrames) {
+            val gain = 0.5 * (1.0 + cos(Math.PI * offset.toDouble() / denom))
+            val frameBase = (startFrame + offset) * bytesPerFrame
+            for (ch in 0 until safeChannels) {
+                val samplePos = frameBase + ch * 2
+                val lo = result[samplePos].toInt() and 0xFF
+                val hi = result[samplePos + 1].toInt()
+                val rawSample = ((hi shl 8) or lo).toShort().toInt()
+                val faded = kotlin.math.round(rawSample * gain).toInt().coerceIn(-32768, 32767)
+                result[samplePos] = (faded and 0xFF).toByte()
+                result[samplePos + 1] = ((faded shr 8) and 0xFF).toByte()
+            }
+        }
+        return result
     }
 
     /**

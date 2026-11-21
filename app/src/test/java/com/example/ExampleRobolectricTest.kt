@@ -2039,8 +2039,420 @@ class ExampleRobolectricTest {
             File(updatedWavEntity.filePath).length() > initialWavSize
         )
     }
-}
 
+    @Test
+    fun `verify OS-delegated audio routing never forces SCO or communication mode and stops capture on pause`() = runBlocking {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as android.media.AudioManager
+        audioManager.mode = android.media.AudioManager.MODE_NORMAL
+        @Suppress("DEPRECATION")
+        audioManager.isBluetoothScoOn = false
+
+        val engine = com.example.audio.AudioStudioEngine(context)
+        val tempDir = File(context.cacheDir, "test_os_bt_routing").apply { mkdirs() }
+        val wavOut = File(tempDir, "pause_resume_session.wav")
+
+        // 1. Passive refresh updates label without altering AudioManager mode or Bluetooth SCO
+        engine.refreshConnectedAudioDevices()
+        assertEquals(android.media.AudioManager.MODE_NORMAL, audioManager.mode)
+        @Suppress("DEPRECATION")
+        org.junit.Assert.assertFalse(audioManager.isBluetoothScoOn)
+
+        // 2. Start recording session and verify OS audio mode remains MODE_NORMAL & SCO stays untouched
+        engine.startRecordingSession(
+            outputFile = wavOut,
+            sampleRate = 44100,
+            channels = 1
+        )
+        kotlinx.coroutines.delay(220)
+        assertTrue(engine.isRecording.value)
+        org.junit.Assert.assertFalse(engine.isPaused.value)
+        assertEquals(android.media.AudioManager.MODE_NORMAL, audioManager.mode)
+        @Suppress("DEPRECATION")
+        org.junit.Assert.assertFalse(audioManager.isBluetoothScoOn)
+
+        // Trigger passive device refresh mid-recording (must never tear down capture or switch mode)
+        engine.refreshConnectedAudioDevices()
+        assertTrue(engine.isRecording.value)
+        assertEquals(android.media.AudioManager.MODE_NORMAL, audioManager.mode)
+
+        val elapsedBeforePause = engine.elapsedMs.value
+        assertTrue("Expected elapsed duration > 0 before pause", elapsedBeforePause > 0L)
+
+        // 3. Pause recording: stops active capture so Android OS can naturally sleep Bluetooth headset
+        engine.pauseRecording()
+        assertTrue(engine.isPaused.value)
+        kotlinx.coroutines.delay(180)
+        val elapsedWhilePaused = engine.elapsedMs.value
+        kotlinx.coroutines.delay(150)
+        assertEquals(
+            "Elapsed recording duration must remain frozen while capture is stopped on pause",
+            elapsedWhilePaused,
+            engine.elapsedMs.value
+        )
+        assertEquals(android.media.AudioManager.MODE_NORMAL, audioManager.mode)
+        @Suppress("DEPRECATION")
+        org.junit.Assert.assertFalse(audioManager.isBluetoothScoOn)
+
+        // 4. Resume recording: restarts capture seamlessly into the exact same session file
+        engine.resumeRecording()
+        org.junit.Assert.assertFalse(engine.isPaused.value)
+        kotlinx.coroutines.delay(260)
+        assertTrue(
+            "Elapsed duration (${engine.elapsedMs.value}ms) must advance after resuming (${elapsedWhilePaused}ms)",
+            engine.elapsedMs.value > elapsedWhilePaused
+        )
+        assertEquals(android.media.AudioManager.MODE_NORMAL, audioManager.mode)
+
+        // 5. Finalize and verify valid WAV output
+        val (finalFile, finalDurationMs) = engine.stopRecordingAndFinalize()
+        org.junit.Assert.assertNotNull(finalFile)
+        assertTrue(finalFile!!.exists() && finalFile.length() > 44L)
+        assertTrue(finalDurationMs > elapsedWhilePaused)
+        assertEquals(android.media.AudioManager.MODE_NORMAL, audioManager.mode)
+        @Suppress("DEPRECATION")
+        org.junit.Assert.assertFalse(audioManager.isBluetoothScoOn)
+        org.junit.Assert.assertFalse(engine.isConnectingBluetoothMic.value)
+
+        engine.releaseEngineResources()
+    }
+
+    @Test
+    fun `verify Adaptive Audio Pipeline dynamic native capability selection and click-free universal resampling`() = runBlocking {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val engine = com.example.audio.AudioStudioEngine(context)
+
+        // 1. Dynamic hardware selection: TWS SCO earbuds reporting [8000, 16000] Mono
+        val (scoRates, scoChannels) = engine.orderNativeHardwareCapabilities(
+            nativeSampleRates = intArrayOf(8000, 16000),
+            nativeChannelCounts = intArrayOf(1),
+            osNativeSampleRate = 48000,
+            isBluetoothSco = true
+        )
+        assertEquals(listOf(16000, 8000), scoRates)
+        assertEquals(listOf(1), scoChannels)
+
+        // 2. Dynamic hardware selection: BLE Audio / USB headset reporting [16000, 32000, 48000] Stereo
+        val (bleRates, bleChannels) = engine.orderNativeHardwareCapabilities(
+            nativeSampleRates = intArrayOf(16000, 48000, 32000),
+            nativeChannelCounts = intArrayOf(1, 2),
+            osNativeSampleRate = 44100,
+            isBluetoothSco = false
+        )
+        assertEquals(listOf(48000, 32000, 16000), bleRates)
+        assertEquals(listOf(2, 1), bleChannels)
+
+        // 3. Dynamic hardware selection: empty native array uses OS native optimal rate first
+        val (arbitraryRates, arbitraryChannels) = engine.orderNativeHardwareCapabilities(
+            nativeSampleRates = IntArray(0),
+            nativeChannelCounts = IntArray(0),
+            osNativeSampleRate = 48000,
+            isBluetoothSco = false
+        )
+        assertEquals(48000, arbitraryRates.first())
+        assertEquals(listOf(2, 1), arbitraryChannels)
+
+        // 4. Universal PcmResampler boundary-exact math: 16kHz Bluetooth mono -> 44.1kHz mono across 20 chunks
+        val srcRate = 16000
+        val dstRate = 44100
+        val resampler = WavFileTools.PcmResampler(srcRate, dstRate, channels = 1)
+        val totalSrcSamples = srcRate // 1.0 second of smooth 440 Hz sine wave
+        val chunkFrames = 800 // 50ms chunks
+        val allOutBytes = java.io.ByteArrayOutputStream()
+        for (chunkStart in 0 until totalSrcSamples step chunkFrames) {
+            val count = minOf(chunkFrames, totalSrcSamples - chunkStart)
+            val chunkBytes = ByteArray(count * 2)
+            val bb = java.nio.ByteBuffer.wrap(chunkBytes).order(java.nio.ByteOrder.LITTLE_ENDIAN)
+            for (i in 0 until count) {
+                val sampleIdx = chunkStart + i
+                val v = (kotlin.math.sin(2.0 * Math.PI * 440.0 * sampleIdx / srcRate) * 16000.0).toInt().toShort()
+                bb.putShort(v)
+            }
+            val resampledChunk = resampler.resampleChunk(chunkBytes)
+            allOutBytes.write(resampledChunk)
+        }
+        val outPcm = allOutBytes.toByteArray()
+        val outFrameCount = outPcm.size / 2
+        assertTrue(
+            "1.0s at 16kHz resampled to 44.1kHz should yield ~44100 frames (got $outFrameCount)",
+            outFrameCount in 44050..44150
+        )
+
+        // Verify zero boundary discontinuity clicks (adjacent sample delta stays strictly bounded for 440Hz sine)
+        val outShorts = java.nio.ByteBuffer.wrap(outPcm).order(java.nio.ByteOrder.LITTLE_ENDIAN).asShortBuffer()
+        var maxDelta = 0
+        var prev = outShorts.get(0).toInt()
+        for (i in 1 until outFrameCount) {
+            val cur = outShorts.get(i).toInt()
+            val delta = kotlin.math.abs(cur - prev)
+            if (delta > maxDelta) maxDelta = delta
+            prev = cur
+        }
+        // Analytical max delta for 16000 amplitude 440 Hz sine at 44.1 kHz is ~1003; a boundary click would spike > 3000
+        assertTrue("Resampled sine wave must have zero chunk-boundary clicks (maxDelta=$maxDelta)", maxDelta < 1800)
+
+        // 5. Verify 16kHz Mono Bluetooth WAV segment resamples & merges cleanly into an existing 44.1kHz Stereo M4A
+        val tempDir = File(context.cacheDir, "test_adaptive_bt_merge").apply { mkdirs() }
+        val baseM4a = File(tempDir, "base_44k_stereo.m4a")
+        val rawBase = File(tempDir, "base_44k_stereo.raw.aac")
+        val baseEnc = com.example.audio.AacEncoder(sampleRate = 44100, channelCount = 2, bitrate = 192_000)
+        baseEnc.start(rawBase)
+        val oneSecStereo = ShortArray(44100 * 2) { idx -> ((idx % 80) * 150).toShort() }
+        baseEnc.encodePcmSamples(oneSecStereo, oneSecStereo.size)
+        val baseSeg = baseEnc.finish()
+        assertTrue(baseEnc.writeStandaloneM4aFile(baseSeg, baseM4a))
+        rawBase.delete()
+        val baseMeta = com.example.audio.Mp4BoxParser.parseM4a(baseM4a)!!
+
+        // Create a 1.0s 16kHz Mono WAV simulating Huawei FreeBuds 5 capture
+        val bt16kWav = File(tempDir, "bt_16k_mono_append.wav")
+        WavFileTools.createStudioSampleAudioFile(bt16kWav, durationSeconds = 1, sampleRate = 16000)
+
+        val (matchEncoder, _) = com.example.audio.AacEncoder.createMatchingEncoderForBaseFile(baseM4a)!!
+        val rawAppend = File(tempDir, "append_44k_stereo.raw.aac")
+        val appendSeg = matchEncoder.encodeWavFileToSegment(bt16kWav, rawAppend)!!
+        assertEquals(44100, appendSeg.sampleRate)
+        assertEquals(2, appendSeg.channelCount)
+        assertTrue(appendSeg.frameSizes.isNotEmpty())
+
+        val appendResult = com.example.audio.Mp4Appender.appendEncodedSegmentToM4a(
+            baseM4aFile = baseM4a,
+            segment = appendSeg
+        )
+        assertTrue("Adaptive 16kHz BT -> 44.1kHz Stereo M4A append must succeed", appendResult.success)
+        val finalMeta = com.example.audio.Mp4BoxParser.parseM4a(baseM4a)!!
+        assertTrue(finalMeta.isSampleTableConsistent())
+        assertEquals(44100, finalMeta.sampleRate)
+        assertEquals(2, finalMeta.channelCount)
+        assertTrue(
+            "Final merged M4A duration (${finalMeta.durationMs}ms) must exceed base (${baseMeta.durationMs}ms)",
+            finalMeta.durationMs >= baseMeta.durationMs + 850L
+        )
+        rawAppend.delete()
+        engine.releaseEngineResources()
+    }
+
+    @Test
+    fun `verify two-way mid-recording handoff micro-fades single-file continuity and anti-loop guards`() = runBlocking {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+
+        // 1. Verify half-cosine micro-fade-in & micro-fade-out on Mono and Stereo 16-bit PCM
+        val targetRate = 44100
+        val fadeMs = 8
+        val expectedFadeFrames = ((targetRate.toLong() * fadeMs.toLong()) / 1000L).toInt()
+        val testFrames = 2000 // ~45ms at 44.1kHz
+
+        // Stereo DC test (+16000 L, -16000 R)
+        val stereoRaw = ByteArray(testFrames * 4)
+        java.nio.ByteBuffer.wrap(stereoRaw).order(java.nio.ByteOrder.LITTLE_ENDIAN).apply {
+            repeat(testFrames) {
+                putShort(16000.toShort())
+                putShort((-16000).toShort())
+            }
+        }
+        val stereoFadedIn = WavFileTools.applyMicroFadeIn(stereoRaw, targetRate, channels = 2, fadeDurationMs = fadeMs)
+        val inBuf = java.nio.ByteBuffer.wrap(stereoFadedIn).order(java.nio.ByteOrder.LITTLE_ENDIAN).asShortBuffer()
+        assertEquals("Fade-in first left sample must be 0", 0, inBuf.get(0).toInt())
+        assertEquals("Fade-in first right sample must be 0", 0, inBuf.get(1).toInt())
+        val midFadeIdx = expectedFadeFrames / 2
+        assertTrue("Mid-fade left sample must be ~8000", inBuf.get(midFadeIdx * 2).toInt() in 6500..9500)
+        assertTrue("Mid-fade right sample must be ~-8000", inBuf.get(midFadeIdx * 2 + 1).toInt() in -9500..-6500)
+        assertEquals("Post-fade left sample must be bit-exact 16000", 16000, inBuf.get((testFrames - 1) * 2).toInt())
+        assertEquals("Post-fade right sample must be bit-exact -16000", -16000, inBuf.get((testFrames - 1) * 2 + 1).toInt())
+
+        val stereoFadedOut = WavFileTools.applyMicroFadeOut(stereoRaw, targetRate, channels = 2, fadeDurationMs = fadeMs)
+        val outBuf = java.nio.ByteBuffer.wrap(stereoFadedOut).order(java.nio.ByteOrder.LITTLE_ENDIAN).asShortBuffer()
+        assertEquals("Pre-fade left sample must be bit-exact 16000", 16000, outBuf.get(0).toInt())
+        assertEquals("Pre-fade right sample must be bit-exact -16000", -16000, outBuf.get(1).toInt())
+        assertEquals("Fade-out final left sample must be 0", 0, outBuf.get((testFrames - 1) * 2).toInt())
+        assertEquals("Fade-out final right sample must be 0", 0, outBuf.get((testFrames - 1) * 2 + 1).toInt())
+
+        // Verify splicing opposite-polarity buffers (+16000 -> -16000) across micro-fade-out + micro-fade-in has ZERO click spike
+        val monoPos = ByteArray(testFrames * 2)
+        val monoNeg = ByteArray(testFrames * 2)
+        java.nio.ByteBuffer.wrap(monoPos).order(java.nio.ByteOrder.LITTLE_ENDIAN).apply {
+            repeat(testFrames) { putShort(16000.toShort()) }
+        }
+        java.nio.ByteBuffer.wrap(monoNeg).order(java.nio.ByteOrder.LITTLE_ENDIAN).apply {
+            repeat(testFrames) { putShort((-16000).toShort()) }
+        }
+        val splicedOut = WavFileTools.applyMicroFadeOut(monoPos, targetRate, channels = 1, fadeDurationMs = fadeMs)
+        val splicedIn = WavFileTools.applyMicroFadeIn(monoNeg, targetRate, channels = 1, fadeDurationMs = fadeMs)
+        val combinedSplice = splicedOut + splicedIn
+        val combinedShorts = java.nio.ByteBuffer.wrap(combinedSplice).order(java.nio.ByteOrder.LITTLE_ENDIAN).asShortBuffer()
+        var maxSpliceDelta = 0
+        for (i in 1 until (combinedSplice.size / 2)) {
+            val delta = kotlin.math.abs(combinedShorts.get(i).toInt() - combinedShorts.get(i - 1).toInt())
+            if (delta > maxSpliceDelta) maxSpliceDelta = delta
+        }
+        // Raw splice delta would be 32000; smooth 8ms half-cosine splice keeps max adjacent delta < 200
+        assertTrue("Micro-fade splice must eliminate click transients (maxDelta=$maxSpliceDelta)", maxSpliceDelta < 250)
+
+        // 2. Simulate full two-way mid-recording handoff (48kHz Phone -> 16kHz BT -> 48kHz Phone)
+        //    into a SINGLE continuously open 44.1kHz WAV and M4A file without splitting or closing
+        fun buildSinePcmBytes(sampleRate: Int, durationMs: Int, freqHz: Double): ByteArray {
+            val frames = (sampleRate * durationMs) / 1000
+            val out = ByteArray(frames * 2)
+            val bb = java.nio.ByteBuffer.wrap(out).order(java.nio.ByteOrder.LITTLE_ENDIAN)
+            for (i in 0 until frames) {
+                val sample = (kotlin.math.sin(2.0 * Math.PI * freqHz * i / sampleRate) * 14000.0).toInt().toShort()
+                bb.putShort(sample)
+            }
+            return out
+        }
+
+        val phoneSeg1 = WavFileTools.PcmResampler(48000, targetRate, 1)
+            .resampleChunk(buildSinePcmBytes(48000, 400, 330.0))
+            .let { WavFileTools.applyMicroFadeOut(it, targetRate, 1, fadeMs) }
+        val btSeg2 = WavFileTools.PcmResampler(16000, targetRate, 1)
+            .resampleChunk(buildSinePcmBytes(16000, 400, 440.0))
+            .let { WavFileTools.applyMicroFadeIn(it, targetRate, 1, fadeMs) }
+            .let { WavFileTools.applyMicroFadeOut(it, targetRate, 1, fadeMs) }
+        val phoneSeg3 = WavFileTools.PcmResampler(48000, targetRate, 1)
+            .resampleChunk(buildSinePcmBytes(48000, 400, 550.0))
+            .let { WavFileTools.applyMicroFadeIn(it, targetRate, 1, fadeMs) }
+
+        val tempDir = File(context.cacheDir, "test_two_way_handoff").apply { mkdirs() }
+
+        // 2a. Single unbroken WAV
+        val singleWav = File(tempDir, "two_way_continuous.wav")
+        java.io.FileOutputStream(singleWav).use { fos ->
+            WavFileTools.writeWavHeader(fos, 0L, targetRate, 1, 16)
+            fos.write(phoneSeg1)
+            fos.write(btSeg2)
+            fos.write(phoneSeg3)
+            fos.flush()
+        }
+        WavFileTools.updateWavHeader(singleWav, targetRate, 1, 16)
+        val wavHeader = WavFileTools.readWavHeaderInfo(singleWav)
+        assertEquals(targetRate, wavHeader.sampleRate)
+        assertEquals(1, wavHeader.channels)
+        val wavDurationMs = (wavHeader.pcmDataBytes * 1000L) / (targetRate * 2L)
+        assertTrue("Combined 3-segment WAV duration (~1200ms) should be contiguous (got ${wavDurationMs}ms)", wavDurationMs in 1150L..1250L)
+
+        // 2b. Single unbroken M4A
+        val singleM4a = File(tempDir, "two_way_continuous.m4a")
+        val rawAac = File(tempDir, "two_way_continuous.raw.aac")
+        val aacEnc = com.example.audio.AacEncoder(sampleRate = targetRate, channelCount = 1, bitrate = 128_000)
+        aacEnc.start(rawAac)
+        aacEnc.encodePcmBytes(phoneSeg1, phoneSeg1.size)
+        aacEnc.encodePcmBytes(btSeg2, btSeg2.size)
+        aacEnc.encodePcmBytes(phoneSeg3, phoneSeg3.size)
+        val m4aSeg = aacEnc.finish()
+        assertTrue(aacEnc.writeStandaloneM4aFile(m4aSeg, singleM4a))
+        rawAac.delete()
+        val m4aMeta = com.example.audio.Mp4BoxParser.parseM4a(singleM4a)!!
+        assertTrue("Single two-way M4A sample table must be consistent", m4aMeta.isSampleTableConsistent())
+        assertEquals(targetRate, m4aMeta.sampleRate)
+        assertEquals(1, m4aMeta.channelCount)
+        assertTrue("Combined 3-segment M4A duration (~1200ms) should be contiguous (got ${m4aMeta.durationMs}ms)", m4aMeta.durationMs in 1100L..1350L)
+
+        // 3. Verify bidirectional topology triggers, paused-state deferral, and anti-loop suppression
+        val engine = com.example.audio.AudioStudioEngine(context)
+        val liveWav = File(tempDir, "topology_guard_session.wav")
+        engine.startRecordingSession(outputFile = liveWav, sampleRate = 44100, channels = 1)
+        kotlinx.coroutines.delay(140)
+        assertTrue(engine.isRecording.value)
+
+        // Pause on Phone Mic, then simulate Bluetooth headset ID 77 connecting while paused
+        engine.pauseRecording()
+        assertTrue(engine.isPaused.value)
+        engine.handleBluetoothTopologyUpdate(hasBluetoothAvailable = true, bluetoothDeviceId = 77)
+        assertTrue("BT connection while paused must queue deferred switch for Resume", engine.hasPendingBluetoothSwitch())
+        org.junit.Assert.assertFalse("Paused state must NOT activate BT connection indicator early", engine.isConnectingBluetoothMic.value)
+
+        // Simulate BT ID 77 physically disconnecting before Resume -> queued switch clears cleanly
+        engine.handleBluetoothTopologyUpdate(hasBluetoothAvailable = false, bluetoothDeviceId = null)
+        org.junit.Assert.assertFalse("Queued BT switch must clear if earbuds disconnect while paused", engine.hasPendingBluetoothSwitch())
+
+        // Simulate BT ID 77 timing out once -> marked failed and strictly suppressed against retry loops
+        engine.markBluetoothDeviceFailedForSession(77)
+        assertTrue(engine.isBluetoothDeviceSuppressedForSession(77))
+        engine.handleBluetoothTopologyUpdate(hasBluetoothAvailable = true, bluetoothDeviceId = 77)
+        org.junit.Assert.assertFalse("Failed BT device ID must NOT re-trigger switch loop", engine.hasPendingBluetoothSwitch())
+
+        // A different BT device ID 88 is NOT suppressed and queues normally
+        engine.handleBluetoothTopologyUpdate(hasBluetoothAvailable = true, bluetoothDeviceId = 88)
+        assertTrue("Different BT headset ID must still be eligible for handoff", engine.hasPendingBluetoothSwitch())
+
+        // Physical disconnect clears suppression so reconnecting ID 77 works again
+        engine.handleBluetoothTopologyUpdate(hasBluetoothAvailable = false, bluetoothDeviceId = null)
+        org.junit.Assert.assertFalse(engine.isBluetoothDeviceSuppressedForSession(77))
+        engine.handleBluetoothTopologyUpdate(hasBluetoothAvailable = true, bluetoothDeviceId = 77)
+        assertTrue("Reconnected BT headset after physical disconnect must re-enable handoff", engine.hasPendingBluetoothSwitch())
+
+        engine.stopRecordingAndFinalize()
+        engine.releaseEngineResources()
+    }
+
+    @Test
+    fun `verify Top App Bar active microphone indicator state resolution across Phone Connecting and Bluetooth`() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+
+        // 1. Connecting state takes highest priority regardless of previous device label
+        assertEquals(
+            com.example.ui.screens.ActiveMicIndicatorState.CONNECTING_BLUETOOTH,
+            com.example.ui.screens.resolveActiveMicIndicatorState(
+                activeAudioDeviceName = "Phone Microphone",
+                isConnectingBluetoothMic = true
+            )
+        )
+        assertEquals(
+            com.example.ui.screens.ActiveMicIndicatorState.CONNECTING_BLUETOOTH,
+            com.example.ui.screens.resolveActiveMicIndicatorState(
+                activeAudioDeviceName = "Bluetooth Headset",
+                isConnectingBluetoothMic = true
+            )
+        )
+
+        // 2. Active Bluetooth / BLE headset state
+        assertEquals(
+            com.example.ui.screens.ActiveMicIndicatorState.BLUETOOTH_ACTIVE,
+            com.example.ui.screens.resolveActiveMicIndicatorState(
+                activeAudioDeviceName = "Bluetooth Headset",
+                isConnectingBluetoothMic = false
+            )
+        )
+        assertEquals(
+            com.example.ui.screens.ActiveMicIndicatorState.BLUETOOTH_ACTIVE,
+            com.example.ui.screens.resolveActiveMicIndicatorState(
+                activeAudioDeviceName = "BLE Headset",
+                isConnectingBluetoothMic = false
+            )
+        )
+
+        // 3. Active Wired / USB headset state
+        assertEquals(
+            com.example.ui.screens.ActiveMicIndicatorState.WIRED_HEADSET_ACTIVE,
+            com.example.ui.screens.resolveActiveMicIndicatorState(
+                activeAudioDeviceName = "Wired Headset",
+                isConnectingBluetoothMic = false
+            )
+        )
+        assertEquals(
+            com.example.ui.screens.ActiveMicIndicatorState.WIRED_HEADSET_ACTIVE,
+            com.example.ui.screens.resolveActiveMicIndicatorState(
+                activeAudioDeviceName = "USB Headset",
+                isConnectingBluetoothMic = false
+            )
+        )
+
+        // 4. Default internal Phone Microphone state
+        assertEquals(
+            com.example.ui.screens.ActiveMicIndicatorState.PHONE_MIC_ACTIVE,
+            com.example.ui.screens.resolveActiveMicIndicatorState(
+                activeAudioDeviceName = "Phone Microphone",
+                isConnectingBluetoothMic = false
+            )
+        )
+
+        // 5. Verify TalkBack accessibility strings exist
+        assertTrue(context.getString(R.string.mic_indicator_phone).isNotBlank())
+        assertTrue(context.getString(R.string.mic_indicator_bluetooth).isNotBlank())
+        assertTrue(context.getString(R.string.mic_indicator_connecting_bluetooth).isNotBlank())
+        assertTrue(context.getString(R.string.mic_indicator_wired_headset).isNotBlank())
+    }
+}
 
 
 

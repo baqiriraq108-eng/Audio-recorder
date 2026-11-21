@@ -37,4 +37,13 @@
     <string name="notification_action_continue_rec">Continue Recording</string>
     <string name="notification_status_playback">Playback</string>
     <string name="recording_title_hint">Recording title…</string>
+    <string name="connecting_bluetooth_mic">CONNECTING BLUETOOTH MIC…</string>
+    <string name="bluetooth_fallback_phone_mic">Bluetooth mic unavailable — recording with Phone Microphone</string>
+    <string name="bluetooth_disconnected_phone_mic">Bluetooth disconnected — switched to Phone Microphone</string>
+    <string name="bluetooth_switched_active">Switched to Bluetooth Headset</string>
+    <string name="bluetooth_handoff_failed_phone_mic">Bluetooth mic unavailable — continuing with Phone Microphone</string>
+    <string name="mic_indicator_phone">Phone Microphone Active</string>
+    <string name="mic_indicator_bluetooth">Bluetooth Headset Active</string>
+    <string name="mic_indicator_connecting_bluetooth">Connecting Bluetooth Microphone</string>
+    <string name="mic_indicator_wired_headset">Wired Headset Active</string>
 </resources>

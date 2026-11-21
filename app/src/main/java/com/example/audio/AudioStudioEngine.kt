@@ -1,7 +1,6 @@
 package com.example.audio
 
 import android.annotation.SuppressLint
-import android.bluetooth.BluetoothHeadset
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
@@ -23,9 +22,11 @@ import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
+import com.example.R
 import com.example.data.AudioFormatUtils
 import com.example.data.SilenceInterval
 import com.example.data.SilenceSkipConfig
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -37,11 +38,14 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import java.io.File
 import java.io.FileOutputStream
 import java.io.RandomAccessFile
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.Executor
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 import kotlin.math.cos
@@ -66,18 +70,38 @@ class AudioStudioEngine(private val context: Context) {
     private val _livePeaks = MutableStateFlow<List<Float>>(emptyList())
     val livePeaks: StateFlow<List<Float>> = _livePeaks.asStateFlow()
 
-    // Active microphone / headset input hardware label
+    // Active microphone / headset input hardware label & async Bluetooth connection status
     private val _activeAudioDeviceName = MutableStateFlow("Phone Microphone")
     val activeAudioDeviceName: StateFlow<String> = _activeAudioDeviceName.asStateFlow()
 
-    private var isBluetoothScoActive = false
-    private val needsAudioRecordRebind = AtomicBoolean(false)
+    private val _isConnectingBluetoothMic = MutableStateFlow(false)
+    val isConnectingBluetoothMic: StateFlow<Boolean> = _isConnectingBluetoothMic.asStateFlow()
+
+    private val _routingNoticeMessage = MutableStateFlow<String?>(null)
+    val routingNoticeMessage: StateFlow<String?> = _routingNoticeMessage.asStateFlow()
+
+    fun clearRoutingNotice() {
+        _routingNoticeMessage.value = null
+    }
+
+    private val captureStateLock = Any()
+    @Volatile
+    private var hasActiveBluetoothCommRoute: Boolean = false
+    @Volatile
+    private var isCapturingFromBluetooth: Boolean = false
+    @Volatile
+    private var isSwitchingMicrophone: Boolean = false
+    @Volatile
+    private var activeBluetoothDeviceId: Int? = null
+    private val pendingFallbackToPhoneMic = AtomicBoolean(false)
+    private val pendingSwitchToBluetooth = AtomicBoolean(false)
+    private val failedBluetoothDeviceIds = ConcurrentHashMap.newKeySet<Int>()
+
     private val mainHandler = Handler(Looper.getMainLooper())
+    private val mainThreadExecutor = Executor { command -> mainHandler.post(command) }
     private var audioDeviceCallback: AudioDeviceCallback? = null
-    private var headsetBroadcastReceiver: BroadcastReceiver? = null
+    private var activeCommDeviceDisconnectListener: Any? = null
     private var isDeviceMonitorRegistered = false
-    private var activeEchoCancellationEnabled: Boolean = true
-    private var activeNoiseSuppressionEnabled: Boolean = true
 
     // Playback state flows
     private val _isPlaying = MutableStateFlow(false)
@@ -306,44 +330,66 @@ class AudioStudioEngine(private val context: Context) {
     }
 
     /**
-     * Finds the highest-priority connected external or headset input device (Bluetooth SCO/BLE,
-     * wired 3.5mm headset, or USB headset) to capture audio instead of the phone's built-in microphone.
+     * Queries OS audio devices to locate an available Bluetooth headset (BLE Audio or SCO/HFP).
+     * On Android 12+ (API 31+), checks `availableCommunicationDevices` first because modern TWS
+     * earbuds (such as Huawei FreeBuds 5) advertise their HFP/BLE mic channel there before the
+     * input node is activated in `GET_DEVICES_INPUTS`.
+     */
+    @SuppressLint("MissingPermission")
+    private fun findAvailableBluetoothRouteDevice(audioManager: AudioManager): AudioDeviceInfo? {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) return null
+        return try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                val commDevices = try {
+                    audioManager.availableCommunicationDevices
+                } catch (_: Exception) {
+                    emptyList()
+                }
+                val bleComm = commDevices.firstOrNull { it.type == AudioDeviceInfo.TYPE_BLE_HEADSET }
+                if (bleComm != null) return bleComm
+                val scoComm = commDevices.firstOrNull { it.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO }
+                if (scoComm != null) return scoComm
+            }
+
+            val inputDevices = audioManager.getDevices(AudioManager.GET_DEVICES_INPUTS)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                val bleInput = inputDevices.firstOrNull { it.type == AudioDeviceInfo.TYPE_BLE_HEADSET }
+                if (bleInput != null) return bleInput
+            }
+            inputDevices.firstOrNull { it.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO }
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    /**
+     * Finds the highest-priority connected external or headset input device (Bluetooth BLE/SCO,
+     * wired 3.5mm headset, or USB headset) without mutating hardware state.
      */
     @SuppressLint("MissingPermission")
     fun findPreferredHeadsetInputDevice(audioManager: AudioManager): AudioDeviceInfo? {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) return null
         return try {
+            val bluetoothDevice = findAvailableBluetoothRouteDevice(audioManager)
+            if (bluetoothDevice != null) return bluetoothDevice
+
             val inputDevices = audioManager.getDevices(AudioManager.GET_DEVICES_INPUTS)
-            // Priority 1: Bluetooth SCO / BLE Headset from active input devices
-            val bluetoothInput = inputDevices.firstOrNull { dev ->
-                isBluetoothHeadsetDevice(dev)
-            }
-            if (bluetoothInput != null) return bluetoothInput
-
-            // On Android 12+ (API 31+), a paired & connected Bluetooth HFP/BLE headset may appear in
-            // availableCommunicationDevices before MODE_IN_COMMUNICATION activates its SCO input node.
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                val btCommDevice = try {
-                    audioManager.availableCommunicationDevices.firstOrNull { dev ->
-                        isBluetoothHeadsetDevice(dev)
-                    }
-                } catch (_: Exception) {
-                    null
-                }
-                if (btCommDevice != null) return btCommDevice
-            }
-
-            // Priority 2: Wired 3.5mm Headset with microphone
-            val wiredHeadset = inputDevices.firstOrNull { dev ->
-                dev.type == AudioDeviceInfo.TYPE_WIRED_HEADSET
-            }
+            val wiredHeadset = inputDevices.firstOrNull { it.type == AudioDeviceInfo.TYPE_WIRED_HEADSET }
             if (wiredHeadset != null) return wiredHeadset
 
-            // Priority 3: USB Headset / USB Audio Device
-            val usbDevice = inputDevices.firstOrNull { dev ->
-                dev.type == AudioDeviceInfo.TYPE_USB_HEADSET || dev.type == AudioDeviceInfo.TYPE_USB_DEVICE
+            inputDevices.firstOrNull {
+                it.type == AudioDeviceInfo.TYPE_USB_HEADSET || it.type == AudioDeviceInfo.TYPE_USB_DEVICE
             }
-            usbDevice
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    private fun findBuiltInMicInputDevice(audioManager: AudioManager): AudioDeviceInfo? {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) return null
+        return try {
+            audioManager.getDevices(AudioManager.GET_DEVICES_INPUTS)
+                .firstOrNull { it.type == AudioDeviceInfo.TYPE_BUILTIN_MIC }
         } catch (_: Exception) {
             null
         }
@@ -353,16 +399,6 @@ class AudioStudioEngine(private val context: Context) {
         if (device == null || Build.VERSION.SDK_INT < Build.VERSION_CODES.M) return false
         return device.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO ||
             (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && device.type == AudioDeviceInfo.TYPE_BLE_HEADSET)
-    }
-
-    private fun findBuiltInMicInputDevice(audioManager: AudioManager): AudioDeviceInfo? {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) return null
-        return try {
-            val inputs = audioManager.getDevices(AudioManager.GET_DEVICES_INPUTS)
-            inputs.firstOrNull { it.type == AudioDeviceInfo.TYPE_BUILTIN_MIC }
-        } catch (_: Exception) {
-            null
-        }
     }
 
     private fun formatInputDeviceLabel(device: AudioDeviceInfo?): String {
@@ -379,33 +415,66 @@ class AudioStudioEngine(private val context: Context) {
         }
     }
 
+    internal fun markBluetoothDeviceFailedForSession(deviceId: Int) {
+        failedBluetoothDeviceIds.add(deviceId)
+    }
+
+    internal fun clearFailedBluetoothDevices() {
+        failedBluetoothDeviceIds.clear()
+    }
+
+    internal fun isBluetoothDeviceSuppressedForSession(deviceId: Int?): Boolean {
+        return deviceId != null && failedBluetoothDeviceIds.contains(deviceId)
+    }
+
+    internal fun hasPendingBluetoothSwitch(): Boolean = pendingSwitchToBluetooth.get()
+
+    internal fun hasPendingPhoneMicFallback(): Boolean = pendingFallbackToPhoneMic.get()
+
     /**
-     * Refreshes the currently connected audio input devices and updates [activeAudioDeviceName].
-     * If a recording session is active and the target hardware route changed, triggers a seamless
-     * hardware rebind so recording continues on the newly connected headset or falls back to the
-     * phone's built-in microphone on disconnect.
+     * Evaluates Bluetooth audio topology changes for true two-way mid-recording handoff:
+     * - Bluetooth added while recording on Phone Mic -> queues seamless Phone -> BT switch
+     *   (deferred automatically if paused, activating when resumed), unless this Bluetooth
+     *   device ID failed/timed out earlier in the same session.
+     * - Bluetooth physically removed -> clears failed-device suppression and any queued BT switch,
+     *   and if actively capturing on Bluetooth, queues seamless BT -> Phone Mic fallback.
+     */
+    internal fun handleBluetoothTopologyUpdate(
+        hasBluetoothAvailable: Boolean,
+        bluetoothDeviceId: Int?
+    ) {
+        if (!hasBluetoothAvailable) {
+            failedBluetoothDeviceIds.clear()
+            pendingSwitchToBluetooth.set(false)
+            if (_isRecording.value && isCapturingFromBluetooth && !_isConnectingBluetoothMic.value && !isSwitchingMicrophone) {
+                pendingFallbackToPhoneMic.set(true)
+            }
+            return
+        }
+
+        if (_isRecording.value && !isCapturingFromBluetooth && !_isConnectingBluetoothMic.value && !isSwitchingMicrophone) {
+            if (bluetoothDeviceId != null && !failedBluetoothDeviceIds.contains(bluetoothDeviceId)) {
+                pendingSwitchToBluetooth.set(true)
+            }
+        }
+    }
+
+    /**
+     * Refreshes connected audio device state and signals bidirectional mid-recording handoffs
+     * (Phone Mic <-> Bluetooth Headset) whenever OS audio topology changes.
      */
     fun refreshConnectedAudioDevices() {
         val am = context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager ?: return
-        val preferred = findPreferredHeadsetInputDevice(am)
-        val newLabel = formatInputDeviceLabel(preferred)
-        val previousLabel = _activeAudioDeviceName.value
-        _activeAudioDeviceName.value = newLabel
-
+        val availableBt = findAvailableBluetoothRouteDevice(am)
         if (_isRecording.value) {
-            val currentRecord = activeAudioRecord
-            val routedId = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-                try { currentRecord?.routedDevice?.id } catch (_: Exception) { null }
-            } else null
-            val targetId = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-                preferred?.id ?: findBuiltInMicInputDevice(am)?.id
-            } else null
-
-            if (previousLabel != newLabel || (targetId != null && routedId != null && targetId != routedId)) {
-                applyHardwareInputRouting(am, preferred, currentRecord)
-                needsAudioRecordRebind.set(true)
-            }
+            handleBluetoothTopologyUpdate(
+                hasBluetoothAvailable = availableBt != null,
+                bluetoothDeviceId = availableBt?.id
+            )
+            return
         }
+        val preferred = findPreferredHeadsetInputDevice(am)
+        _activeAudioDeviceName.value = formatInputDeviceLabel(preferred)
     }
 
     private fun registerAudioDeviceMonitor() {
@@ -420,6 +489,9 @@ class AudioStudioEngine(private val context: Context) {
                 }
 
                 override fun onAudioDevicesRemoved(removedDevices: Array<out AudioDeviceInfo>?) {
+                    if (removedDevices?.any { isBluetoothHeadsetDevice(it) } == true) {
+                        failedBluetoothDeviceIds.clear()
+                    }
                     refreshConnectedAudioDevices()
                 }
             }
@@ -428,48 +500,40 @@ class AudioStudioEngine(private val context: Context) {
                 am.registerAudioDeviceCallback(callback, mainHandler)
             } catch (_: Exception) {}
         }
+    }
 
-        val receiver = object : BroadcastReceiver() {
-            override fun onReceive(ctx: Context?, intent: Intent?) {
-                val action = intent?.action ?: return
-                if (action == AudioManager.ACTION_SCO_AUDIO_STATE_UPDATED) {
-                    val state = intent.getIntExtra(
-                        AudioManager.EXTRA_SCO_AUDIO_STATE,
-                        AudioManager.SCO_AUDIO_STATE_ERROR
-                    )
-                    if (state == AudioManager.SCO_AUDIO_STATE_CONNECTED && _isRecording.value) {
-                        val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
-                        if (audioManager != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-                            val btInput = audioManager.getDevices(AudioManager.GET_DEVICES_INPUTS)
-                                .firstOrNull { isBluetoothHeadsetDevice(it) }
-                            if (btInput != null) {
-                                try {
-                                    activeAudioRecord?.preferredDevice = btInput
-                                } catch (_: Exception) {}
-                            }
+    private fun registerActiveBluetoothDisconnectListener(audioManager: AudioManager) {
+        unregisterActiveBluetoothDisconnectListener(audioManager)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            val listener = AudioManager.OnCommunicationDeviceChangedListener { device ->
+                if (_isRecording.value && isCapturingFromBluetooth && !_isConnectingBluetoothMic.value) {
+                    if (device == null || !isBluetoothHeadsetDevice(device)) {
+                        val btStillAvailable = findAvailableBluetoothRouteDevice(audioManager)
+                        if (btStillAvailable == null) {
+                            pendingFallbackToPhoneMic.set(true)
                         }
-                    } else if (state == AudioManager.SCO_AUDIO_STATE_DISCONNECTED && _isRecording.value) {
-                        refreshConnectedAudioDevices()
                     }
-                } else {
-                    refreshConnectedAudioDevices()
                 }
             }
+            activeCommDeviceDisconnectListener = listener
+            try {
+                audioManager.addOnCommunicationDeviceChangedListener(mainThreadExecutor, listener)
+            } catch (_: Exception) {
+                activeCommDeviceDisconnectListener = null
+            }
         }
-        headsetBroadcastReceiver = receiver
-        try {
-            val filter = IntentFilter().apply {
-                addAction(AudioManager.ACTION_HEADSET_PLUG)
-                addAction(AudioManager.ACTION_SCO_AUDIO_STATE_UPDATED)
-                addAction(AudioManager.ACTION_AUDIO_BECOMING_NOISY)
-                addAction(BluetoothHeadset.ACTION_CONNECTION_STATE_CHANGED)
-            }
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                context.registerReceiver(receiver, filter, Context.RECEIVER_NOT_EXPORTED)
-            } else {
-                context.registerReceiver(receiver, filter)
-            }
-        } catch (_: Exception) {}
+    }
+
+    private fun unregisterActiveBluetoothDisconnectListener(audioManager: AudioManager?) {
+        val existing = activeCommDeviceDisconnectListener ?: return
+        activeCommDeviceDisconnectListener = null
+        if (audioManager != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            try {
+                audioManager.removeOnCommunicationDeviceChangedListener(
+                    existing as AudioManager.OnCommunicationDeviceChangedListener
+                )
+            } catch (_: Exception) {}
+        }
     }
 
     fun releaseEngineResources() {
@@ -478,112 +542,253 @@ class AudioStudioEngine(private val context: Context) {
         if (!isDeviceMonitorRegistered) return
         isDeviceMonitorRegistered = false
         val am = context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
+        unregisterActiveBluetoothDisconnectListener(am)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && audioDeviceCallback != null) {
             try {
                 am?.unregisterAudioDeviceCallback(audioDeviceCallback)
             } catch (_: Exception) {}
         }
         audioDeviceCallback = null
-        headsetBroadcastReceiver?.let { receiver ->
-            try {
-                context.unregisterReceiver(receiver)
-            } catch (_: Exception) {}
-        }
-        headsetBroadcastReceiver = null
+    }
+
+    private sealed class BluetoothRouteResult {
+        data class Connected(val inputDevice: AudioDeviceInfo?, val label: String) : BluetoothRouteResult()
+        data object FallbackToPhoneMic : BluetoothRouteResult()
+        data object Cancelled : BluetoothRouteResult()
     }
 
     /**
-     * Explicitly configures OS audio routing and AudioRecord preferred input device:
-     * - For Bluetooth Headsets (SCO / BLE): switches AudioManager to MODE_IN_COMMUNICATION,
-     *   calls setCommunicationDevice on Android 12+ (API 31+) and starts Bluetooth SCO link,
-     *   then binds AudioRecord.preferredDevice to the Bluetooth headset input node.
-     * - For Wired / USB Headsets: clears any stale Bluetooth SCO state, uses MODE_NORMAL,
-     *   and binds AudioRecord.preferredDevice directly to the wired/USB headset input node.
-     * - For Phone Microphone fallback (on headset disconnect or when no headset is present):
-     *   clears communication device/SCO, restores MODE_NORMAL, and binds AudioRecord.preferredDevice
-     *   to TYPE_BUILTIN_MIC.
+     * Stage 1: Asynchronous Bluetooth Route Coordinator.
+     * Requests OS communication audio routing using the standard Android API for the device's OS
+     * version (strictly `setCommunicationDevice` on Android 12+, or `startBluetoothSco` on older
+     * versions — never mixing both), then suspends until the OS confirms the mic route is open.
+     * Falls back cleanly to Phone Microphone on timeout or rejection so recordings never capture
+     * flatlined silence.
      */
     @Suppress("DEPRECATION")
     @SuppressLint("MissingPermission")
-    private fun applyHardwareInputRouting(
-        audioManager: AudioManager?,
-        preferredHeadset: AudioDeviceInfo?,
-        audioRecord: AudioRecord?
-    ) {
-        if (audioManager == null) return
+    private suspend fun establishBluetoothRouteAsync(
+        audioManager: AudioManager,
+        targetBtDevice: AudioDeviceInfo,
+        timeoutMs: Long = 3500L
+    ): BluetoothRouteResult {
+        if (!_isRecording.value) return BluetoothRouteResult.Cancelled
+        _isConnectingBluetoothMic.value = true
         try {
-            if (preferredHeadset != null && isBluetoothHeadsetDevice(preferredHeadset)) {
-                try {
-                    audioManager.mode = AudioManager.MODE_IN_COMMUNICATION
-                } catch (_: Exception) {}
-
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                    try {
-                        val commDevice = audioManager.availableCommunicationDevices.firstOrNull { dev ->
-                            dev.id == preferredHeadset.id || isBluetoothHeadsetDevice(dev)
-                        }
-                        if (commDevice != null) {
-                            audioManager.setCommunicationDevice(commDevice)
-                        }
-                    } catch (_: Exception) {}
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                val commDevice = try {
+                    audioManager.availableCommunicationDevices.firstOrNull { dev ->
+                        dev.id == targetBtDevice.id || isBluetoothHeadsetDevice(dev)
+                    }
+                } catch (_: Exception) {
+                    null
                 }
 
-                if (preferredHeadset.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO) {
-                    try {
-                        if (!audioManager.isBluetoothScoOn) {
-                            audioManager.startBluetoothSco()
-                            audioManager.isBluetoothScoOn = true
-                        }
-                        isBluetoothScoActive = true
-                    } catch (_: Exception) {}
-                }
-
-                if (audioRecord != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-                    val activeBtInput = try {
+                if (commDevice == null) {
+                    // Check if a BLE/SCO input node is already directly active without a communication profile
+                    val directInput = try {
                         audioManager.getDevices(AudioManager.GET_DEVICES_INPUTS)
                             .firstOrNull { isBluetoothHeadsetDevice(it) }
                     } catch (_: Exception) {
                         null
-                    } ?: preferredHeadset
-                    try {
-                        audioRecord.preferredDevice = activeBtInput
-                    } catch (_: Exception) {}
+                    }
+                    return if (directInput != null) {
+                        activeBluetoothDeviceId = directInput.id
+                        BluetoothRouteResult.Connected(directInput, formatInputDeviceLabel(directInput))
+                    } else {
+                        BluetoothRouteResult.FallbackToPhoneMic
+                    }
                 }
-            } else if (preferredHeadset != null) {
-                // Wired 3.5mm headset or USB headset
-                clearBluetoothCommunicationRouting(audioManager)
-                if (audioRecord != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+
+                val routeConfirmed = CompletableDeferred<Boolean>()
+                val tempListener = AudioManager.OnCommunicationDeviceChangedListener { device ->
+                    if (device != null && (device.id == commDevice.id || isBluetoothHeadsetDevice(device))) {
+                        routeConfirmed.complete(true)
+                    }
+                }
+
+                try {
+                    audioManager.addOnCommunicationDeviceChangedListener(mainThreadExecutor, tempListener)
+                } catch (_: Exception) {}
+
+                try {
                     try {
-                        audioRecord.preferredDevice = preferredHeadset
+                        audioManager.mode = AudioManager.MODE_IN_COMMUNICATION
+                    } catch (_: Exception) {}
+                    hasActiveBluetoothCommRoute = true
+
+                    val alreadyActive = try {
+                        val current = audioManager.communicationDevice
+                        current != null && (current.id == commDevice.id || isBluetoothHeadsetDevice(current))
+                    } catch (_: Exception) {
+                        false
+                    }
+
+                    if (alreadyActive) {
+                        routeConfirmed.complete(true)
+                    } else {
+                        val accepted = try {
+                            audioManager.setCommunicationDevice(commDevice)
+                        } catch (_: Exception) {
+                            false
+                        }
+                        if (!accepted) {
+                            teardownBluetoothRoute(audioManager)
+                            return BluetoothRouteResult.FallbackToPhoneMic
+                        }
+                    }
+
+                    // Await OS confirmation callback (with lightweight polling backup for OEM HALs/Robolectric)
+                    val confirmed = withTimeoutOrNull(timeoutMs) {
+                        while (_isRecording.value) {
+                            if (routeConfirmed.isCompleted) return@withTimeoutOrNull true
+                            val activeComm = try {
+                                audioManager.communicationDevice
+                            } catch (_: Exception) {
+                                null
+                            }
+                            if (activeComm != null && (activeComm.id == commDevice.id || isBluetoothHeadsetDevice(activeComm))) {
+                                return@withTimeoutOrNull true
+                            }
+                            delay(60L)
+                        }
+                        false
+                    } ?: false
+
+                    if (!_isRecording.value) {
+                        teardownBluetoothRoute(audioManager)
+                        return BluetoothRouteResult.Cancelled
+                    }
+
+                    if (!confirmed) {
+                        teardownBluetoothRoute(audioManager)
+                        return BluetoothRouteResult.FallbackToPhoneMic
+                    }
+
+                    // Briefly wait for the Bluetooth input AudioDeviceInfo node to expose its native capabilities
+                    var activeInput: AudioDeviceInfo? = null
+                    val inputDeadline = SystemClock.uptimeMillis() + 450L
+                    while (_isRecording.value) {
+                        activeInput = try {
+                            audioManager.getDevices(AudioManager.GET_DEVICES_INPUTS)
+                                .firstOrNull { isBluetoothHeadsetDevice(it) }
+                        } catch (_: Exception) {
+                            null
+                        }
+                        if (activeInput != null || SystemClock.uptimeMillis() >= inputDeadline) break
+                        delay(45L)
+                    }
+
+                    if (!_isRecording.value) {
+                        teardownBluetoothRoute(audioManager)
+                        return BluetoothRouteResult.Cancelled
+                    }
+
+                    val resolvedInput = activeInput ?: commDevice
+                    activeBluetoothDeviceId = resolvedInput.id
+                    registerActiveBluetoothDisconnectListener(audioManager)
+                    return BluetoothRouteResult.Connected(resolvedInput, formatInputDeviceLabel(resolvedInput))
+                } finally {
+                    try {
+                        audioManager.removeOnCommunicationDeviceChangedListener(tempListener)
                     } catch (_: Exception) {}
                 }
             } else {
-                // Fallback to built-in phone microphone
-                clearBluetoothCommunicationRouting(audioManager)
-                if (audioRecord != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-                    val builtInMic = findBuiltInMicInputDevice(audioManager)
+                // Legacy Android (< API 31): standard SCO handshake waiting for SCO_AUDIO_STATE_CONNECTED
+                val scoConfirmed = CompletableDeferred<Boolean>()
+                val scoReceiver = object : BroadcastReceiver() {
+                    override fun onReceive(ctx: Context?, intent: Intent?) {
+                        if (intent?.action != AudioManager.ACTION_SCO_AUDIO_STATE_UPDATED) return
+                        val state = intent.getIntExtra(
+                            AudioManager.EXTRA_SCO_AUDIO_STATE,
+                            AudioManager.SCO_AUDIO_STATE_ERROR
+                        )
+                        if (state == AudioManager.SCO_AUDIO_STATE_CONNECTED) {
+                            scoConfirmed.complete(true)
+                        } else if (state == AudioManager.SCO_AUDIO_STATE_ERROR) {
+                            scoConfirmed.complete(false)
+                        }
+                    }
+                }
+                val filter = IntentFilter(AudioManager.ACTION_SCO_AUDIO_STATE_UPDATED)
+                try {
+                    context.registerReceiver(scoReceiver, filter)
+                } catch (_: Exception) {}
+
+                try {
                     try {
-                        audioRecord.preferredDevice = builtInMic
+                        audioManager.mode = AudioManager.MODE_IN_COMMUNICATION
+                        audioManager.startBluetoothSco()
+                        audioManager.isBluetoothScoOn = true
+                        hasActiveBluetoothCommRoute = true
+                    } catch (_: Exception) {
+                        teardownBluetoothRoute(audioManager)
+                        return BluetoothRouteResult.FallbackToPhoneMic
+                    }
+
+                    val confirmed = withTimeoutOrNull(timeoutMs) {
+                        while (_isRecording.value) {
+                            if (scoConfirmed.isCompleted) return@withTimeoutOrNull scoConfirmed.await()
+                            if (isRobolectricRuntime && try { audioManager.isBluetoothScoOn } catch (_: Exception) { false }) {
+                                return@withTimeoutOrNull true
+                            }
+                            delay(60L)
+                        }
+                        false
+                    } ?: false
+
+                    if (!_isRecording.value) {
+                        teardownBluetoothRoute(audioManager)
+                        return BluetoothRouteResult.Cancelled
+                    }
+                    if (!confirmed) {
+                        teardownBluetoothRoute(audioManager)
+                        return BluetoothRouteResult.FallbackToPhoneMic
+                    }
+
+                    val btInput = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                        try {
+                            audioManager.getDevices(AudioManager.GET_DEVICES_INPUTS)
+                                .firstOrNull { isBluetoothHeadsetDevice(it) }
+                        } catch (_: Exception) {
+                            null
+                        }
+                    } else null
+                    activeBluetoothDeviceId = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) btInput?.id else null
+                    return BluetoothRouteResult.Connected(btInput ?: targetBtDevice, formatInputDeviceLabel(btInput ?: targetBtDevice))
+                } finally {
+                    try {
+                        context.unregisterReceiver(scoReceiver)
                     } catch (_: Exception) {}
                 }
             }
-        } catch (_: Exception) {}
+        } finally {
+            _isConnectingBluetoothMic.value = false
+        }
     }
 
+    /**
+     * Tears down the active Bluetooth communication route and restores normal audio mode.
+     * Invoked ONLY when a recording session ends (Save/Discard), times out on startup, or
+     * when Bluetooth earbuds physically disconnect mid-session — NEVER during Pause.
+     */
     @Suppress("DEPRECATION")
-    private fun clearBluetoothCommunicationRouting(audioManager: AudioManager?) {
+    private fun teardownBluetoothRoute(audioManager: AudioManager?) {
+        unregisterActiveBluetoothDisconnectListener(audioManager)
+        activeBluetoothDeviceId = null
+        if (!hasActiveBluetoothCommRoute) return
+        hasActiveBluetoothCommRoute = false
         if (audioManager == null) return
+
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
             try {
                 audioManager.clearCommunicationDevice()
             } catch (_: Exception) {}
-        }
-        if (isBluetoothScoActive || try { audioManager.isBluetoothScoOn } catch (_: Exception) { false }) {
+        } else {
             try {
                 audioManager.isBluetoothScoOn = false
                 audioManager.stopBluetoothSco()
             } catch (_: Exception) {}
-            isBluetoothScoActive = false
         }
         try {
             if (audioManager.mode == AudioManager.MODE_IN_COMMUNICATION) {
@@ -592,36 +797,161 @@ class AudioStudioEngine(private val context: Context) {
         } catch (_: Exception) {}
     }
 
+    internal data class CaptureConfig(
+        val sampleRate: Int,
+        val channels: Int,
+        val channelMask: Int,
+        val bufferSizeBytes: Int
+    )
+
     /**
-     * Selects the optimal AudioSource list for the target input hardware:
-     * - Bluetooth Headset (SCO / BLE): VOICE_COMMUNICATION is required by Android Audio HALs
-     *   to route capture through the Bluetooth HFP/BLE voice uplink instead of the internal mic.
-     * - Wired / USB Headset: MIC followed by VOICE_COMMUNICATION avoids far-field internal mic overrides.
-     * - Built-in Phone Microphone: uses VOICE_RECOGNITION when AEC/NS are enabled, or raw MIC when off.
+     * Pure dynamic hardware rate & channel ordering without hardcoded limits:
+     * - When the hardware reports explicit native `sampleRates`, selects strictly from highest
+     *   native rate downward so we always capture the cleanest signal the hardware natively produces.
+     * - When `sampleRates` is empty (meaning arbitrary/standard rates supported by the HAL),
+     *   prioritizes the OS-reported native optimal sample rate (`PROPERTY_OUTPUT_SAMPLE_RATE`)
+     *   followed by standard descending PCM rates.
+     * - Picks the highest natively supported channel count (capped to 1..2 for PCM mono/stereo).
      */
-    private fun resolvePrioritizedAudioSources(
-        preferredHeadset: AudioDeviceInfo?,
+    internal fun orderNativeHardwareCapabilities(
+        nativeSampleRates: IntArray,
+        nativeChannelCounts: IntArray,
+        osNativeSampleRate: Int?,
+        isBluetoothSco: Boolean
+    ): Pair<List<Int>, List<Int>> {
+        val validNativeRates = nativeSampleRates
+            .filter { it in 8000..192000 }
+            .distinct()
+            .sortedDescending()
+
+        val orderedRates = if (validNativeRates.isNotEmpty()) {
+            validNativeRates
+        } else {
+            buildList {
+                if (osNativeSampleRate != null && osNativeSampleRate in 8000..192000) {
+                    add(osNativeSampleRate)
+                }
+                addAll(listOf(96000, 48000, 44100, 32000, 24000, 22050, 16000, 11025, 8000))
+            }.distinct()
+        }
+
+        val validNativeChannels = nativeChannelCounts
+            .filter { it in 1..2 }
+            .distinct()
+            .sortedDescending()
+
+        val orderedChannels = when {
+            validNativeChannels.isNotEmpty() -> validNativeChannels
+            isBluetoothSco -> listOf(1)
+            else -> listOf(2, 1)
+        }
+
+        return orderedRates to orderedChannels
+    }
+
+    /**
+     * Stage 2: Dynamic Hardware Configuration Selector.
+     * Queries the active microphone's [AudioDeviceInfo] native `sampleRates` and `channelCounts`
+     * and returns OS-validated [CaptureConfig] candidates ordered from highest native capability down.
+     */
+    internal fun buildDynamicCaptureCandidates(
+        audioManager: AudioManager?,
+        activeInputDevice: AudioDeviceInfo?
+    ): List<CaptureConfig> {
+        val nativeRates = if (activeInputDevice != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            try {
+                activeInputDevice.sampleRates
+            } catch (_: Exception) {
+                IntArray(0)
+            }
+        } else {
+            IntArray(0)
+        }
+
+        val nativeChannels = if (activeInputDevice != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            try {
+                activeInputDevice.channelCounts
+            } catch (_: Exception) {
+                IntArray(0)
+            }
+        } else {
+            IntArray(0)
+        }
+
+        val osNativeRate = try {
+            audioManager?.getProperty(AudioManager.PROPERTY_OUTPUT_SAMPLE_RATE)?.toIntOrNull()
+        } catch (_: Exception) {
+            null
+        }
+
+        val isBtSco = activeInputDevice != null &&
+            Build.VERSION.SDK_INT >= Build.VERSION_CODES.M &&
+            activeInputDevice.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO
+
+        val (orderedRates, orderedChannels) = orderNativeHardwareCapabilities(
+            nativeSampleRates = nativeRates,
+            nativeChannelCounts = nativeChannels,
+            osNativeSampleRate = osNativeRate,
+            isBluetoothSco = isBtSco
+        )
+
+        val candidates = ArrayList<CaptureConfig>()
+        for (ch in orderedChannels) {
+            val mask = if (ch == 2) AudioFormat.CHANNEL_IN_STEREO else AudioFormat.CHANNEL_IN_MONO
+            for (rate in orderedRates) {
+                val rawMinBuf = try {
+                    AudioRecord.getMinBufferSize(rate, mask, AudioFormat.ENCODING_PCM_16BIT)
+                } catch (_: Exception) {
+                    -1
+                }
+                if (rawMinBuf > 0 || isRobolectricRuntime) {
+                    val bufBytes = rawMinBuf.coerceAtLeast(4096) * 2
+                    candidates.add(
+                        CaptureConfig(
+                            sampleRate = rate,
+                            channels = ch,
+                            channelMask = mask,
+                            bufferSizeBytes = bufBytes
+                        )
+                    )
+                }
+            }
+        }
+
+        if (candidates.isEmpty()) {
+            val fallbackRate = osNativeRate?.takeIf { it in 8000..96000 } ?: 48000
+            val fallbackMask = AudioFormat.CHANNEL_IN_MONO
+            val fallbackBuf = try {
+                AudioRecord.getMinBufferSize(fallbackRate, fallbackMask, AudioFormat.ENCODING_PCM_16BIT)
+            } catch (_: Exception) {
+                4096
+            }.coerceAtLeast(4096) * 2
+            candidates.add(
+                CaptureConfig(
+                    sampleRate = fallbackRate,
+                    channels = 1,
+                    channelMask = fallbackMask,
+                    bufferSizeBytes = fallbackBuf
+                )
+            )
+        }
+
+        return candidates
+    }
+
+    private fun resolveAudioSourceForRoute(
+        activeInputDevice: AudioDeviceInfo?,
+        isBluetoothRoute: Boolean,
         echoCancellationEnabled: Boolean,
         noiseSuppressionEnabled: Boolean
-    ): List<Int> {
+    ): Int {
         return when {
-            isBluetoothHeadsetDevice(preferredHeadset) -> listOf(
-                MediaRecorder.AudioSource.VOICE_COMMUNICATION,
-                MediaRecorder.AudioSource.MIC,
-                MediaRecorder.AudioSource.DEFAULT
-            )
-            preferredHeadset != null -> listOf(
-                MediaRecorder.AudioSource.MIC,
-                MediaRecorder.AudioSource.VOICE_COMMUNICATION,
-                MediaRecorder.AudioSource.DEFAULT
-            )
-            !echoCancellationEnabled && !noiseSuppressionEnabled -> listOf(
-                MediaRecorder.AudioSource.MIC
-            )
-            else -> listOf(
-                MediaRecorder.AudioSource.VOICE_RECOGNITION,
-                MediaRecorder.AudioSource.MIC
-            )
+            isBluetoothRoute -> MediaRecorder.AudioSource.VOICE_COMMUNICATION
+            activeInputDevice != null &&
+                Build.VERSION.SDK_INT >= Build.VERSION_CODES.M &&
+                activeInputDevice.type != AudioDeviceInfo.TYPE_BUILTIN_MIC -> MediaRecorder.AudioSource.MIC
+            !echoCancellationEnabled && !noiseSuppressionEnabled -> MediaRecorder.AudioSource.MIC
+            else -> MediaRecorder.AudioSource.VOICE_RECOGNITION
         }
     }
 
@@ -629,150 +959,144 @@ class AudioStudioEngine(private val context: Context) {
         val audioRecord: AudioRecord,
         val actualSampleRate: Int,
         val actualChannels: Int,
-        val chunkShorts: Int
+        val chunkShorts: Int,
+        val isBluetoothRoute: Boolean
     )
 
     @SuppressLint("MissingPermission")
     private fun createAndStartAudioRecord(
         audioManager: AudioManager?,
-        preferredHeadset: AudioDeviceInfo?,
-        effectiveSampleRate: Int,
-        effectiveChannels: Int,
+        activeInputDevice: AudioDeviceInfo?,
+        isBluetoothRoute: Boolean,
         echoCancellationEnabled: Boolean,
         noiseSuppressionEnabled: Boolean
     ): HardwareCaptureSession? {
-        applyHardwareInputRouting(audioManager, preferredHeadset, null)
-
-        val audioSources = resolvePrioritizedAudioSources(
-            preferredHeadset = preferredHeadset,
+        val resolvedInputDevice = activeInputDevice ?: audioManager?.let { findBuiltInMicInputDevice(it) }
+        val audioSource = resolveAudioSourceForRoute(
+            activeInputDevice = resolvedInputDevice,
+            isBluetoothRoute = isBluetoothRoute,
             echoCancellationEnabled = echoCancellationEnabled,
             noiseSuppressionEnabled = noiseSuppressionEnabled
         )
 
-        val isBtHeadset = isBluetoothHeadsetDevice(preferredHeadset)
-        val safeTargetRate = effectiveSampleRate.coerceIn(8000, 96000)
-        val safeTargetChannels = effectiveChannels.coerceIn(1, 2)
+        val candidates = buildDynamicCaptureCandidates(audioManager, resolvedInputDevice)
+        var initializedRecord: AudioRecord? = null
+        var chosenConfig: CaptureConfig? = null
 
-        val candidateConfigs = buildList {
-            add(safeTargetRate to safeTargetChannels)
-            if (safeTargetChannels != 1) {
-                add(safeTargetRate to 1)
-            }
-            if (isBtHeadset) {
-                // Bluetooth SCO / HFP voice uplinks commonly operate at 16 kHz or 8 kHz Mono
-                add(16000 to 1)
-                add(8000 to 1)
-                add(48000 to 1)
-                add(44100 to 1)
-                add(32000 to 1)
-                add(24000 to 1)
-            } else {
-                add(48000 to safeTargetChannels)
-                add(44100 to safeTargetChannels)
-                add(48000 to 1)
-                add(44100 to 1)
-                add(32000 to 1)
-                add(24000 to 1)
-                add(16000 to 1)
-                add(8000 to 1)
-            }
-        }.distinct()
-
-        var audioRecord: AudioRecord? = null
-        var negotiatedRate = safeTargetRate
-        var negotiatedChannels = safeTargetChannels
-
-        outer@ for (source in audioSources) {
-            for ((candidateRate, candidateCh) in candidateConfigs) {
-                val chConfig = if (candidateCh == 2) {
-                    AudioFormat.CHANNEL_IN_STEREO
+        for (candidate in candidates) {
+            val record = try {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                    AudioRecord.Builder()
+                        .setAudioSource(audioSource)
+                        .setAudioFormat(
+                            AudioFormat.Builder()
+                                .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                                .setSampleRate(candidate.sampleRate)
+                                .setChannelMask(candidate.channelMask)
+                                .build()
+                        )
+                        .setBufferSizeInBytes(candidate.bufferSizeBytes)
+                        .build()
                 } else {
-                    AudioFormat.CHANNEL_IN_MONO
-                }
-                val rawMinBuf = try {
-                    AudioRecord.getMinBufferSize(
-                        candidateRate,
-                        chConfig,
-                        AudioFormat.ENCODING_PCM_16BIT
-                    )
-                } catch (_: Exception) {
-                    -1
-                }
-                if (!isRobolectricRuntime && rawMinBuf <= 0) {
-                    continue
-                }
-                val minBufSize = rawMinBuf.coerceAtLeast(4096)
-                try {
-                    val candidate = AudioRecord(
-                        source,
-                        candidateRate,
-                        chConfig,
+                    AudioRecord(
+                        audioSource,
+                        candidate.sampleRate,
+                        candidate.channelMask,
                         AudioFormat.ENCODING_PCM_16BIT,
-                        minBufSize * 2
+                        candidate.bufferSizeBytes
                     )
-                    if (candidate.state == AudioRecord.STATE_INITIALIZED) {
-                        audioRecord = candidate
-                        negotiatedRate = candidateRate
-                        negotiatedChannels = candidateCh
-                        break@outer
-                    } else {
-                        candidate.release()
-                    }
+                }
+            } catch (_: Exception) {
+                null
+            }
+
+            if (record != null && record.state == AudioRecord.STATE_INITIALIZED) {
+                initializedRecord = record
+                chosenConfig = candidate
+                break
+            } else {
+                try {
+                    record?.release()
                 } catch (_: Exception) {}
             }
         }
 
-        if (audioRecord != null && audioRecord.state == AudioRecord.STATE_INITIALIZED) {
-            activeAudioRecord = audioRecord
-            applyHardwareInputRouting(audioManager, preferredHeadset, audioRecord)
-
-            // Acoustic Echo Cancellation (AEC): enable only when toggle is ON; explicitly disable if OFF
-            if (AcousticEchoCanceler.isAvailable()) {
-                try {
-                    val aec = AcousticEchoCanceler.create(audioRecord.audioSessionId)
-                    if (echoCancellationEnabled) {
-                        aec?.enabled = true
-                        activeAec = aec
-                    } else {
-                        aec?.enabled = false
-                        aec?.release()
-                        activeAec = null
-                    }
-                } catch (_: Exception) {}
+        val audioRecord = initializedRecord
+        val config = chosenConfig
+        if (audioRecord == null || config == null) {
+            synchronized(captureStateLock) {
+                activeAudioRecord = null
             }
-            // Noise Suppression (NS): enable only when toggle is ON; explicitly disable if OFF
-            if (NoiseSuppressor.isAvailable()) {
-                try {
-                    val ns = NoiseSuppressor.create(audioRecord.audioSessionId)
-                    if (noiseSuppressionEnabled) {
-                        ns?.enabled = true
-                        activeNs = ns
-                    } else {
-                        ns?.enabled = false
-                        ns?.release()
-                        activeNs = null
-                    }
-                } catch (_: Exception) {}
-            }
-
-            try {
-                audioRecord.startRecording()
-            } catch (_: Exception) {}
-
-            // Re-assert preferredDevice immediately after startRecording() so OEM HALs lock onto the headset
-            applyHardwareInputRouting(audioManager, preferredHeadset, audioRecord)
-            val rawShorts = ((negotiatedRate * negotiatedChannels) / 20).coerceAtLeast(512)
-            val alignedShorts = rawShorts - (rawShorts % negotiatedChannels.coerceAtLeast(1))
-            return HardwareCaptureSession(
-                audioRecord = audioRecord,
-                actualSampleRate = negotiatedRate,
-                actualChannels = negotiatedChannels,
-                chunkShorts = alignedShorts.coerceAtLeast(256)
-            )
-        } else {
-            activeAudioRecord = null
             return null
         }
+
+        synchronized(captureStateLock) {
+            activeAudioRecord = audioRecord
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && resolvedInputDevice != null) {
+                try {
+                    audioRecord.preferredDevice = resolvedInputDevice
+                } catch (_: Exception) {}
+            }
+        }
+
+        // Acoustic Echo Cancellation (AEC): enable only when toggle is ON; explicitly disable if OFF
+        if (AcousticEchoCanceler.isAvailable()) {
+            try {
+                val aec = AcousticEchoCanceler.create(audioRecord.audioSessionId)
+                if (echoCancellationEnabled) {
+                    aec?.enabled = true
+                    activeAec = aec
+                } else {
+                    aec?.enabled = false
+                    aec?.release()
+                    activeAec = null
+                }
+            } catch (_: Exception) {}
+        }
+        // Noise Suppression (NS): enable only when toggle is ON; explicitly disable if OFF
+        if (NoiseSuppressor.isAvailable()) {
+            try {
+                val ns = NoiseSuppressor.create(audioRecord.audioSessionId)
+                if (noiseSuppressionEnabled) {
+                    ns?.enabled = true
+                    activeNs = ns
+                } else {
+                    ns?.enabled = false
+                    ns?.release()
+                    activeNs = null
+                }
+            } catch (_: Exception) {}
+        }
+
+        synchronized(captureStateLock) {
+            if (_isRecording.value && !_isPaused.value) {
+                try {
+                    audioRecord.startRecording()
+                } catch (_: Exception) {}
+            }
+        }
+
+        // Accept whatever exact stream parameters Android's AudioRecord accepted
+        val actualSampleRate = try {
+            audioRecord.sampleRate.takeIf { it in 8000..192000 } ?: config.sampleRate
+        } catch (_: Exception) {
+            config.sampleRate
+        }
+        val actualChannels = try {
+            audioRecord.channelCount.takeIf { it in 1..2 } ?: config.channels
+        } catch (_: Exception) {
+            config.channels
+        }
+
+        val rawShorts = ((actualSampleRate * actualChannels) / 20).coerceAtLeast(512)
+        val alignedShorts = rawShorts - (rawShorts % actualChannels.coerceAtLeast(1))
+        return HardwareCaptureSession(
+            audioRecord = audioRecord,
+            actualSampleRate = actualSampleRate,
+            actualChannels = actualChannels,
+            chunkShorts = alignedShorts.coerceAtLeast(256),
+            isBluetoothRoute = isBluetoothRoute
+        )
     }
 
     @SuppressLint("MissingPermission")
@@ -788,19 +1112,21 @@ class AudioStudioEngine(private val context: Context) {
     ) {
         stopPlayback()
         recordingJob?.cancel()
-        releaseAudioEffects()
-        abandonRecordingAudioFocus()
+        releaseMicrophoneHardwareImmediately()
 
-        activeEchoCancellationEnabled = echoCancellationEnabled
-        activeNoiseSuppressionEnabled = noiseSuppressionEnabled
-        needsAudioRecordRebind.set(false)
+        pendingFallbackToPhoneMic.set(false)
+        pendingSwitchToBluetooth.set(false)
+        failedBluetoothDeviceIds.clear()
+        isSwitchingMicrophone = false
+        isCapturingFromBluetooth = false
 
         val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
-        val initialPreferredHeadset = audioManager?.let { findPreferredHeadsetInputDevice(it) }
-        _activeAudioDeviceName.value = formatInputDeviceLabel(initialPreferredHeadset)
+        val initialPreferredDevice = audioManager?.let { findPreferredHeadsetInputDevice(it) }
+        val initialIsBluetooth = isBluetoothHeadsetDevice(initialPreferredDevice)
+        _activeAudioDeviceName.value = formatInputDeviceLabel(initialPreferredDevice)
 
-        // If appending to an existing M4A file, parse its esds/mdhd/stsd before encoding
-        // so the output stream matches its exact sampleRate and channelCount.
+        // Stage 3 Target Format: Base M4A metadata (for continuations) or requested session format
+        // dictates the output sample rate and channel count; any hardware stream is resampled on-the-fly.
         val baseM4aMeta = if (baseM4aForAppend != null && baseM4aForAppend.exists()) {
             Mp4BoxParser.parseM4a(baseM4aForAppend)
         } else null
@@ -830,6 +1156,7 @@ class AudioStudioEngine(private val context: Context) {
         _elapsedMs.value = 0L
         _livePeaks.value = initialPeaks
         _isPaused.value = false
+        _isConnectingBluetoothMic.value = initialIsBluetooth
         _isRecording.value = true
 
         if (pauseExternalMediaOnRecord) {
@@ -839,53 +1166,252 @@ class AudioStudioEngine(private val context: Context) {
         recordingJob = engineScope.launch(Dispatchers.IO) {
             outputFile.parentFile?.mkdirs()
 
+            // Stage 1: Establish Bluetooth route asynchronously before touching AudioRecord
+            var activeInputDevice: AudioDeviceInfo? = initialPreferredDevice
+            var useBluetoothRoute = false
+
+            if (initialIsBluetooth && audioManager != null && initialPreferredDevice != null) {
+                when (val routeResult = establishBluetoothRouteAsync(audioManager, initialPreferredDevice)) {
+                    is BluetoothRouteResult.Connected -> {
+                        activeInputDevice = routeResult.inputDevice
+                        useBluetoothRoute = true
+                        isCapturingFromBluetooth = true
+                        _activeAudioDeviceName.value = routeResult.label
+                    }
+                    is BluetoothRouteResult.FallbackToPhoneMic -> {
+                        failedBluetoothDeviceIds.add(initialPreferredDevice.id)
+                        activeInputDevice = findBuiltInMicInputDevice(audioManager)
+                        useBluetoothRoute = false
+                        isCapturingFromBluetooth = false
+                        _activeAudioDeviceName.value = "Phone Microphone"
+                        _routingNoticeMessage.value = context.getString(R.string.bluetooth_fallback_phone_mic)
+                    }
+                    is BluetoothRouteResult.Cancelled -> {
+                        return@launch
+                    }
+                }
+            } else {
+                _isConnectingBluetoothMic.value = false
+            }
+
+            if (!_isRecording.value) {
+                teardownBluetoothRoute(audioManager)
+                return@launch
+            }
+
+            // Stage 2: Dynamically initialize AudioRecord at the active mic's highest native capability
             var captureSession: HardwareCaptureSession? = createAndStartAudioRecord(
                 audioManager = audioManager,
-                preferredHeadset = initialPreferredHeadset,
-                effectiveSampleRate = effectiveSampleRate,
-                effectiveChannels = effectiveChannels,
+                activeInputDevice = activeInputDevice,
+                isBluetoothRoute = useBluetoothRoute,
                 echoCancellationEnabled = echoCancellationEnabled,
                 noiseSuppressionEnabled = noiseSuppressionEnabled
             )
-            var activeResampler: WavFileTools.PcmResampler? = captureSession?.let { session ->
-                if (session.actualSampleRate != effectiveSampleRate) {
+
+            // If Bluetooth AudioRecord unexpectedly failed to initialize, cleanly fall back to Phone Mic
+            if (captureSession == null && useBluetoothRoute) {
+                initialPreferredDevice?.let { failedBluetoothDeviceIds.add(it.id) }
+                activeBluetoothDeviceId?.let { failedBluetoothDeviceIds.add(it) }
+                teardownBluetoothRoute(audioManager)
+                useBluetoothRoute = false
+                isCapturingFromBluetooth = false
+                val builtInMic = audioManager?.let { findBuiltInMicInputDevice(it) }
+                _activeAudioDeviceName.value = "Phone Microphone"
+                _routingNoticeMessage.value = context.getString(R.string.bluetooth_fallback_phone_mic)
+                captureSession = createAndStartAudioRecord(
+                    audioManager = audioManager,
+                    activeInputDevice = builtInMic,
+                    isBluetoothRoute = false,
+                    echoCancellationEnabled = echoCancellationEnabled,
+                    noiseSuppressionEnabled = noiseSuppressionEnabled
+                )
+            }
+
+            fun buildResamplerForSession(session: HardwareCaptureSession?): WavFileTools.PcmResampler? {
+                val srcRate = session?.actualSampleRate ?: return null
+                return if (srcRate != effectiveSampleRate) {
                     WavFileTools.PcmResampler(
-                        srcSampleRate = session.actualSampleRate,
+                        srcSampleRate = srcRate,
                         targetSampleRate = effectiveSampleRate,
                         channels = effectiveChannels
                     )
                 } else null
             }
 
-            suspend fun rebindAudioRecordSeamlessly(): HardwareCaptureSession? {
+            var activeResampler: WavFileTools.PcmResampler? = buildResamplerForSession(captureSession)
+            var pendingSpliceFadeIn = false
+
+            fun stopAndReleaseCurrentCaptureSession() {
                 releaseAudioEffects()
-                try {
-                    captureSession?.audioRecord?.stop()
-                } catch (_: Exception) {}
-                try {
-                    captureSession?.audioRecord?.release()
-                } catch (_: Exception) {}
-                activeAudioRecord = null
-                val latestPreferred = audioManager?.let { findPreferredHeadsetInputDevice(it) }
-                _activeAudioDeviceName.value = formatInputDeviceLabel(latestPreferred)
-                val newSession = createAndStartAudioRecord(
-                    audioManager = audioManager,
-                    preferredHeadset = latestPreferred,
-                    effectiveSampleRate = effectiveSampleRate,
-                    effectiveChannels = effectiveChannels,
-                    echoCancellationEnabled = activeEchoCancellationEnabled,
-                    noiseSuppressionEnabled = activeNoiseSuppressionEnabled
-                )
-                activeResampler = newSession?.let { session ->
-                    if (session.actualSampleRate != effectiveSampleRate) {
-                        WavFileTools.PcmResampler(
-                            srcSampleRate = session.actualSampleRate,
-                            targetSampleRate = effectiveSampleRate,
-                            channels = effectiveChannels
-                        )
-                    } else null
+                synchronized(captureStateLock) {
+                    val oldRecord = captureSession?.audioRecord
+                    if (oldRecord != null) {
+                        try {
+                            if (oldRecord.recordingState == AudioRecord.RECORDSTATE_RECORDING) {
+                                oldRecord.stop()
+                            }
+                        } catch (_: Exception) {}
+                        try {
+                            oldRecord.release()
+                        } catch (_: Exception) {}
+                    }
+                    if (activeAudioRecord === oldRecord) {
+                        activeAudioRecord = null
+                    }
                 }
-                return newSession
+                captureSession = null
+            }
+
+            /**
+             * Seamless Bluetooth -> Phone Microphone handoff when Bluetooth earbuds physically
+             * disconnect mid-recording. Re-targets the software resampler on-the-fly and schedules
+             * an 8 ms micro-fade-in so the single open WAV/AAC stream remains click-free.
+             */
+            fun fallbackToPhoneMicrophoneMidSession() {
+                isSwitchingMicrophone = true
+                try {
+                    pendingSwitchToBluetooth.set(false)
+                    stopAndReleaseCurrentCaptureSession()
+                    teardownBluetoothRoute(audioManager)
+                    isCapturingFromBluetooth = false
+                    val builtInMic = audioManager?.let { findBuiltInMicInputDevice(it) }
+                    _activeAudioDeviceName.value = "Phone Microphone"
+                    _routingNoticeMessage.value = context.getString(R.string.bluetooth_disconnected_phone_mic)
+
+                    val newSession = createAndStartAudioRecord(
+                        audioManager = audioManager,
+                        activeInputDevice = builtInMic,
+                        isBluetoothRoute = false,
+                        echoCancellationEnabled = echoCancellationEnabled,
+                        noiseSuppressionEnabled = noiseSuppressionEnabled
+                    )
+                    captureSession = newSession
+                    activeResampler = buildResamplerForSession(newSession)
+                    pendingSpliceFadeIn = true
+                } finally {
+                    isSwitchingMicrophone = false
+                }
+            }
+
+            /**
+             * Seamless Phone Microphone -> Bluetooth Headset mid-recording handoff.
+             * Halts Phone Mic capture while holding the accumulated timer and waveform, opens the
+             * OS Bluetooth audio route asynchronously, dynamically queries the headset's native
+             * hardware capabilities, re-targets the software resampler on-the-fly, and resumes into
+             * the exact same open WAV/AAC file with a smooth 8 ms micro-fade-in.
+             * On timeout or rejection, suppresses retries for that headset instance until physical
+             * disconnect and smoothly resumes Phone Microphone capture.
+             */
+            suspend fun switchToBluetoothMicrophoneMidSession() {
+                if (!_isRecording.value || isCapturingFromBluetooth || audioManager == null) return
+                val targetBtDevice = findAvailableBluetoothRouteDevice(audioManager) ?: return
+                if (isBluetoothDeviceSuppressedForSession(targetBtDevice.id)) return
+
+                isSwitchingMicrophone = true
+                try {
+                    stopAndReleaseCurrentCaptureSession()
+                    _liveDb.value = -58f
+                    _activeAudioDeviceName.value = formatInputDeviceLabel(targetBtDevice)
+                    _isConnectingBluetoothMic.value = true
+
+                    when (val routeResult = establishBluetoothRouteAsync(audioManager, targetBtDevice)) {
+                        is BluetoothRouteResult.Connected -> {
+                            val btSession = createAndStartAudioRecord(
+                                audioManager = audioManager,
+                                activeInputDevice = routeResult.inputDevice,
+                                isBluetoothRoute = true,
+                                echoCancellationEnabled = echoCancellationEnabled,
+                                noiseSuppressionEnabled = noiseSuppressionEnabled
+                            )
+                            if (btSession != null) {
+                                captureSession = btSession
+                                activeResampler = buildResamplerForSession(btSession)
+                                isCapturingFromBluetooth = true
+                                pendingSpliceFadeIn = true
+                                _activeAudioDeviceName.value = routeResult.label
+                                _routingNoticeMessage.value = context.getString(R.string.bluetooth_switched_active)
+                                return
+                            }
+                            // Bluetooth AudioRecord failed to initialize: suppress & recover on Phone Mic
+                            failedBluetoothDeviceIds.add(targetBtDevice.id)
+                            activeBluetoothDeviceId?.let { failedBluetoothDeviceIds.add(it) }
+                            pendingSwitchToBluetooth.set(false)
+                            teardownBluetoothRoute(audioManager)
+                            isCapturingFromBluetooth = false
+                        }
+                        is BluetoothRouteResult.FallbackToPhoneMic -> {
+                            failedBluetoothDeviceIds.add(targetBtDevice.id)
+                            activeBluetoothDeviceId?.let { failedBluetoothDeviceIds.add(it) }
+                            pendingSwitchToBluetooth.set(false)
+                            teardownBluetoothRoute(audioManager)
+                            isCapturingFromBluetooth = false
+                        }
+                        is BluetoothRouteResult.Cancelled -> {
+                            teardownBluetoothRoute(audioManager)
+                            return
+                        }
+                    }
+
+                    // Recovery path: re-open Phone Microphone seamlessly so recording continues unbroken
+                    if (_isRecording.value) {
+                        val builtInMic = findBuiltInMicInputDevice(audioManager)
+                        _activeAudioDeviceName.value = "Phone Microphone"
+                        _routingNoticeMessage.value = context.getString(R.string.bluetooth_handoff_failed_phone_mic)
+                        val recoveredPhoneSession = createAndStartAudioRecord(
+                            audioManager = audioManager,
+                            activeInputDevice = builtInMic,
+                            isBluetoothRoute = false,
+                            echoCancellationEnabled = echoCancellationEnabled,
+                            noiseSuppressionEnabled = noiseSuppressionEnabled
+                        )
+                        captureSession = recoveredPhoneSession
+                        activeResampler = buildResamplerForSession(recoveredPhoneSession)
+                        pendingSpliceFadeIn = true
+                    }
+                } finally {
+                    _isConnectingBluetoothMic.value = false
+                    isSwitchingMicrophone = false
+                }
+            }
+
+            suspend fun resumeCaptureAfterPause() {
+                if (pendingFallbackToPhoneMic.getAndSet(false) && isCapturingFromBluetooth) {
+                    fallbackToPhoneMicrophoneMidSession()
+                    return
+                }
+                if (pendingSwitchToBluetooth.getAndSet(false) && !isCapturingFromBluetooth) {
+                    switchToBluetoothMicrophoneMidSession()
+                    return
+                }
+                val existingSession = captureSession
+                if (existingSession != null && existingSession.audioRecord.state == AudioRecord.STATE_INITIALIZED) {
+                    synchronized(captureStateLock) {
+                        if (!_isRecording.value || _isPaused.value) return
+                        try {
+                            if (existingSession.audioRecord.recordingState != AudioRecord.RECORDSTATE_RECORDING) {
+                                existingSession.audioRecord.startRecording()
+                            }
+                        } catch (_: Exception) {}
+                    }
+                    activeResampler?.reset()
+                    pendingSpliceFadeIn = true
+                } else if (_isRecording.value && !_isPaused.value) {
+                    val fallbackDevice = if (isCapturingFromBluetooth) {
+                        audioManager?.let { findAvailableBluetoothRouteDevice(it) }
+                    } else {
+                        audioManager?.let { findBuiltInMicInputDevice(it) }
+                    }
+                    val recreated = createAndStartAudioRecord(
+                        audioManager = audioManager,
+                        activeInputDevice = fallbackDevice,
+                        isBluetoothRoute = isCapturingFromBluetooth && fallbackDevice != null,
+                        echoCancellationEnabled = echoCancellationEnabled,
+                        noiseSuppressionEnabled = noiseSuppressionEnabled
+                    )
+                    captureSession = recreated
+                    activeResampler = buildResamplerForSession(recreated)
+                    pendingSpliceFadeIn = true
+                }
             }
 
             val isAacSession = outputFile.extension.equals("m4a", ignoreCase = true) ||
@@ -895,8 +1421,9 @@ class AudioStudioEngine(private val context: Context) {
             }
             var shortBuffer = ShortArray(captureSession?.chunkShorts ?: fallbackChunkShorts)
             var totalBytesWritten = 0L
-            var consecutiveReadFailures = 0
+            var wasPaused = false
 
+            // Stage 3: Universal on-the-fly channel conversion + click-free software resampling
             fun convertCapturedShortsToTargetPcmBytes(readShorts: Int): ByteArray {
                 val hwChannels = (captureSession?.actualChannels ?: effectiveChannels).coerceIn(1, 2)
                 val alignedShorts = (readShorts - (readShorts % hwChannels)).coerceAtLeast(0)
@@ -922,7 +1449,7 @@ class AudioStudioEngine(private val context: Context) {
                     val aacEncoder = AacEncoder(
                         sampleRate = effectiveSampleRate,
                         channelCount = effectiveChannels,
-                        bitrate = 128_000,
+                        bitrate = AacEncoder.clampBitrateForAacLc(128_000, effectiveSampleRate, effectiveChannels),
                         baseStartSamples = 0L,
                         skipPrimingFrame = false
                     )
@@ -931,16 +1458,21 @@ class AudioStudioEngine(private val context: Context) {
                     try {
                         while (isActive && _isRecording.value) {
                             if (_isPaused.value) {
+                                wasPaused = true
                                 _liveDb.value = -58f
                                 delay(60L)
                                 continue
                             }
 
-                            if (needsAudioRecordRebind.getAndSet(false)) {
-                                captureSession = rebindAudioRecordSeamlessly()
-                                val reqShorts = captureSession?.chunkShorts ?: fallbackChunkShorts
-                                if (shortBuffer.size < reqShorts) shortBuffer = ShortArray(reqShorts)
-                                consecutiveReadFailures = 0
+                            if (wasPaused) {
+                                wasPaused = false
+                                resumeCaptureAfterPause()
+                            }
+
+                            if (pendingFallbackToPhoneMic.getAndSet(false) && isCapturingFromBluetooth) {
+                                fallbackToPhoneMicrophoneMidSession()
+                            } else if (pendingSwitchToBluetooth.getAndSet(false) && !isCapturingFromBluetooth) {
+                                switchToBluetoothMicrophoneMidSession()
                             }
 
                             val currentRecord = captureSession?.audioRecord
@@ -955,32 +1487,44 @@ class AudioStudioEngine(private val context: Context) {
                                     readSamples = currentRecord.read(shortBuffer, 0, targetReadShorts)
                                 }
                             } catch (_: Exception) {
-                                readSamples = -1
+                                readSamples = 0
                             }
 
                             if (!_isRecording.value) break
-                            if (_isPaused.value) continue
+                            if (_isPaused.value) {
+                                wasPaused = true
+                                continue
+                            }
 
                             if (readSamples <= 0) {
-                                consecutiveReadFailures++
                                 if (!isRobolectricRuntime) {
-                                    if (readSamples < 0 || consecutiveReadFailures >= 6) {
-                                        captureSession = rebindAudioRecordSeamlessly()
-                                        consecutiveReadFailures = 0
-                                    }
-                                    delay(25L)
+                                    delay(30L)
                                     continue
                                 } else {
                                     readSamples = targetReadShorts
                                     shortBuffer.fill(0)
                                     delay(48L)
                                 }
-                            } else {
-                                consecutiveReadFailures = 0
                             }
 
-                            val targetPcmBytes = convertCapturedShortsToTargetPcmBytes(readSamples)
+                            var targetPcmBytes = convertCapturedShortsToTargetPcmBytes(readSamples)
+                            val switchToBtAfterChunk = !isCapturingFromBluetooth && pendingSwitchToBluetooth.getAndSet(false)
                             if (targetPcmBytes.isNotEmpty()) {
+                                if (pendingSpliceFadeIn) {
+                                    targetPcmBytes = WavFileTools.applyMicroFadeIn(
+                                        pcmBytes = targetPcmBytes,
+                                        sampleRate = effectiveSampleRate,
+                                        channels = effectiveChannels
+                                    )
+                                    pendingSpliceFadeIn = false
+                                }
+                                if (switchToBtAfterChunk) {
+                                    targetPcmBytes = WavFileTools.applyMicroFadeOut(
+                                        pcmBytes = targetPcmBytes,
+                                        sampleRate = effectiveSampleRate,
+                                        channels = effectiveChannels
+                                    )
+                                }
                                 aacEncoder.encodePcmBytes(targetPcmBytes, targetPcmBytes.size)
                                 totalBytesWritten += targetPcmBytes.size.toLong()
                             }
@@ -992,6 +1536,10 @@ class AudioStudioEngine(private val context: Context) {
 
                             val bytesPerSecond = (effectiveSampleRate.toLong() * effectiveChannels.toLong() * 2L).coerceAtLeast(1L)
                             _elapsedMs.value = (totalBytesWritten * 1000L) / bytesPerSecond
+
+                            if (switchToBtAfterChunk) {
+                                switchToBluetoothMicrophoneMidSession()
+                            }
                         }
                     } finally {
                         val segment = aacEncoder.finish()
@@ -1005,16 +1553,21 @@ class AudioStudioEngine(private val context: Context) {
 
                         while (isActive && _isRecording.value) {
                             if (_isPaused.value) {
+                                wasPaused = true
                                 _liveDb.value = -58f
                                 delay(60L)
                                 continue
                             }
 
-                            if (needsAudioRecordRebind.getAndSet(false)) {
-                                captureSession = rebindAudioRecordSeamlessly()
-                                val reqShorts = captureSession?.chunkShorts ?: fallbackChunkShorts
-                                if (shortBuffer.size < reqShorts) shortBuffer = ShortArray(reqShorts)
-                                consecutiveReadFailures = 0
+                            if (wasPaused) {
+                                wasPaused = false
+                                resumeCaptureAfterPause()
+                            }
+
+                            if (pendingFallbackToPhoneMic.getAndSet(false) && isCapturingFromBluetooth) {
+                                fallbackToPhoneMicrophoneMidSession()
+                            } else if (pendingSwitchToBluetooth.getAndSet(false) && !isCapturingFromBluetooth) {
+                                switchToBluetoothMicrophoneMidSession()
                             }
 
                             val currentRecord = captureSession?.audioRecord
@@ -1029,33 +1582,45 @@ class AudioStudioEngine(private val context: Context) {
                                     readSamples = currentRecord.read(shortBuffer, 0, targetReadShorts)
                                 }
                             } catch (_: Exception) {
-                                readSamples = -1
+                                readSamples = 0
                             }
 
                             if (!_isRecording.value) break
-                            if (_isPaused.value) continue
+                            if (_isPaused.value) {
+                                wasPaused = true
+                                continue
+                            }
 
                             if (readSamples <= 0) {
-                                consecutiveReadFailures++
                                 if (!isRobolectricRuntime) {
-                                    if (readSamples < 0 || consecutiveReadFailures >= 6) {
-                                        captureSession = rebindAudioRecordSeamlessly()
-                                        consecutiveReadFailures = 0
-                                    }
-                                    delay(25L)
+                                    delay(30L)
                                     continue
                                 } else {
                                     readSamples = targetReadShorts
                                     shortBuffer.fill(0)
                                     delay(48L)
                                 }
-                            } else {
-                                consecutiveReadFailures = 0
                             }
 
                             // Write PCM bytes to disk matched to effectiveSampleRate & effectiveChannels
-                            val targetPcmBytes = convertCapturedShortsToTargetPcmBytes(readSamples)
+                            var targetPcmBytes = convertCapturedShortsToTargetPcmBytes(readSamples)
+                            val switchToBtAfterChunk = !isCapturingFromBluetooth && pendingSwitchToBluetooth.getAndSet(false)
                             if (targetPcmBytes.isNotEmpty()) {
+                                if (pendingSpliceFadeIn) {
+                                    targetPcmBytes = WavFileTools.applyMicroFadeIn(
+                                        pcmBytes = targetPcmBytes,
+                                        sampleRate = effectiveSampleRate,
+                                        channels = effectiveChannels
+                                    )
+                                    pendingSpliceFadeIn = false
+                                }
+                                if (switchToBtAfterChunk) {
+                                    targetPcmBytes = WavFileTools.applyMicroFadeOut(
+                                        pcmBytes = targetPcmBytes,
+                                        sampleRate = effectiveSampleRate,
+                                        channels = effectiveChannels
+                                    )
+                                }
                                 fos.write(targetPcmBytes, 0, targetPcmBytes.size)
                                 totalBytesWritten += targetPcmBytes.size.toLong()
                             }
@@ -1068,6 +1633,10 @@ class AudioStudioEngine(private val context: Context) {
 
                             val bytesPerSecond = (effectiveSampleRate.toLong() * effectiveChannels.toLong() * 2L).coerceAtLeast(1L)
                             _elapsedMs.value = (totalBytesWritten * 1000L) / bytesPerSecond
+
+                            if (switchToBtAfterChunk) {
+                                switchToBluetoothMicrophoneMidSession()
+                            }
                         }
                         fos.flush()
                     }
@@ -1078,29 +1647,44 @@ class AudioStudioEngine(private val context: Context) {
                     WavFileTools.updateWavHeader(outputFile, effectiveSampleRate, effectiveChannels, 16)
                 }
             } finally {
-                try {
-                    captureSession?.audioRecord?.stop()
-                } catch (_: Exception) {}
-                try {
-                    captureSession?.audioRecord?.release()
-                } catch (_: Exception) {}
-                activeAudioRecord = null
+                synchronized(captureStateLock) {
+                    val record = captureSession?.audioRecord
+                    if (record != null) {
+                        try {
+                            if (record.recordingState == AudioRecord.RECORDSTATE_RECORDING) {
+                                record.stop()
+                            }
+                        } catch (_: Exception) {}
+                        try {
+                            record.release()
+                        } catch (_: Exception) {}
+                    }
+                    if (activeAudioRecord === record) {
+                        activeAudioRecord = null
+                    }
+                }
+                teardownBluetoothRoute(audioManager)
+                isCapturingFromBluetooth = false
+                _isConnectingBluetoothMic.value = false
             }
         }
     }
 
     /**
-     * Instantly stops and frees physical microphone hardware (AudioRecord.release())
-     * to immediately drop Android OS microphone indicators with zero delay.
+     * Instantly stops and frees physical microphone hardware and tears down any active
+     * Bluetooth communication route when a recording session is saved, discarded, or released.
      */
     fun releaseMicrophoneHardwareImmediately() {
+        _isConnectingBluetoothMic.value = false
+        isSwitchingMicrophone = false
+        isCapturingFromBluetooth = false
+        pendingFallbackToPhoneMic.set(false)
+        pendingSwitchToBluetooth.set(false)
+        failedBluetoothDeviceIds.clear()
         releaseAudioEffects()
         abandonRecordingAudioFocus()
         val am = context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
-        clearBluetoothCommunicationRouting(am)
-        val preferred = am?.let { findPreferredHeadsetInputDevice(it) }
-        _activeAudioDeviceName.value = formatInputDeviceLabel(preferred)
-        try {
+        synchronized(captureStateLock) {
             val record = activeAudioRecord
             activeAudioRecord = null
             if (record != null) {
@@ -1113,17 +1697,38 @@ class AudioStudioEngine(private val context: Context) {
                     record.release()
                 } catch (_: Exception) {}
             }
-        } catch (_: Exception) {}
+        }
+        teardownBluetoothRoute(am)
+        val preferred = am?.let { findPreferredHeadsetInputDevice(it) }
+        _activeAudioDeviceName.value = formatInputDeviceLabel(preferred)
     }
 
+    /**
+     * Pauses recording and halts active AudioRecord reads to save CPU/battery, while silently
+     * keeping the established Bluetooth communication route open so earbuds do not play
+     * annoying connect/disconnect chimes on Pause/Resume.
+     */
     fun pauseRecording() {
-        if (_isRecording.value) {
+        synchronized(captureStateLock) {
+            if (!_isRecording.value || _isPaused.value) return
             _isPaused.value = true
+            val record = activeAudioRecord
+            if (record != null) {
+                try {
+                    if (record.recordingState == AudioRecord.RECORDSTATE_RECORDING) {
+                        record.stop()
+                    }
+                } catch (_: Exception) {}
+            }
         }
     }
 
+    /**
+     * Resumes recording instantaneously over the silently held audio route.
+     */
     fun resumeRecording() {
-        if (_isRecording.value) {
+        synchronized(captureStateLock) {
+            if (!_isRecording.value || !_isPaused.value) return
             _isPaused.value = false
         }
     }
@@ -1131,7 +1736,8 @@ class AudioStudioEngine(private val context: Context) {
     suspend fun stopRecordingAndFinalize(): Pair<File?, Long> {
         _isRecording.value = false
         _isPaused.value = false
-        // Instantly release microphone hardware so the OS microphone indicator drops with 0ms delay
+        _isConnectingBluetoothMic.value = false
+        // Instantly release microphone hardware and tear down Bluetooth route on Save
         releaseMicrophoneHardwareImmediately()
         recordingJob?.join()
         _liveDb.value = -60f
@@ -1151,7 +1757,8 @@ class AudioStudioEngine(private val context: Context) {
     fun cancelAndResetRecording() {
         _isRecording.value = false
         _isPaused.value = false
-        // Instantly release microphone hardware so the OS microphone indicator drops with 0ms delay
+        _isConnectingBluetoothMic.value = false
+        // Instantly release microphone hardware and tear down Bluetooth route on Discard
         releaseMicrophoneHardwareImmediately()
         recordingJob?.cancel()
         currentSessionFile?.delete()

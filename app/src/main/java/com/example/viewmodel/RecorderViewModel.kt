@@ -258,6 +258,7 @@ class RecorderViewModel(application: Application) : AndroidViewModel(application
         .stateIn(viewModelScope, SharingStarted.Eagerly, 0)
 
     val activeAudioDeviceName: StateFlow<String> = audioEngine.activeAudioDeviceName
+    val isConnectingBluetoothMic: StateFlow<Boolean> = audioEngine.isConnectingBluetoothMic
 
     val filteredRecordings: StateFlow<List<RecordingEntity>> = combine(
         combine(localRecordings, cloudRecordings, trashRecordings, _activeLibraryStorageTab) { localList, cloudList, trashList, storageTab ->
@@ -351,6 +352,15 @@ class RecorderViewModel(application: Application) : AndroidViewModel(application
     init {
         audioEngine.updateSilenceSkipConfig(_settings.value.silenceConfig)
         audioEngine.setPlaybackSpeed(_settings.value.defaultPlaybackSpeed)
+
+        viewModelScope.launch {
+            audioEngine.routingNoticeMessage.collect { notice ->
+                if (!notice.isNullOrBlank()) {
+                    postSnackbar(notice)
+                    audioEngine.clearRoutingNotice()
+                }
+            }
+        }
 
         viewModelScope.launch {
             repository.removePreinstalledSamplesIfPresent()

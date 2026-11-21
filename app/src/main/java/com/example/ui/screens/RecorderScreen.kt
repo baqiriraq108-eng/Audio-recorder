@@ -5,8 +5,14 @@ import android.content.pm.PackageManager
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.Crossfade
 import androidx.compose.animation.animateColorAsState
+import androidx.compose.animation.core.FastOutSlowInEasing
+import androidx.compose.animation.core.RepeatMode
 import androidx.compose.animation.core.animateDpAsState
+import androidx.compose.animation.core.animateFloat
+import androidx.compose.animation.core.infiniteRepeatable
+import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
@@ -27,11 +33,13 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.BluetoothAudio
 import androidx.compose.material.icons.filled.Bookmark
 import androidx.compose.material.icons.filled.BookmarkAdd
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.DeleteOutline
 import androidx.compose.material.icons.filled.GraphicEq
+import androidx.compose.material.icons.filled.HeadsetMic
 import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PlayArrow
@@ -44,6 +52,8 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.ui.res.stringResource
+import com.example.R
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import androidx.compose.runtime.getValue
@@ -62,8 +72,11 @@ import androidx.compose.ui.graphics.PathEffect
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.StrokeJoin
 import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -205,6 +218,153 @@ fun SkipSilenceCustomIcon(
     }
 }
 
+enum class ActiveMicIndicatorState {
+    PHONE_MIC_ACTIVE,
+    CONNECTING_BLUETOOTH,
+    BLUETOOTH_ACTIVE,
+    WIRED_HEADSET_ACTIVE
+}
+
+fun resolveActiveMicIndicatorState(
+    activeAudioDeviceName: String,
+    isConnectingBluetoothMic: Boolean
+): ActiveMicIndicatorState {
+    if (isConnectingBluetoothMic) return ActiveMicIndicatorState.CONNECTING_BLUETOOTH
+    if (activeAudioDeviceName.contains("Bluetooth", ignoreCase = true) ||
+        activeAudioDeviceName.contains("BLE", ignoreCase = true)
+    ) {
+        return ActiveMicIndicatorState.BLUETOOTH_ACTIVE
+    }
+    if (activeAudioDeviceName.contains("Wired", ignoreCase = true) ||
+        activeAudioDeviceName.contains("USB", ignoreCase = true) ||
+        activeAudioDeviceName.contains("External", ignoreCase = true)
+    ) {
+        return ActiveMicIndicatorState.WIRED_HEADSET_ACTIVE
+    }
+    return ActiveMicIndicatorState.PHONE_MIC_ACTIVE
+}
+
+/**
+ * Minimalist icon-only active microphone indicator anchored at the trailing edge of the Top App Bar.
+ * Locked to a fixed 40.dp circular tonal container so transitioning between Phone Mic, Connecting,
+ * and Bluetooth Mic states incurs strictly zero layout shift.
+ */
+@Composable
+private fun ActiveMicTopBarIndicator(
+    state: ActiveMicIndicatorState,
+    modifier: Modifier = Modifier
+) {
+    val isBluetoothVisual = state == ActiveMicIndicatorState.BLUETOOTH_ACTIVE ||
+        state == ActiveMicIndicatorState.CONNECTING_BLUETOOTH
+
+    val containerBg by animateColorAsState(
+        targetValue = if (isBluetoothVisual) WarmSecondarySurface else ElevatedSurface,
+        animationSpec = tween(durationMillis = 220),
+        label = "active_mic_container_bg"
+    )
+
+    val iconTint by animateColorAsState(
+        targetValue = when (state) {
+            ActiveMicIndicatorState.CONNECTING_BLUETOOTH,
+            ActiveMicIndicatorState.BLUETOOTH_ACTIVE -> PeachAccent
+            ActiveMicIndicatorState.WIRED_HEADSET_ACTIVE -> PrimaryText
+            ActiveMicIndicatorState.PHONE_MIC_ACTIVE -> SecondaryText
+        },
+        animationSpec = tween(durationMillis = 220),
+        label = "active_mic_icon_tint"
+    )
+
+    val accessibilityLabel = when (state) {
+        ActiveMicIndicatorState.CONNECTING_BLUETOOTH -> stringResource(R.string.mic_indicator_connecting_bluetooth)
+        ActiveMicIndicatorState.BLUETOOTH_ACTIVE -> stringResource(R.string.mic_indicator_bluetooth)
+        ActiveMicIndicatorState.WIRED_HEADSET_ACTIVE -> stringResource(R.string.mic_indicator_wired_headset)
+        ActiveMicIndicatorState.PHONE_MIC_ACTIVE -> stringResource(R.string.mic_indicator_phone)
+    }
+
+    Box(
+        contentAlignment = Alignment.Center,
+        modifier = modifier
+            .size(40.dp)
+            .clip(CircleShape)
+            .background(containerBg)
+            .semantics { contentDescription = accessibilityLabel }
+            .testTag("recorder_active_mic_indicator")
+    ) {
+        Crossfade(
+            targetState = state,
+            animationSpec = tween(durationMillis = 200),
+            label = "active_mic_icon_crossfade"
+        ) { targetState ->
+            when (targetState) {
+                ActiveMicIndicatorState.CONNECTING_BLUETOOTH -> {
+                    val pulseTransition = rememberInfiniteTransition(label = "bt_connecting_pulse")
+                    val pulseAlpha by pulseTransition.animateFloat(
+                        initialValue = 1.0f,
+                        targetValue = 0.35f,
+                        animationSpec = infiniteRepeatable(
+                            animation = tween(durationMillis = 750, easing = FastOutSlowInEasing),
+                            repeatMode = RepeatMode.Reverse
+                        ),
+                        label = "bt_connecting_alpha"
+                    )
+                    val pulseScale by pulseTransition.animateFloat(
+                        initialValue = 1.04f,
+                        targetValue = 0.90f,
+                        animationSpec = infiniteRepeatable(
+                            animation = tween(durationMillis = 750, easing = FastOutSlowInEasing),
+                            repeatMode = RepeatMode.Reverse
+                        ),
+                        label = "bt_connecting_scale"
+                    )
+                    Icon(
+                        imageVector = Icons.Default.BluetoothAudio,
+                        contentDescription = null,
+                        tint = PeachAccent,
+                        modifier = Modifier
+                            .size(20.dp)
+                            .graphicsLayer {
+                                alpha = pulseAlpha
+                                scaleX = pulseScale
+                                scaleY = pulseScale
+                            }
+                            .testTag("recorder_connecting_bluetooth_icon")
+                    )
+                }
+                ActiveMicIndicatorState.BLUETOOTH_ACTIVE -> {
+                    Icon(
+                        imageVector = Icons.Default.BluetoothAudio,
+                        contentDescription = null,
+                        tint = iconTint,
+                        modifier = Modifier
+                            .size(20.dp)
+                            .testTag("recorder_bluetooth_mic_icon")
+                    )
+                }
+                ActiveMicIndicatorState.WIRED_HEADSET_ACTIVE -> {
+                    Icon(
+                        imageVector = Icons.Default.HeadsetMic,
+                        contentDescription = null,
+                        tint = iconTint,
+                        modifier = Modifier
+                            .size(20.dp)
+                            .testTag("recorder_wired_mic_icon")
+                    )
+                }
+                ActiveMicIndicatorState.PHONE_MIC_ACTIVE -> {
+                    Icon(
+                        imageVector = Icons.Default.Mic,
+                        contentDescription = null,
+                        tint = iconTint,
+                        modifier = Modifier
+                            .size(20.dp)
+                            .testTag("recorder_phone_mic_icon")
+                    )
+                }
+            }
+        }
+    }
+}
+
 @Composable
 fun RecorderScreen(
     status: RecordingStatus,
@@ -216,6 +376,7 @@ fun RecorderScreen(
     appendTarget: RecordingEntity?,
     mergeProgress: Int? = null,
     activeAudioDeviceName: String = "Phone Microphone",
+    isConnectingBluetoothMic: Boolean = false,
     onStartRecording: () -> Unit,
     onPauseRecording: () -> Unit,
     onResumeRecording: () -> Unit,
@@ -275,20 +436,27 @@ fun RecorderScreen(
             .testTag("recorder_screen_root"),
         verticalArrangement = Arrangement.SpaceBetween
     ) {
-        // 1. Top Header Bar: Title & Audio Format Details (Settings button removed)
-        Column(modifier = Modifier.fillMaxWidth()) {
-            Text(
-                text = "Audio Recorder",
-                style = MaterialTheme.typography.headlineMedium,
-                color = PrimaryText,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis
-            )
-            Spacer(modifier = Modifier.height(2.dp))
-            Row(
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(8.dp)
-            ) {
+        // 1. Top App Bar: App Title & Audio Format on the left, minimalist icon-only active mic indicator on the right
+        val micIndicatorState = resolveActiveMicIndicatorState(
+            activeAudioDeviceName = activeAudioDeviceName,
+            isConnectingBluetoothMic = isConnectingBluetoothMic
+        )
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .testTag("recorder_top_app_bar"),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    text = "Audio Recorder",
+                    style = MaterialTheme.typography.headlineMedium,
+                    color = PrimaryText,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+                Spacer(modifier = Modifier.height(2.dp))
                 Text(
                     text = "${settings.defaultFormat.label} • ${settings.sampleRate / 1000.0} kHz • ${settings.bitDepth}-bit",
                     style = MaterialTheme.typography.bodySmall,
@@ -296,30 +464,9 @@ fun RecorderScreen(
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis
                 )
-                Box(
-                    modifier = Modifier
-                        .clip(RoundedCornerShape(6.dp))
-                        .background(if (activeAudioDeviceName.contains("Headset", ignoreCase = true) || activeAudioDeviceName.contains("Bluetooth", ignoreCase = true)) WarmSecondarySurface else ElevatedSurface)
-                        .padding(horizontal = 6.dp, vertical = 2.dp)
-                        .testTag("recorder_active_mic_badge")
-                ) {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Icon(
-                            imageVector = Icons.Default.Mic,
-                            contentDescription = activeAudioDeviceName,
-                            tint = if (activeAudioDeviceName.contains("Headset", ignoreCase = true) || activeAudioDeviceName.contains("Bluetooth", ignoreCase = true)) PeachAccent else SecondaryText,
-                            modifier = Modifier.size(11.dp)
-                        )
-                        Spacer(modifier = Modifier.width(3.dp))
-                        Text(
-                            text = activeAudioDeviceName,
-                            style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp),
-                            color = if (activeAudioDeviceName.contains("Headset", ignoreCase = true) || activeAudioDeviceName.contains("Bluetooth", ignoreCase = true)) PeachAccent else SecondaryText,
-                            maxLines = 1
-                        )
-                    }
-                }
             }
+            Spacer(modifier = Modifier.width(12.dp))
+            ActiveMicTopBarIndicator(state = micIndicatorState)
         }
 
         // 2. Single Combined Card: Contains Big Time Counter, LIVE INPUT indicator (shown ONLY during active recording), and Waveform Visualizer
@@ -413,7 +560,7 @@ fun RecorderScreen(
                     modifier = Modifier.testTag("recorder_primary_timer")
                 )
 
-                // LIVE INPUT text centered directly below the time display ONLY when recording or paused
+                // LIVE INPUT indicator centered directly below the time display
                 if (isRecordingOrPaused) {
                     Spacer(modifier = Modifier.height(6.dp))
                     Row(

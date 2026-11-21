@@ -488,6 +488,7 @@ private fun RecorderDestination(
     val liveDb by viewModel.audioEngine.liveDb.collectAsStateWithLifecycle()
     val livePeaks by viewModel.audioEngine.livePeaks.collectAsStateWithLifecycle()
     val activeAudioDeviceName by viewModel.activeAudioDeviceName.collectAsStateWithLifecycle()
+    val isConnectingBluetoothMic by viewModel.isConnectingBluetoothMic.collectAsStateWithLifecycle()
 
     RecorderScreen(
         status = recordingStatus,
@@ -499,6 +500,7 @@ private fun RecorderDestination(
         appendTarget = appendTarget,
         mergeProgress = mergeProgress,
         activeAudioDeviceName = activeAudioDeviceName,
+        isConnectingBluetoothMic = isConnectingBluetoothMic,
         onStartRecording = { viewModel.startRecording() },
         onPauseRecording = { viewModel.pauseRecording() },
         onResumeRecording = { viewModel.resumeRecording() },
