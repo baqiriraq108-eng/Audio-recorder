@@ -442,7 +442,7 @@ class RecordingForegroundService : Service() {
             ?: RecordingIslandOverlayManager.currentEditedRecordingTitle.trim().takeIf { it.isNotEmpty() }
         isShowingAppendSaveConfirmation = false
         isAppendingSession = false
-        showFinishedSavedConfirmation(getString(R.string.notification_finished_recording))
+        // Wait for RecorderViewModel to finish merging, validating, and saving before posting "Finished recording"
         dispatchConfirmAppendSaveAction(resolvedTitle)
     }
 
@@ -922,7 +922,8 @@ class RecordingForegroundService : Service() {
             }
 
             ACTION_SHOW_APPEND_SAVE_CONFIRMATION -> {
-                showAppendSaveConfirmation()
+                val explicitSuggestedTitle = intent.getStringExtra(EXTRA_TITLE)?.trim()?.takeIf { it.isNotEmpty() }
+                showAppendSaveConfirmation(explicitSuggestedTitle)
             }
 
             ACTION_NOTIFICATION_CONFIRM_APPEND_SAVE -> {
@@ -1414,7 +1415,7 @@ class RecordingForegroundService : Service() {
      * Transitions the notification to the inline Append Save Confirmation message
      * featuring equal-sized Θ Don't and Ω Save buttons with warm gradient blending.
      */
-    fun showAppendSaveConfirmation() {
+    fun showAppendSaveConfirmation(explicitSuggestedTitle: String? = null) {
         isShowingAppendSaveConfirmation = true
         hasEmittedFinishedConfirmation = false
         isPausedState = true
@@ -1432,6 +1433,7 @@ class RecordingForegroundService : Service() {
             }
         } catch (_: Exception) {}
 
+        val suggestedTitle = explicitSuggestedTitle?.takeIf { it.isNotBlank() } ?: currentTitle
         val notif = buildAppendSaveConfirmationNotification()
         val waveformBmp = lastRenderedWaveformBitmap ?: renderRecordingWaveformBitmap(currentWaveformBars, isPaused = true)
         RecordingIslandOverlayManager.updateRecordingOverlayState(
@@ -1442,7 +1444,7 @@ class RecordingForegroundService : Service() {
             waveformBitmap = waveformBmp,
             oscillatingDisplacements = lastRenderedOscillatingDisplacements,
             isShowingAppendConfirmation = true,
-            defaultSuggestedTitle = currentTitle
+            defaultSuggestedTitle = suggestedTitle
         )
         val nm = getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager
         nm?.notify(NOTIFICATION_ID, notif)

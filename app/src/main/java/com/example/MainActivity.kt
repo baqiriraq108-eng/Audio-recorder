@@ -509,10 +509,8 @@ private fun RecorderDestination(
         onResetRecording = { viewModel.resetActiveRecording() },
         onCancelAppendMode = { viewModel.cancelContinueRecordingMode() },
         showAppendSaveConfirmDialog = showAppendSaveConfirmDialog,
-        onConfirmAppendSave = {
-            viewModel.confirmSaveFromNotification(
-                com.example.service.RecordingIslandOverlayManager.currentEditedRecordingTitle
-            )
+        onConfirmAppendSave = { typedTitle ->
+            viewModel.confirmSaveFromNotification(typedTitle)
         },
         onDiscardAppendSave = { viewModel.cancelSaveFromNotification() },
         onDismissAppendSaveConfirmDialog = { viewModel.dismissAppendSaveConfirmDialog() },

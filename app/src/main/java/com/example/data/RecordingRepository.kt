@@ -47,6 +47,89 @@ class RecordingRepository(
         }
     }
 
+    companion object {
+        private const val KEYSTORE_PROVIDER = "AndroidKeyStore"
+        private const val KEYSTORE_ALIAS = "google_drive_studio_token_key"
+        private const val AES_TRANSFORMATION = "AES/GCM/NoPadding"
+        private const val GCM_TAG_BITS = 128
+
+        private val KNOWN_AUDIO_EXTENSIONS = setOf(
+            "wav", "mp3", "m4a", "aac", "flac", "ogg", "opus", "mp4", "3gp", "amr"
+        )
+        private val FORBIDDEN_STORAGE_CHARS = Regex("[\\\\/:*?\"<>|\\u0000-\\u001F]")
+
+        /**
+         * Sanitizes a user-facing display title for safe storage on Android/FAT32/SAF filesystems
+         * without altering underscores, hyphens, spaces, or normal punctuation.
+         */
+        fun sanitizeFileNameForStorage(rawTitle: String, maxLength: Int = 120): String {
+            val cleaned = rawTitle
+                .trim()
+                .replace(FORBIDDEN_STORAGE_CHARS, "_")
+                .trim('.', ' ')
+                .take(maxLength)
+                .trim('.', ' ')
+            return cleaned.ifBlank { "Recording" }
+        }
+
+        /**
+         * Sanitizes a filename that may include an extension (e.g. "Meeting: 10:30.m4a")
+         * for safe filesystem / SAF export while preserving its extension.
+         */
+        fun sanitizeFileNameWithExtension(rawFileName: String, fallbackExt: String = "m4a"): String {
+            val trimmed = rawFileName.trim()
+            val dotIdx = trimmed.lastIndexOf('.')
+            return if (dotIdx > 0 && dotIdx < trimmed.length - 1) {
+                val rawBase = trimmed.substring(0, dotIdx)
+                val rawExt = trimmed.substring(dotIdx + 1)
+                    .replace(FORBIDDEN_STORAGE_CHARS, "")
+                    .lowercase(Locale.US)
+                    .ifBlank { fallbackExt }
+                "${sanitizeFileNameForStorage(rawBase)}.$rawExt"
+            } else {
+                val cleanExt = fallbackExt.trim().trimStart('.').lowercase(Locale.US).ifBlank { "m4a" }
+                "${sanitizeFileNameForStorage(trimmed)}.$cleanExt"
+            }
+        }
+
+        /**
+         * Extracts the exact original recording title from an imported file's display name or URI
+         * without modifying underscores, hyphens, colons, or internal dots.
+         * Strips only a recognized trailing audio file extension.
+         */
+        fun extractExactTitleFromDisplayName(rawDisplayName: String, uri: Uri? = null): String {
+            var candidate = rawDisplayName.trim()
+            if (candidate.isBlank() && uri != null) {
+                val rawSegment = uri.lastPathSegment.orEmpty()
+                val decoded = try {
+                    Uri.decode(rawSegment)
+                } catch (_: Exception) {
+                    rawSegment
+                }
+                val afterSlash = decoded.substringAfterLast('/')
+                // Android document tree IDs sometimes look like "primary:Music/track_01-final.m4a"
+                candidate = if (afterSlash.startsWith("primary:", ignoreCase = true) ||
+                    afterSlash.startsWith("raw:", ignoreCase = true) ||
+                    afterSlash.startsWith("home:", ignoreCase = true)
+                ) {
+                    afterSlash.substringAfter(':').substringAfterLast('/')
+                } else {
+                    afterSlash
+                }.trim()
+            }
+            if (candidate.isBlank()) return ""
+
+            val dotIdx = candidate.lastIndexOf('.')
+            if (dotIdx > 0 && dotIdx < candidate.length - 1) {
+                val ext = candidate.substring(dotIdx + 1).lowercase(Locale.US)
+                if (ext in KNOWN_AUDIO_EXTENSIONS) {
+                    return candidate.substring(0, dotIdx)
+                }
+            }
+            return candidate
+        }
+    }
+
     /**
      * Resolves the actual audio file on device storage for [recording], auto-healing stale,
      * renamed, or relocated file paths (e.g. extension changes between M4A/WAV, companion .bak files,
@@ -62,15 +145,15 @@ class RecordingRepository(
 
         val directFile = if (recording.filePath.isNotBlank()) File(recording.filePath) else null
         val parentDir = directFile?.parentFile ?: getRecordingsDir()
-        val cleanTitleSanitized = recording.title.trim().replace(Regex("[\\\\/:*?\"<>|]"), "_")
+        val cleanTitleSanitized = sanitizeFileNameForStorage(recording.title)
         val baseName = directFile?.nameWithoutExtension
-            ?: cleanTitleSanitized.ifBlank { "Recording" }
+            ?: cleanTitleSanitized
 
         // Candidates to search for the physical audio file
         val candidates = mutableListOf<File>()
 
         // 1. Same directory with alternative extensions and exact title
-        listOf("wav", "m4a", "aac", "flac", "mp3").forEach { ext ->
+        listOf("wav", "m4a", "aac", "flac", "mp3", "ogg", "opus").forEach { ext ->
             candidates.add(File(parentDir, "$baseName.$ext"))
             candidates.add(File(getRecordingsDir(), "$baseName.$ext"))
             if (cleanTitleSanitized != baseName) {
@@ -151,6 +234,10 @@ class RecordingRepository(
         desiredFileName: String = sourceFile.name
     ): Boolean = withContext(Dispatchers.IO) {
         if (!sourceFile.exists() || sourceFile.length() <= 0L) return@withContext false
+        val safeDesiredFileName = sanitizeFileNameWithExtension(
+            rawFileName = desiredFileName,
+            fallbackExt = sourceFile.extension.ifBlank { "m4a" }
+        )
         var synced = false
 
         // 1. Ensure file is present in the selected internal subfolder if different from sourceFile's parent
@@ -160,7 +247,7 @@ class RecordingRepository(
                 folderPath = settings.localFolderPath
             )
             if (sourceFile.parentFile?.canonicalPath != targetInternalDir.canonicalPath) {
-                val destInternalFile = File(targetInternalDir, desiredFileName)
+                val destInternalFile = File(targetInternalDir, safeDesiredFileName)
                 sourceFile.copyTo(destInternalFile, overwrite = true)
                 synced = destInternalFile.exists() && destInternalFile.length() > 0L
             } else {
@@ -175,17 +262,17 @@ class RecordingRepository(
                 val treeUri = Uri.parse(treeUriStr)
                 val treeDoc = androidx.documentfile.provider.DocumentFile.fromTreeUri(context, treeUri)
                 if (treeDoc != null && treeDoc.exists() && treeDoc.canWrite()) {
-                    val ext = desiredFileName.substringAfterLast('.', "m4a").lowercase(Locale.US)
+                    val ext = safeDesiredFileName.substringAfterLast('.', "m4a").lowercase(Locale.US)
                     val mimeType = when (ext) {
                         "wav" -> "audio/x-wav"
                         "flac" -> "audio/flac"
                         "aac" -> "audio/aac"
                         else -> "audio/mp4"
                     }
-                    treeDoc.findFile(desiredFileName)?.delete()
-                    val baseWithoutExt = desiredFileName.substringBeforeLast('.')
+                    treeDoc.findFile(safeDesiredFileName)?.delete()
+                    val baseWithoutExt = safeDesiredFileName.substringBeforeLast('.')
                     treeDoc.findFile(baseWithoutExt)?.delete()
-                    val exportDoc = treeDoc.createFile(mimeType, desiredFileName)
+                    val exportDoc = treeDoc.createFile(mimeType, safeDesiredFileName)
                         ?: treeDoc.createFile(mimeType, baseWithoutExt)
                     if (exportDoc != null) {
                         context.contentResolver.openOutputStream(exportDoc.uri)?.use { os ->
@@ -371,8 +458,12 @@ class RecordingRepository(
                 if (other.id != recording.id) {
                     dao.updateRecording(
                         other.copy(
+                            title = recording.title,
                             filePath = recording.filePath,
                             format = recording.format,
+                            sampleRate = recording.sampleRate,
+                            channels = recording.channels,
+                            bitDepth = recording.bitDepth,
                             durationMs = recording.durationMs,
                             sizeBytes = recording.sizeBytes,
                             waveformPeaks = recording.waveformPeaks,
@@ -496,15 +587,9 @@ class RecordingRepository(
                 else -> "m4a"
             }
 
-            val baseTitle = if (displayName.contains('.')) {
-                displayName.substringBeforeLast('.')
-            } else {
-                displayName
-            }
-            val cleanTitle = baseTitle
-                .replace('_', ' ')
-                .trim()
-                .ifBlank { "Imported Drive Audio ${System.currentTimeMillis() % 10000}" }
+            val extractedTitle = extractExactTitleFromDisplayName(displayName, uri)
+            val cleanTitle = extractedTitle
+                .ifBlank { "Imported Audio ${System.currentTimeMillis() % 10000}" }
 
             val targetDir = if (targetStorageLocation == StorageDestination.CLOUD) {
                 val cloudDir = File(context.filesDir, "drive_cloud")
@@ -569,7 +654,9 @@ class RecordingRepository(
             try {
                 val retriever = MediaMetadataRetriever()
                 try {
-                    retriever.setDataSource(destFile.absolutePath)
+                    java.io.FileInputStream(destFile).use { fis ->
+                        retriever.setDataSource(fis.fd)
+                    }
                     val durStr = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)
                     val parsedDur = durStr?.toLongOrNull() ?: 0L
                     if (parsedDur > 0L) durationMs = parsedDur
@@ -585,7 +672,9 @@ class RecordingRepository(
             try {
                 val extractor = MediaExtractor()
                 try {
-                    extractor.setDataSource(destFile.absolutePath)
+                    java.io.FileInputStream(destFile).use { fis ->
+                        extractor.setDataSource(fis.fd)
+                    }
                     if (extractor.trackCount > 0) {
                         val format = extractor.getTrackFormat(0)
                         if (format.containsKey(MediaFormat.KEY_SAMPLE_RATE)) {
@@ -680,15 +769,13 @@ class RecordingRepository(
     ): File {
         if (!targetDir.exists()) targetDir.mkdirs()
         val cleanExt = extension.trim().trimStart('.').lowercase(Locale.US).ifBlank { "m4a" }
-        val sanitizedBase = baseTitle.trim()
-            .replace(Regex("[\\\\/:*?\"<>|]"), "_")
-            .take(128)
-            .ifBlank { "Recording" }
-        val baseWithoutExt = if (sanitizedBase.endsWith(".$cleanExt", ignoreCase = true)) {
-            sanitizedBase.removeSuffix(".$cleanExt")
+        val trimmedBase = baseTitle.trim()
+        val rawBaseWithoutExt = if (trimmedBase.endsWith(".$cleanExt", ignoreCase = true)) {
+            trimmedBase.removeSuffix(".$cleanExt")
         } else {
-            sanitizedBase
+            trimmedBase
         }
+        val baseWithoutExt = sanitizeFileNameForStorage(rawBaseWithoutExt)
 
         var candidate = File(targetDir, "$baseWithoutExt.$cleanExt")
         var counter = 1
@@ -775,7 +862,9 @@ class RecordingRepository(
                 try {
                     val retriever = MediaMetadataRetriever()
                     try {
-                        retriever.setDataSource(savedFile.absolutePath)
+                        java.io.FileInputStream(savedFile).use { fis ->
+                            retriever.setDataSource(fis.fd)
+                        }
                         val durStr = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)
                         val parsedDur = durStr?.toLongOrNull() ?: 0L
                         if (parsedDur > 0L) durationMs = parsedDur
@@ -1112,12 +1201,6 @@ class RecordingRepository(
         }
     }
 
-    private companion object {
-        private const val KEYSTORE_PROVIDER = "AndroidKeyStore"
-        private const val KEYSTORE_ALIAS = "google_drive_studio_token_key"
-        private const val AES_TRANSFORMATION = "AES/GCM/NoPadding"
-        private const val GCM_TAG_BITS = 128
-    }
 
     private fun getOrCreateSecretKey(): javax.crypto.SecretKey? {
         return try {

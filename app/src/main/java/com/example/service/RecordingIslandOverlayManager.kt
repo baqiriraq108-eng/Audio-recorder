@@ -410,9 +410,19 @@ object RecordingIslandOverlayManager {
             pillDragOffsetX = 0
             pillDragOffsetY = defaultTopY(appCtx)
             if (!wasShowingConfirm || suggestedRecordingTitle.isBlank()) {
-                val initialTitle = generateDefaultTimestampedTitle(defaultSuggestedTitle ?: title)
+                val explicitCandidate = defaultSuggestedTitle?.trim().orEmpty()
+                val isRealTargetTitle = explicitCandidate.isNotEmpty() &&
+                    !explicitCandidate.equals("Recording", ignoreCase = true) &&
+                    !explicitCandidate.equals("Paused", ignoreCase = true)
+                val initialTitle = if (isRealTargetTitle) {
+                    explicitCandidate
+                } else {
+                    generateDefaultTimestampedTitle(defaultSuggestedTitle ?: title)
+                }
                 suggestedRecordingTitle = initialTitle
-                currentEditedRecordingTitle = initialTitle
+                if (currentEditedRecordingTitle.isBlank() || isRealTargetTitle) {
+                    currentEditedRecordingTitle = initialTitle
+                }
             }
             // Recording capsule transitions to Greek Save/Cancel confirmation card
             currentMode = OverlayMode.EXPANDED_CARD
@@ -1819,7 +1829,7 @@ object RecordingIslandOverlayManager {
             includeFontPadding = false
             isSingleLine = true
             maxLines = 1
-            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_CAP_SENTENCES
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
             imeOptions = EditorInfo.IME_ACTION_DONE
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
             typeface = android.graphics.Typeface.create("sans-serif-medium", android.graphics.Typeface.NORMAL)

@@ -2,13 +2,19 @@ package com.example
 
 import android.content.Context
 import android.content.Intent
+import android.graphics.Bitmap
 import androidx.test.core.app.ApplicationProvider
 import com.example.audio.WavFileTools
 import com.example.data.AudioFormatUtils
+import com.example.data.RecordingEntity
+import com.example.data.RecordingRepository
+import com.example.data.StorageDestination
 import com.example.service.RecordingForegroundService
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -2452,7 +2458,185 @@ class ExampleRobolectricTest {
         assertTrue(context.getString(R.string.mic_indicator_connecting_bluetooth).isNotBlank())
         assertTrue(context.getString(R.string.mic_indicator_wired_headset).isNotBlank())
     }
+
+    @Test
+    fun `verify import and storage filename preservation keeps underscores hyphens and colons verbatim in title while sanitizing disk paths`() {
+        // 1. Underscores, hyphens, colons, and internal dots must NEVER be replaced with spaces in display titles
+        assertEquals(
+            "lecture_01-part-2",
+            RecordingRepository.extractExactTitleFromDisplayName("lecture_01-part-2.m4a")
+        )
+        assertEquals(
+            "voice-note_2026-04_v1.2-final",
+            RecordingRepository.extractExactTitleFromDisplayName("voice-note_2026-04_v1.2-final.wav")
+        )
+        assertEquals(
+            "Meeting: 10:30 - Part_2",
+            RecordingRepository.extractExactTitleFromDisplayName("Meeting: 10:30 - Part_2.m4a")
+        )
+        assertEquals(
+            "notes_v2.5-draft",
+            RecordingRepository.extractExactTitleFromDisplayName("notes_v2.5-draft")
+        )
+
+        // 2. URI fallback when OpenableColumns.DISPLAY_NAME is empty preserves underscores and hyphens
+        val docUri = android.net.Uri.parse(
+            "content://com.android.externalstorage.documents/document/primary%3AMusic%2Fmy_clip-01_final.mp3"
+        )
+        assertEquals(
+            "my_clip-01_final",
+            RecordingRepository.extractExactTitleFromDisplayName("", docUri)
+        )
+
+        // 3. Storage filename sanitizer removes restricted filesystem symbols (like ':') while preserving '_' and '-'
+        val sanitizedDiskBase = RecordingRepository.sanitizeFileNameForStorage("Meeting: 10:30 - Part_2: Final")
+        assertFalse("Disk filename must not contain colons", sanitizedDiskBase.contains(':'))
+        assertTrue("Disk filename must preserve hyphens", sanitizedDiskBase.contains('-'))
+        assertTrue("Disk filename must preserve underscores", sanitizedDiskBase.contains('_'))
+
+        val sanitizedWithExt = RecordingRepository.sanitizeFileNameWithExtension("Meeting: 10:30 - Part_2.m4a")
+        assertFalse("Sanitized filename with ext must not contain colons", sanitizedWithExt.contains(':'))
+        assertTrue("Sanitized filename must retain .m4a extension", sanitizedWithExt.endsWith(".m4a"))
+    }
+
+    @Test
+    fun `verify Continue Recording rename with colons produces valid playable M4A and WAV with exact display title and sanitized disk path`() = runBlocking {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val db = com.example.data.AppDatabase.getInstance(context)
+        val repo = RecordingRepository(context, db.recordingDao())
+        val tempDir = File(context.cacheDir, "test_continue_colon_${System.nanoTime()}").apply { mkdirs() }
+
+        // --- Part A: M4A Continue Recording + Rename with colons ---
+        val origM4a = File(tempDir, "lecture_01-part-1.m4a")
+        val rawBase = File(tempDir, "base.raw.aac")
+        val enc = com.example.audio.AacEncoder(sampleRate = 44100, channelCount = 1, bitrate = 128_000)
+        enc.start(rawBase)
+        val pcm1 = ShortArray(44100) { i -> ((kotlin.math.sin(2.0 * Math.PI * 440.0 * i / 44100.0)) * 12000).toInt().toShort() }
+        enc.encodePcmSamples(pcm1, pcm1.size)
+        val seg1 = enc.finish()
+        assertTrue(enc.writeStandaloneM4aFile(seg1, origM4a))
+        rawBase.delete()
+        val origM4aMeta = com.example.audio.Mp4BoxParser.parseM4a(origM4a)!!
+
+        val appendWavForM4a = File(tempDir, "append_seg_m4a.wav")
+        WavFileTools.createStudioSampleAudioFile(appendWavForM4a, durationSeconds = 1, sampleRate = 44100)
+
+        val m4aAppend = WavFileTools.appendAudioFilesUniversal(
+            originalFile = origM4a,
+            appendedPcmFile = appendWavForM4a,
+            sampleRate = 44100,
+            channels = 1,
+            bitsPerSample = 16,
+            targetBitrate = 128_000
+        )
+        assertTrue("M4A append must succeed", m4aAppend.success)
+
+        // Simulate Continue Recording rename with colons in display title -> decoupled sanitized disk path
+        val colonTitle = "Meeting: 10:30 - Part_2: Final"
+        val sanitizedM4aDest = repo.resolveUniqueLocalFile(tempDir, colonTitle, "m4a")
+        assertFalse("Sanitized M4A path must not contain colons", sanitizedM4aDest.name.contains(':'))
+        assertTrue(m4aAppend.finalFile.renameTo(sanitizedM4aDest))
+
+        val mergedM4aMeta = com.example.audio.Mp4BoxParser.parseM4a(sanitizedM4aDest)
+        assertNotNull("Renamed merged M4A must parse cleanly", mergedM4aMeta)
+        assertTrue("Merged M4A sample table must be consistent", mergedM4aMeta!!.isSampleTableConsistent())
+        assertTrue(
+            "Merged M4A duration (${mergedM4aMeta.durationMs}ms) must exceed original (${origM4aMeta.durationMs}ms)",
+            mergedM4aMeta.durationMs >= origM4aMeta.durationMs + 850L
+        )
+
+        // Verify Room persistence & linked row title propagation
+        val localId = repo.insertRecording(
+            RecordingEntity(
+                title = "lecture_01-part-1",
+                filePath = origM4a.absolutePath,
+                durationMs = origM4aMeta.durationMs,
+                format = "M4A",
+                sampleRate = 44100,
+                channels = 1,
+                bitDepth = 16,
+                sizeBytes = origM4a.length(),
+                storageLocation = StorageDestination.LOCAL.id
+            )
+        )
+        val cloudId = repo.insertRecording(
+            RecordingEntity(
+                title = "lecture_01-part-1",
+                filePath = origM4a.absolutePath,
+                durationMs = origM4aMeta.durationMs,
+                format = "M4A",
+                sampleRate = 44100,
+                channels = 1,
+                bitDepth = 16,
+                sizeBytes = origM4a.length(),
+                storageLocation = StorageDestination.CLOUD.id
+            )
+        )
+        val updatedLocal = repo.getRecordingById(localId)!!.copy(
+            title = colonTitle,
+            filePath = sanitizedM4aDest.absolutePath,
+            durationMs = mergedM4aMeta.durationMs,
+            sizeBytes = sanitizedM4aDest.length()
+        )
+        repo.updateRecordingAndLinkedPaths(updatedLocal, origM4a.absolutePath)
+        assertEquals(colonTitle, repo.getRecordingById(localId)!!.title)
+        assertEquals(colonTitle, repo.getRecordingById(cloudId)!!.title)
+        assertEquals(sanitizedM4aDest.absolutePath, repo.getRecordingById(cloudId)!!.filePath)
+
+        // --- Part B: WAV Continue Recording + Rename with colons ---
+        val origWav = File(tempDir, "voice-note_01-draft.wav")
+        WavFileTools.createStudioSampleAudioFile(origWav, durationSeconds = 1, sampleRate = 44100)
+        val origWavHeader = WavFileTools.readWavHeaderInfo(origWav)
+
+        val appendWav = File(tempDir, "append_seg_wav.wav")
+        WavFileTools.createStudioSampleAudioFile(appendWav, durationSeconds = 1, sampleRate = 44100)
+
+        val wavAppend = WavFileTools.appendAudioFilesUniversal(
+            originalFile = origWav,
+            appendedPcmFile = appendWav,
+            sampleRate = 44100,
+            channels = 1,
+            bitsPerSample = 16
+        )
+        assertTrue("WAV append must succeed", wavAppend.success)
+
+        val sanitizedWavDest = repo.resolveUniqueLocalFile(tempDir, "Voice: 14:15_final-cut", "wav")
+        assertFalse("Sanitized WAV path must not contain colons", sanitizedWavDest.name.contains(':'))
+        assertTrue(wavAppend.finalFile.renameTo(sanitizedWavDest))
+        assertTrue("Merged WAV must remain valid RIFF WAVE", WavFileTools.isRiffWaveFile(sanitizedWavDest))
+        val mergedWavHeader = WavFileTools.readWavHeaderInfo(sanitizedWavDest)
+        assertTrue(
+            "Merged WAV payload (${mergedWavHeader.pcmDataBytes}) must exceed original (${origWavHeader.pcmDataBytes})",
+            mergedWavHeader.pcmDataBytes >= origWavHeader.pcmDataBytes * 2 - 4096L
+        )
+    }
+
+    @Test
+    fun `verify Continue Recording overlay and ViewModel preserve exact target title across pause resume and confirmation`() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val originalTitle = "my_lecture-01_part-2"
+
+        // Reset overlay state
+        com.example.service.RecordingIslandOverlayManager.dismissAndReset()
+        com.example.service.RecordingIslandOverlayManager.updateRecordingOverlayState(
+            context = context,
+            title = "Paused",
+            isPaused = true,
+            elapsedMs = 4200L,
+            waveformBitmap = Bitmap.createBitmap(1, 1, Bitmap.Config.ARGB_8888),
+            oscillatingDisplacements = FloatArray(5),
+            isShowingAppendConfirmation = true,
+            defaultSuggestedTitle = originalTitle
+        )
+        assertEquals(
+            "Overlay confirmation must keep exact original title with underscores and hyphens",
+            originalTitle,
+            com.example.service.RecordingIslandOverlayManager.currentEditedRecordingTitle
+        )
+        com.example.service.RecordingIslandOverlayManager.dismissAndReset()
+    }
 }
+
 
 
 

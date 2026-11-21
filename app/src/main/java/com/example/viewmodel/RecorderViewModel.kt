@@ -559,7 +559,7 @@ class RecorderViewModel(application: Application) : AndroidViewModel(application
             audioEngine.pauseRecording()
             _recordingStatus.value = RecordingStatus.PAUSED
             updateForegroundServiceNotification(
-                title = "Paused",
+                title = _appendTarget.value?.title ?: "Paused",
                 status = "",
                 isPaused = true
             )
@@ -572,7 +572,7 @@ class RecorderViewModel(application: Application) : AndroidViewModel(application
             audioEngine.resumeRecording()
             _recordingStatus.value = RecordingStatus.RECORDING
             updateForegroundServiceNotification(
-                title = "Recording",
+                title = _appendTarget.value?.title ?: "Recording",
                 status = "",
                 isPaused = false,
                 clearAppendConfirmation = true
@@ -769,7 +769,8 @@ class RecorderViewModel(application: Application) : AndroidViewModel(application
                 viewModelScope.launch(Dispatchers.IO + NonCancellable) {
                     try {
                         _mergeProgress.value = 0
-                        val origFile = File(appendTargetItem.filePath)
+                        val origFile = repository.resolveAudioFile(appendTargetItem)
+                            ?: File(appendTargetItem.filePath)
                         val rawBitrate = appendTargetItem.bitrate.takeIf { it > 0 } ?: 192_000
                         val safeTargetBitrate = com.example.audio.AacEncoder.clampBitrateForAacLc(
                             rawBitrate = rawBitrate,
@@ -788,10 +789,101 @@ class RecorderViewModel(application: Application) : AndroidViewModel(application
                             }
                         )
 
-                        if (appendResult != null && appendResult.success) {
+                        if (appendResult != null && appendResult.success &&
+                            appendResult.finalFile.exists() && appendResult.finalFile.length() > 32L
+                        ) {
                             _mergeProgress.value = 100
-                            val finalFile = appendResult.finalFile
-                            if (origFile.exists() && origFile.absolutePath != finalFile.absolutePath) {
+                            val mergedFile = appendResult.finalFile
+                            val isMergedM4a = appendResult.format.equals("M4A", ignoreCase = true) ||
+                                mergedFile.extension.equals("m4a", ignoreCase = true)
+                            val finalExt = if (isMergedM4a) {
+                                "m4a"
+                            } else {
+                                mergedFile.extension.ifBlank { "wav" }.lowercase(Locale.US)
+                            }
+
+                            // Verify container integrity before renaming or committing to DB
+                            val mergedM4aMeta = if (isMergedM4a) {
+                                com.example.audio.Mp4BoxParser.parseM4a(mergedFile)
+                            } else null
+                            val mergedWavHeader = if (!isMergedM4a) {
+                                WavFileTools.readWavHeaderInfo(
+                                    file = mergedFile,
+                                    fallbackSampleRate = appendTargetItem.sampleRate,
+                                    fallbackChannels = appendTargetItem.channels,
+                                    fallbackBitsPerSample = appendTargetItem.bitDepth
+                                )
+                            } else null
+                            val isContainerValid = if (isMergedM4a) {
+                                mergedM4aMeta != null &&
+                                    mergedM4aMeta.isSampleTableConsistent() &&
+                                    mergedM4aMeta.sampleSizes.isNotEmpty()
+                            } else {
+                                WavFileTools.isRiffWaveFile(mergedFile) &&
+                                    (mergedWavHeader?.pcmDataBytes ?: 0L) > 0L
+                            }
+
+                            if (!isContainerValid) {
+                                stopForegroundServiceNotification()
+                                saveOrphanedSegmentAsRecoveryRecording(
+                                    segmentFile = sessionFile,
+                                    baseTitle = cleanTitle,
+                                    durationMs = finalDuration,
+                                    sampleRate = effSampleRate,
+                                    channels = effChannels,
+                                    bitDepth = effBitDepth
+                                )
+                                return@launch
+                            }
+
+                            // Decouple exact user display title (may contain ":", "-", "_", etc.)
+                            // from a strictly filesystem-safe disk filename when renamed or sanitized
+                            val titleChanged = cleanTitle != appendTargetItem.title
+                            val currentNameUnsafe = mergedFile.name.contains(Regex("[\\\\/:*?\"<>|\\u0000-\\u001F]"))
+                            val finalFile = if (titleChanged || currentNameUnsafe) {
+                                val targetDir = mergedFile.parentFile ?: repository.getRecordingsDir(
+                                    subFolderName = _settings.value.localFolderName,
+                                    folderPath = _settings.value.localFolderPath
+                                )
+                                val sanitizedTarget = repository.resolveUniqueLocalFile(
+                                    targetDir = targetDir,
+                                    baseTitle = cleanTitle,
+                                    extension = finalExt
+                                )
+                                if (sanitizedTarget.canonicalPath == mergedFile.canonicalPath) {
+                                    mergedFile
+                                } else {
+                                    val moved = try {
+                                        if (mergedFile.renameTo(sanitizedTarget)) {
+                                            true
+                                        } else {
+                                            mergedFile.copyTo(sanitizedTarget, overwrite = true)
+                                            if (sanitizedTarget.exists() && sanitizedTarget.length() == mergedFile.length()) {
+                                                mergedFile.delete()
+                                                true
+                                            } else {
+                                                sanitizedTarget.delete()
+                                                false
+                                            }
+                                        }
+                                    } catch (_: Exception) {
+                                        false
+                                    }
+                                    if (moved && sanitizedTarget.exists() && sanitizedTarget.length() > 32L) {
+                                        sanitizedTarget
+                                    } else {
+                                        mergedFile
+                                    }
+                                }
+                            } else {
+                                mergedFile
+                            }
+
+                            if (origFile.exists() &&
+                                origFile.canonicalPath != finalFile.canonicalPath &&
+                                finalFile.exists() &&
+                                finalFile.length() > 32L
+                            ) {
                                 try { origFile.delete() } catch (_: Exception) {}
                             }
                             val fallbackCombinedDuration = appendTargetItem.durationMs + finalDuration
@@ -801,25 +893,12 @@ class RecorderViewModel(application: Application) : AndroidViewModel(application
                                 fallbackCombinedDuration
                             }
                             val updatedFileSize = finalFile.length()
-                            val isMergedM4a = appendResult.format.equals("M4A", ignoreCase = true) ||
-                                finalFile.extension.equals("m4a", ignoreCase = true)
-                            val mergedM4aMeta = if (isMergedM4a) {
-                                com.example.audio.Mp4BoxParser.parseM4a(finalFile)
-                            } else null
-                            val mergedWavHeader = if (!isMergedM4a) {
-                                WavFileTools.readWavHeaderInfo(
-                                    file = finalFile,
-                                    fallbackSampleRate = appendTargetItem.sampleRate,
-                                    fallbackChannels = appendTargetItem.channels,
-                                    fallbackBitsPerSample = appendTargetItem.bitDepth
-                                )
-                            } else null
                             val resolvedRate = mergedM4aMeta?.sampleRate ?: mergedWavHeader?.sampleRate ?: appendTargetItem.sampleRate
                             val resolvedChannels = mergedM4aMeta?.channelCount ?: mergedWavHeader?.channels ?: appendTargetItem.channels
                             val resolvedBits = mergedWavHeader?.bitsPerSample ?: appendTargetItem.bitDepth
 
-                            // Immediately persist new duration, file size, and unsynced status so Local and Cloud
-                            // Library lists refresh without delay.
+                            // Immediately persist exact display title, sanitized filePath, duration, size, and unsynced status
+                            // so Local and Cloud Library lists refresh without delay.
                             val immediateEntity = appendTargetItem.copy(
                                 title = cleanTitle,
                                 filePath = finalFile.absolutePath,
@@ -871,10 +950,12 @@ class RecorderViewModel(application: Application) : AndroidViewModel(application
                             if (shouldAutoUploadAppend) {
                                 syncRecordingToCloud(updatedEntity, isManualTrigger = false)
                             } else if (shouldLocalAutoSyncAppend) {
+                                val safeSyncFileName =
+                                    "${RecordingRepository.sanitizeFileNameForStorage(cleanTitle)}.$finalExt"
                                 repository.syncFileToSelectedLocalFolder(
                                     sourceFile = finalFile,
                                     settings = _settings.value,
-                                    desiredFileName = finalFile.name
+                                    desiredFileName = safeSyncFileName
                                 )
                                 refreshLocalPhoneFolders()
                             }
@@ -891,6 +972,7 @@ class RecorderViewModel(application: Application) : AndroidViewModel(application
                             )
                         }
                     } catch (e: Exception) {
+                        stopForegroundServiceNotification()
                         saveOrphanedSegmentAsRecoveryRecording(
                             segmentFile = sessionFile,
                             baseTitle = cleanTitle,
@@ -3190,7 +3272,7 @@ class RecorderViewModel(application: Application) : AndroidViewModel(application
                 notes = "Saved automatically after merge interruption"
             )
             repository.insertRecording(entity)
-            postSnackbar("Merge fallback: saved new audio as \"$recoveryTitle\"")
+            postSnackbar("Merge failed — original kept safe, new clip saved as \"$recoveryTitle\"")
         } catch (_: Exception) {
             postSnackbar("Failed to merge audio segments; original file preserved safely.")
         }
@@ -3200,11 +3282,7 @@ class RecorderViewModel(application: Application) : AndroidViewModel(application
         val currentStatus = _recordingStatus.value
         if (currentStatus == RecordingStatus.RECORDING || currentStatus == RecordingStatus.PAUSED) {
             val isPaused = currentStatus == RecordingStatus.PAUSED
-            val title = if (isPaused) {
-                "Paused"
-            } else {
-                _appendTarget.value?.title ?: "Recording"
-            }
+            val title = _appendTarget.value?.title ?: if (isPaused) "Paused" else "Recording"
             updateForegroundServiceNotification(
                 title = title,
                 status = "",
@@ -3274,6 +3352,9 @@ class RecorderViewModel(application: Application) : AndroidViewModel(application
             val context = getApplication<Application>()
             val intent = Intent(context, RecordingForegroundService::class.java).apply {
                 action = RecordingForegroundService.ACTION_SHOW_APPEND_SAVE_CONFIRMATION
+                _appendTarget.value?.title?.takeIf { it.isNotBlank() }?.let { targetTitle ->
+                    putExtra(RecordingForegroundService.EXTRA_TITLE, targetTitle)
+                }
             }
             context.startService(intent)
         } catch (_: Exception) {}

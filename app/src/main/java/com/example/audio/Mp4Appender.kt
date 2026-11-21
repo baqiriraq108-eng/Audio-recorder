@@ -98,7 +98,7 @@ object Mp4Appender {
         }
 
         val parentDir = baseM4aFile.parentFile ?: File(".")
-        val stagingFile = File(parentDir, "${baseM4aFile.name}.append.tmp")
+        val stagingFile = File(parentDir, ".mp4_app_${System.nanoTime()}.tmp")
         if (stagingFile.exists()) stagingFile.delete()
 
         return try {
@@ -394,7 +394,7 @@ object Mp4Appender {
             baseMeta.aacObjectType == appendMeta.aacObjectType &&
             ascMatches
         ) {
-            val rawExtractTemp = File(baseM4aFile.parentFile, "${baseM4aFile.name}.raw_ext.aac")
+            val rawExtractTemp = File(baseM4aFile.parentFile ?: File("."), ".mp4_ext_${System.nanoTime()}.aac")
             try {
                 val skipFirstPriming = if (appendMeta.sampleSizes.size > 2) 1 else 0
                 val keptSizes = extractRawAacFramesViaChunkTable(
@@ -455,7 +455,7 @@ object Mp4Appender {
             val matchingEncoderPair = AacEncoder.createMatchingEncoderForBaseFile(baseM4aFile, safeBitrate)
             if (matchingEncoderPair != null) {
                 val (encoder, _) = matchingEncoderPair
-                val rawAacTemp = File(baseM4aFile.parentFile, "${baseM4aFile.name}.seg.aac")
+                val rawAacTemp = File(baseM4aFile.parentFile ?: File("."), ".mp4_seg_${System.nanoTime()}.aac")
                 try {
                     val encodedSegment = encoder.encodeWavFileToSegment(
                         wavFile = appendedFile,
@@ -516,9 +516,10 @@ object Mp4Appender {
         appendedSegment: EncodedAacSegment
     ): Mp4AppendOutcome {
         val parentDir = baseM4aFile.parentFile ?: File(".")
-        val baseRawTemp = File(parentDir, "${baseM4aFile.name}.base_repack.aac")
-        val combinedRawTemp = File(parentDir, "${baseM4aFile.name}.combined_repack.aac")
-        val stagingM4a = File(parentDir, "${baseM4aFile.name}.repack_staging.m4a")
+        val stamp = System.nanoTime()
+        val baseRawTemp = File(parentDir, ".mp4_brep_$stamp.aac")
+        val combinedRawTemp = File(parentDir, ".mp4_crep_$stamp.aac")
+        val stagingM4a = File(parentDir, ".mp4_srep_$stamp.m4a")
         return try {
             val baseSizes = extractRawAacFramesViaChunkTable(
                 sourceFile = baseM4aFile,
@@ -601,10 +602,11 @@ object Mp4Appender {
         onProgress: ((Float) -> Unit)? = null
     ): Mp4AppendOutcome {
         val parentDir = baseFile.parentFile ?: File(".")
-        val basePcmTemp = File(parentDir, "${baseFile.name}.transcode_base.pcm")
-        val appendPcmTemp = File(parentDir, "${baseFile.name}.transcode_app.pcm")
-        val rawAacTemp = File(parentDir, "${baseFile.name}.transcode.aac")
-        val stagingM4a = File(parentDir, "${baseFile.name}.transcode.m4a.tmp")
+        val stamp = System.nanoTime()
+        val basePcmTemp = File(parentDir, ".mp4_tb_$stamp.pcm")
+        val appendPcmTemp = File(parentDir, ".mp4_ta_$stamp.pcm")
+        val rawAacTemp = File(parentDir, ".mp4_tr_$stamp.aac")
+        val stagingM4a = File(parentDir, ".mp4_ts_$stamp.m4a.tmp")
 
         return try {
             onProgress?.invoke(0.05f)
@@ -670,14 +672,33 @@ object Mp4Appender {
 
             val segment = encoder.finish()
             val wroteM4a = encoder.writeStandaloneM4aFile(segment, stagingM4a)
-            if (!wroteM4a || !stagingM4a.exists()) {
+            if (!wroteM4a || !stagingM4a.exists() || stagingM4a.length() <= 32L) {
                 return Mp4AppendOutcome(false, baseFile, errorMessage = "Failed to write transcoded M4A container.")
+            }
+
+            val expectedTranscodeDurMs = (segment.totalEncodedSamples * 1000L) / targetSampleRate.coerceAtLeast(8000).toLong()
+            val (transcodeValid, transcodeErr) = validateAppendedM4aFile(
+                file = stagingM4a,
+                expectedTotalSamples = segment.frameSizes.size.toLong(),
+                expectedDurationMs = expectedTranscodeDurMs
+            )
+            if (!transcodeValid) {
+                return Mp4AppendOutcome(
+                    success = false,
+                    finalFile = baseFile,
+                    usedTranscodeFallback = true,
+                    errorMessage = transcodeErr ?: "Transcoded M4A failed integrity verification."
+                )
             }
 
             val targetFinalM4a = if (baseFile.extension.equals("m4a", ignoreCase = true)) {
                 baseFile
             } else {
-                File(parentDir, "${baseFile.nameWithoutExtension}.m4a")
+                val safeBaseName = baseFile.nameWithoutExtension
+                    .replace(Regex("[\\\\/:*?\"<>|\\u0000-\\u001F]"), "_")
+                    .trim('.', ' ')
+                    .ifBlank { "Recording" }
+                File(parentDir, "$safeBaseName.m4a")
             }
 
             if (!atomicSwapFile(stagingM4a, targetFinalM4a)) {
@@ -782,6 +803,9 @@ object Mp4Appender {
         }
 
         val totalSampleBytes = meta.sampleSizes.sumOf { it.toLong() }
+        if (meta.sampleSizes.isEmpty() || totalSampleBytes <= 0L) {
+            return false to "Appended M4A contains zero audio sample payload."
+        }
         if (totalSampleBytes > meta.mdatDataSize) {
             return false to "Sum of sample sizes ($totalSampleBytes) exceeds mdat payload (${meta.mdatDataSize})."
         }
@@ -797,7 +821,9 @@ object Mp4Appender {
             var extractor: MediaExtractor? = null
             try {
                 extractor = MediaExtractor()
-                extractor.setDataSource(file.absolutePath)
+                FileInputStream(file).use { fis ->
+                    extractor.setDataSource(fis.fd)
+                }
                 if (extractor.trackCount < 1) {
                     return false to "MediaExtractor found 0 tracks in appended M4A."
                 }
@@ -822,7 +848,9 @@ object Mp4Appender {
             var retriever: MediaMetadataRetriever? = null
             try {
                 retriever = MediaMetadataRetriever()
-                retriever.setDataSource(file.absolutePath)
+                FileInputStream(file).use { fis ->
+                    retriever.setDataSource(fis.fd)
+                }
                 retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)
             } catch (_: Exception) {
                 // Ignore retriever metadata quirks if MediaExtractor and box parser succeeded
@@ -1195,7 +1223,7 @@ object Mp4Appender {
     private fun atomicSwapFile(stagingFile: File, targetFile: File): Boolean {
         if (!stagingFile.exists() || stagingFile.length() == 0L) return false
         val parent = targetFile.parentFile ?: stagingFile.parentFile ?: return false
-        val backupFile = File(parent, "${targetFile.name}.bak")
+        val backupFile = File(parent, ".mp4_swap_${System.nanoTime()}.bak")
         if (backupFile.exists()) backupFile.delete()
 
         return try {

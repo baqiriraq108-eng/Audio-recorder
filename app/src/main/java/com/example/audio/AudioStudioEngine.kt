@@ -2237,7 +2237,9 @@ class AudioStudioEngine(private val context: Context) {
         try {
             hasAppliedCustomMediaPlayerSpeed = false
             val mp = MediaPlayer()
-            mp.setDataSource(file.absolutePath)
+            java.io.FileInputStream(file).use { fis ->
+                mp.setDataSource(fis.fd)
+            }
             mp.prepare()
             // Strict flat 0 dB (1.0f) unity gain
             mp.setVolume(1.0f, 1.0f)
@@ -2285,7 +2287,9 @@ class AudioStudioEngine(private val context: Context) {
                     withContext(Dispatchers.Main) {
                         try {
                             val mpRetry = MediaPlayer()
-                            mpRetry.setDataSource(repairResult.finalFile.absolutePath)
+                            java.io.FileInputStream(repairResult.finalFile).use { fis ->
+                                mpRetry.setDataSource(fis.fd)
+                            }
                             mpRetry.prepare()
                             mpRetry.setVolume(1.0f, 1.0f)
                             val totalDur = mpRetry.duration.toLong().coerceAtLeast(500L)

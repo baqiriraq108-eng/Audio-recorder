@@ -574,7 +574,9 @@ object WavFileTools {
         var codec: MediaCodec? = null
         return try {
             extractor = MediaExtractor()
-            extractor.setDataSource(sourceFile.absolutePath)
+            FileInputStream(sourceFile).use { fis ->
+                extractor.setDataSource(fis.fd)
+            }
             var audioTrackIndex = -1
             var audioFormat: MediaFormat? = null
             for (i in 0 until extractor.trackCount) {
@@ -920,12 +922,42 @@ object WavFileTools {
         }
 
         // Native WAV-to-WAV Merge Path (for RIFF WAVE recordings)
+        // Non-M4A/non-WAV imported formats (e.g. MP3, FLAC, OGG, OPUS, AAC) are transcoded and merged into M4A
         if (!isRiffWaveFile(repairedOriginal)) {
-            return AppendResult(success = false, finalFile = repairedOriginal)
+            val safeRate = sampleRate.coerceIn(8000, 48000).let { r ->
+                if (r in setOf(8000, 11025, 12000, 16000, 22050, 24000, 32000, 44100, 48000)) r else 44100
+            }
+            val safeCh = channels.coerceIn(1, 2)
+            val safeBr = AacEncoder.clampBitrateForAacLc(targetBitrate, safeRate, safeCh)
+            val transcodeOutcome = Mp4Appender.transcodeAndAppendFallback(
+                baseFile = repairedOriginal,
+                appendedFile = appendedPcmFile,
+                targetSampleRate = safeRate,
+                targetChannels = safeCh,
+                targetBitrate = safeBr,
+                onProgress = onProgress
+            )
+            return if (transcodeOutcome.success) {
+                AppendResult(
+                    success = true,
+                    finalFile = transcodeOutcome.finalFile,
+                    format = "M4A",
+                    mimeType = "audio/mp4",
+                    durationMs = transcodeOutcome.totalDurationMs
+                )
+            } else {
+                AppendResult(
+                    success = false,
+                    finalFile = repairedOriginal,
+                    format = repairedOriginal.extension.uppercase().ifBlank { "M4A" },
+                    mimeType = "audio/mp4"
+                )
+            }
         }
 
         val origHeader = readWavHeaderInfo(repairedOriginal, sampleRate, channels, bitsPerSample)
         val parentDir = repairedOriginal.parentFile ?: appendedPcmFile.parentFile ?: return AppendResult(false, repairedOriginal)
+        val stamp = System.nanoTime()
 
         val effectiveRate = origHeader.sampleRate.coerceIn(8000, 192000)
         val effectiveChannels = origHeader.channels.coerceIn(1, 2)
@@ -936,7 +968,7 @@ object WavFileTools {
         val sourceAppendWavFile = if (isRiffWaveFile(appendedPcmFile)) {
             appendedPcmFile
         } else {
-            val tempWav = File(parentDir, "${repairedOriginal.name}.app_decoded.wav")
+            val tempWav = File(parentDir, ".wav_app_dec_$stamp.wav")
             val ok = decodeAudioToWav(
                 sourceFile = appendedPcmFile,
                 outputWavFile = tempWav,
@@ -957,7 +989,7 @@ object WavFileTools {
         val appendChannels = appendHeader.channels.coerceIn(1, 2)
         val appendBlockAlign = appendHeader.blockAlign.coerceAtLeast(2)
 
-        val stagingFile = File(parentDir, "${repairedOriginal.name}.merged.tmp")
+        val stagingFile = File(parentDir, ".wav_merged_$stamp.tmp")
         if (stagingFile.exists()) stagingFile.delete()
 
         return try {
@@ -1051,8 +1083,8 @@ object WavFileTools {
 
             onProgress?.invoke(0.92f)
 
-            if (stagingFile.exists() && stagingFile.length() > 44L) {
-                val backupFile = File(parentDir, "${repairedOriginal.name}.bak")
+            if (stagingFile.exists() && stagingFile.length() > 44L && writtenPcmBytes > 0L && isRiffWaveFile(stagingFile)) {
+                val backupFile = File(parentDir, ".wav_swap_$stamp.bak")
                 if (backupFile.exists()) backupFile.delete()
 
                 var replaced = false
@@ -2165,7 +2197,9 @@ object WavFileTools {
         // Read file duration and sample a high-fidelity dynamic speech peak profile with clear pauses
         return try {
             val retriever = android.media.MediaMetadataRetriever()
-            retriever.setDataSource(file.absolutePath)
+            FileInputStream(file).use { fis ->
+                retriever.setDataSource(fis.fd)
+            }
             val durMs = retriever.extractMetadata(android.media.MediaMetadataRetriever.METADATA_KEY_DURATION)?.toLongOrNull() ?: 10000L
             retriever.release()
 
@@ -2618,7 +2652,9 @@ object WavFileTools {
             onProgress(1.0f)
             val durMs = try {
                 val retriever = android.media.MediaMetadataRetriever()
-                retriever.setDataSource(sourceFile.absolutePath)
+                FileInputStream(sourceFile).use { fis ->
+                    retriever.setDataSource(fis.fd)
+                }
                 val d = retriever.extractMetadata(android.media.MediaMetadataRetriever.METADATA_KEY_DURATION)?.toLongOrNull() ?: 10000L
                 retriever.release()
                 d

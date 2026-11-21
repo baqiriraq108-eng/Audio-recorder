@@ -385,7 +385,7 @@ fun RecorderScreen(
     onResetRecording: () -> Unit,
     onCancelAppendMode: () -> Unit,
     showAppendSaveConfirmDialog: Boolean = false,
-    onConfirmAppendSave: () -> Unit = {},
+    onConfirmAppendSave: (String) -> Unit = {},
     onDismissAppendSaveConfirmDialog: () -> Unit = {},
     onDiscardAppendSave: () -> Unit = onResetRecording,
     onToggleSkipSilence: (Boolean) -> Unit = {},
@@ -1008,9 +1008,10 @@ fun RecorderScreen(
                                 .m3PressScale(
                                     shape = CircleShape,
                                     onClick = {
+                                        val exactTypedTitle = dialogRecordingTitle.trim()
                                         com.example.service.RecordingIslandOverlayManager.currentEditedRecordingTitle =
-                                            dialogRecordingTitle.trim()
-                                        onConfirmAppendSave()
+                                            exactTypedTitle
+                                        onConfirmAppendSave(exactTypedTitle)
                                     }
                                 )
                                 .padding(horizontal = 8.dp)
@@ -1034,6 +1035,9 @@ fun RecorderScreen(
                         },
                         label = { Text("Recording Title", maxLines = 1) },
                         singleLine = true,
+                        keyboardOptions = androidx.compose.foundation.text.KeyboardOptions(
+                            autoCorrectEnabled = false
+                        ),
                         shape = RoundedCornerShape(14.dp),
                         colors = androidx.compose.material3.OutlinedTextFieldDefaults.colors(
                             focusedBorderColor = PeachAccent,

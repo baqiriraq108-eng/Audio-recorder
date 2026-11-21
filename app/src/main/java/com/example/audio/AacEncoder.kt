@@ -211,7 +211,14 @@ class AacEncoder(
                 useFallbackPacketizer = false
             } else {
                 mediaCodec = null
-                useFallbackPacketizer = true
+                useFallbackPacketizer = false
+                try { rawOutputStream?.close() } catch (_: Exception) {}
+                rawOutputStream = null
+                try { rawAccessUnitsFile.delete() } catch (_: Exception) {}
+                isStarted = false
+                throw IllegalStateException(
+                    "Unable to configure AAC MediaCodec encoder for ${sampleRate}Hz/${channelCount}ch."
+                )
             }
         } else {
             useFallbackPacketizer = true
@@ -517,7 +524,7 @@ class AacEncoder(
     ): Boolean {
         if (!segment.rawAacFile.exists() || segment.frameSizes.isEmpty()) return false
         outputM4aFile.parentFile?.mkdirs()
-        val tempOut = File(outputM4aFile.parentFile, "${outputM4aFile.name}.new.tmp")
+        val tempOut = File(outputM4aFile.parentFile, ".m4a_new_${System.nanoTime()}.tmp")
         if (tempOut.exists()) tempOut.delete()
 
         return try {
