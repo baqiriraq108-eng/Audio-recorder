@@ -375,6 +375,8 @@ fun RecorderScreen(
     liveBookmarks: List<Long>,
     appendTarget: RecordingEntity?,
     mergeProgress: Int? = null,
+    isMergeCancelling: Boolean = false,
+    onCancelMerge: () -> Unit = {},
     activeAudioDeviceName: String = "Phone Microphone",
     isConnectingBluetoothMic: Boolean = false,
     onStartRecording: () -> Unit,
@@ -640,38 +642,129 @@ fun RecorderScreen(
             }
         }
 
-        // Clean Merging Progress Banner directly above control buttons
+        // Clean Merging Progress Banner directly above control buttons with Cancel button & reverse rollback animation
         AnimatedVisibility(visible = mergeProgress != null) {
             mergeProgress?.let { progress ->
+                val animatedMergeArc by androidx.compose.animation.core.animateFloatAsState(
+                    targetValue = (progress / 100f).coerceIn(0f, 1f),
+                    animationSpec = tween(durationMillis = if (isMergeCancelling) 70 else 140),
+                    label = "recorder_merge_progress_arc"
+                )
+                val indicatorColor by animateColorAsState(
+                    targetValue = if (isMergeCancelling) SecondaryText else PeachAccent,
+                    animationSpec = tween(durationMillis = 180),
+                    label = "recorder_merge_indicator_color"
+                )
                 Row(
                     verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.Center,
+                    horizontalArrangement = Arrangement.SpaceBetween,
                     modifier = Modifier
                         .fillMaxWidth()
                         .padding(bottom = 12.dp)
                         .clip(RoundedCornerShape(18.dp))
                         .background(WarmSecondarySurface)
-                        .padding(horizontal = 16.dp, vertical = 12.dp)
+                        .padding(start = 16.dp, end = 10.dp, top = 4.dp, bottom = 4.dp)
                         .testTag("merging_progress_banner")
                 ) {
-                    androidx.compose.material3.CircularProgressIndicator(
-                        progress = { (progress / 100f).coerceIn(0f, 1f) },
-                        modifier = Modifier.size(20.dp),
-                        color = PeachAccent,
-                        strokeWidth = 2.5.dp
-                    )
-                    Spacer(modifier = Modifier.width(12.dp))
-                    Text(
-                        text = "Merging audio... $progress%",
-                        style = MaterialTheme.typography.titleMedium.copy(
-                            fontWeight = FontWeight.Bold,
-                            fontSize = 15.sp
-                        ),
-                        color = PrimaryText,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis,
-                        modifier = Modifier.testTag("merging_progress_text")
-                    )
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        modifier = Modifier.weight(1f)
+                    ) {
+                        androidx.compose.material3.CircularProgressIndicator(
+                            progress = { animatedMergeArc },
+                            modifier = Modifier
+                                .size(20.dp)
+                                .testTag("merging_progress_indicator"),
+                            color = indicatorColor,
+                            trackColor = ElevatedSurface,
+                            strokeWidth = 2.5.dp
+                        )
+                        Spacer(modifier = Modifier.width(12.dp))
+                        Text(
+                            text = if (isMergeCancelling) {
+                                stringResource(R.string.merge_status_reverting, progress)
+                            } else {
+                                stringResource(R.string.merge_status_merging, progress)
+                            },
+                            style = MaterialTheme.typography.titleMedium.copy(
+                                fontWeight = FontWeight.Bold,
+                                fontSize = 15.sp,
+                                fontFeatureSettings = "tnum"
+                            ),
+                            color = if (isMergeCancelling) SecondaryText else PrimaryText,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                            modifier = Modifier.testTag("merging_progress_text")
+                        )
+                    }
+
+                    Spacer(modifier = Modifier.width(8.dp))
+
+                    if (!isMergeCancelling) {
+                        val cancelDesc = stringResource(R.string.btn_cancel_merge)
+                        Box(
+                            contentAlignment = Alignment.Center,
+                            modifier = Modifier
+                                .height(48.dp)
+                                .clip(CircleShape)
+                                .m3PressScale(
+                                    shape = CircleShape,
+                                    onClick = onCancelMerge
+                                )
+                                .semantics { contentDescription = cancelDesc }
+                                .testTag("merging_cancel_button")
+                        ) {
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(4.dp),
+                                modifier = Modifier
+                                    .clip(CircleShape)
+                                    .background(ElevatedSurface)
+                                    .padding(horizontal = 12.dp, vertical = 7.dp)
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Default.Close,
+                                    contentDescription = null,
+                                    tint = PeachAccent,
+                                    modifier = Modifier.size(14.dp)
+                                )
+                                Text(
+                                    text = stringResource(R.string.btn_cancel_merge),
+                                    style = MaterialTheme.typography.labelMedium.copy(
+                                        fontWeight = FontWeight.SemiBold,
+                                        fontSize = 13.sp
+                                    ),
+                                    color = PeachAccent,
+                                    maxLines = 1
+                                )
+                            }
+                        }
+                    } else {
+                        Box(
+                            contentAlignment = Alignment.Center,
+                            modifier = Modifier
+                                .height(48.dp)
+                                .testTag("merging_undoing_badge")
+                        ) {
+                            Box(
+                                contentAlignment = Alignment.Center,
+                                modifier = Modifier
+                                    .clip(CircleShape)
+                                    .background(ElevatedSurface.copy(alpha = 0.65f))
+                                    .padding(horizontal = 12.dp, vertical = 7.dp)
+                            ) {
+                                Text(
+                                    text = stringResource(R.string.merge_cancelling_badge),
+                                    style = MaterialTheme.typography.labelMedium.copy(
+                                        fontWeight = FontWeight.Medium,
+                                        fontSize = 12.sp
+                                    ),
+                                    color = SecondaryText,
+                                    maxLines = 1
+                                )
+                            }
+                        }
+                    }
                 }
             }
         }

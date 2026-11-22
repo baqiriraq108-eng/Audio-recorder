@@ -159,6 +159,8 @@ fun LibraryScreen(
     syncingIds: Map<Long, Float> = emptyMap(),
     downloadingIds: Map<Long, Float> = emptyMap(),
     mergeProgress: Int? = null,
+    mergeTargetStorage: StorageDestination? = null,
+    isMergeCancelling: Boolean = false,
     onSelectStorageTab: (StorageDestination) -> Unit,
     onSearchQueryChange: (String) -> Unit,
     onSelectFilter: (LibraryFilterChip) -> Unit,
@@ -581,6 +583,8 @@ fun LibraryScreen(
             cloudCount = cloudTotalCount,
             trashCount = trashTotalCount,
             mergeProgress = mergeProgress,
+            mergeTargetStorage = mergeTargetStorage,
+            isMergeCancelling = isMergeCancelling,
             onSelectTab = onSelectStorageTab
         )
 
@@ -1331,6 +1335,20 @@ fun LibraryScreen(
     }
 }
 
+/**
+ * Determines whether [tab] should transform its storage icon into the active merging progress
+ * indicator based on the active [mergeProgress] and [mergeTargetStorage].
+ */
+fun isStorageTabMerging(
+    tab: StorageDestination,
+    mergeProgress: Int?,
+    mergeTargetStorage: StorageDestination?
+): Boolean {
+    if (mergeProgress == null) return false
+    val effectiveTarget = mergeTargetStorage ?: StorageDestination.LOCAL
+    return tab == effectiveTarget
+}
+
 @Composable
 private fun LibraryStorageTabSwitcher(
     activeTab: StorageDestination,
@@ -1338,14 +1356,16 @@ private fun LibraryStorageTabSwitcher(
     cloudCount: Int,
     trashCount: Int,
     mergeProgress: Int? = null,
+    mergeTargetStorage: StorageDestination? = null,
+    isMergeCancelling: Boolean = false,
     onSelectTab: (StorageDestination) -> Unit
 ) {
     val tabs = StorageDestination.entries
     val selectedIndex = tabs.indexOf(activeTab).coerceAtLeast(0)
     val animatedMergeProgress by animateFloatAsState(
         targetValue = ((mergeProgress ?: 0).coerceIn(0, 100)) / 100f,
-        animationSpec = tween(durationMillis = 150),
-        label = "library_local_tab_merge_progress_anim"
+        animationSpec = tween(durationMillis = if (isMergeCancelling) 70 else 150),
+        label = "library_tab_merge_progress_anim"
     )
 
     BoxWithConstraints(
@@ -1382,7 +1402,11 @@ private fun LibraryStorageTabSwitcher(
         Row(modifier = Modifier.fillMaxSize()) {
             tabs.forEach { tab ->
                 val isSelected = activeTab == tab
-                val isLocalMerging = tab == StorageDestination.LOCAL && mergeProgress != null
+                val isTabMerging = isStorageTabMerging(
+                    tab = tab,
+                    mergeProgress = mergeProgress,
+                    mergeTargetStorage = mergeTargetStorage
+                )
                 val count = when (tab) {
                     StorageDestination.LOCAL -> localCount
                     StorageDestination.CLOUD -> cloudCount
@@ -1390,7 +1414,7 @@ private fun LibraryStorageTabSwitcher(
                 }
                 val contentTint by animateColorAsState(
                     targetValue = when {
-                        isLocalMerging -> PeachAccent
+                        isTabMerging -> PeachAccent
                         isSelected -> NavActiveContent
                         else -> NavInactiveContent
                     },
@@ -1413,15 +1437,15 @@ private fun LibraryStorageTabSwitcher(
                         )
                         .testTag("library_storage_tab_${tab.id.lowercase()}")
                 ) {
-                    if (isLocalMerging) {
+                    if (isTabMerging) {
                         CircularProgressIndicator(
                             progress = { animatedMergeProgress },
-                            color = PeachAccent,
+                            color = if (isMergeCancelling) SecondaryText else PeachAccent,
                             trackColor = if (isSelected) ObsidianBackground else ElevatedSurface,
                             strokeWidth = 2.dp,
                             modifier = Modifier
                                 .size(16.dp)
-                                .testTag("library_local_tab_merge_progress")
+                                .testTag("library_${tab.id.lowercase()}_tab_merge_progress")
                         )
                     } else {
                         Icon(
@@ -1437,15 +1461,19 @@ private fun LibraryStorageTabSwitcher(
                     }
                     Spacer(modifier = Modifier.width(5.dp))
                     Text(
-                        text = if (isLocalMerging) "Merging" else tab.shortTitle,
+                        text = when {
+                            isTabMerging && isMergeCancelling -> "Reverting"
+                            isTabMerging -> "Merging"
+                            else -> tab.shortTitle
+                        },
                         style = MaterialTheme.typography.titleSmall.copy(
-                            fontWeight = if (isSelected || isLocalMerging) FontWeight.Bold else FontWeight.Medium
+                            fontWeight = if (isSelected || isTabMerging) FontWeight.Bold else FontWeight.Medium
                         ),
-                        color = contentTint,
+                        color = if (isTabMerging && isMergeCancelling) SecondaryText else contentTint,
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis
                     )
-                    if (!isLocalMerging) {
+                    if (!isTabMerging) {
                         Spacer(modifier = Modifier.width(5.dp))
                         Box(
                             contentAlignment = Alignment.Center,

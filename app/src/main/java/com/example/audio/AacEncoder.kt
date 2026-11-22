@@ -140,6 +140,8 @@ class AacEncoder(
     private var totalPrimingFramesSkipped: Int = 0
     private var isStarted: Boolean = false
     private var useFallbackPacketizer: Boolean = false
+    private var cancellationCheck: (() -> Boolean)? = null
+    private var consecutiveFailedFrames: Int = 0
     private val pcmCarryBuffer = ByteArray(AAC_FRAME_SAMPLES * 4)
     private var pcmCarryCount = 0
 
@@ -163,10 +165,31 @@ class AacEncoder(
     }
 
     /**
+     * Immediately aborts an active encoding session, releases MediaCodec resources,
+     * and deletes any temporary raw AAC staging file.
+     */
+    fun abortAndCleanup() {
+        try { rawOutputStream?.close() } catch (_: Exception) {}
+        rawOutputStream = null
+        try { mediaCodec?.stop() } catch (_: Exception) {}
+        try { mediaCodec?.release() } catch (_: Exception) {}
+        mediaCodec = null
+        try { rawAacTempFile?.delete() } catch (_: Exception) {}
+        isStarted = false
+        pcmCarryCount = 0
+        consecutiveFailedFrames = 0
+    }
+
+    /**
      * Starts an encoding session writing raw AAC access units into [rawAccessUnitsFile].
      */
-    fun start(rawAccessUnitsFile: File) {
+    fun start(rawAccessUnitsFile: File, isCancelled: (() -> Boolean)? = null) {
         if (isStarted) return
+        if (isCancelled?.invoke() == true) {
+            throw java.util.concurrent.CancellationException("AAC encoder start cancelled")
+        }
+        cancellationCheck = isCancelled
+        consecutiveFailedFrames = 0
         rawAccessUnitsFile.parentFile?.mkdirs()
         if (rawAccessUnitsFile.exists()) rawAccessUnitsFile.delete()
         rawAacTempFile = rawAccessUnitsFile
@@ -184,26 +207,39 @@ class AacEncoder(
             val fallbackBitrate = (sampleRate.coerceIn(8000, 48000) * channelCount.coerceIn(1, 2) * 3)
                 .coerceIn(24_000, 128_000)
             val candidateBitrates = listOf(safeBitrate, fallbackBitrate, 64_000).distinct()
+            // Prefer Android's deterministic software AAC-LC encoders first to avoid vendor hardware
+            // MediaCodec buffer-queue stalls during offline file merging, with default type fallback.
+            val codecFactories: List<() -> MediaCodec> = listOf(
+                { MediaCodec.createByCodecName("c2.android.aac.encoder") },
+                { MediaCodec.createByCodecName("OMX.google.aac.encoder") },
+                { MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_AUDIO_AAC) }
+            )
             var configuredCodec: MediaCodec? = null
-            for (candidateRate in candidateBitrates) {
-                var codec: MediaCodec? = null
-                try {
-                    val format = MediaFormat.createAudioFormat(
-                        MediaFormat.MIMETYPE_AUDIO_AAC,
-                        sampleRate,
-                        channelCount
-                    ).apply {
-                        setInteger(MediaFormat.KEY_AAC_PROFILE, aacProfile)
-                        setInteger(MediaFormat.KEY_BIT_RATE, candidateRate)
-                        setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, 16384)
+            outer@ for (createCodec in codecFactories) {
+                for (candidateRate in candidateBitrates) {
+                    if (isCancelled?.invoke() == true) {
+                        abortAndCleanup()
+                        throw java.util.concurrent.CancellationException("AAC encoder configuration cancelled")
                     }
-                    codec = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_AUDIO_AAC)
-                    codec.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
-                    codec.start()
-                    configuredCodec = codec
-                    break
-                } catch (_: Exception) {
-                    try { codec?.release() } catch (_: Exception) {}
+                    var codec: MediaCodec? = null
+                    try {
+                        val format = MediaFormat.createAudioFormat(
+                            MediaFormat.MIMETYPE_AUDIO_AAC,
+                            sampleRate,
+                            channelCount
+                        ).apply {
+                            setInteger(MediaFormat.KEY_AAC_PROFILE, aacProfile)
+                            setInteger(MediaFormat.KEY_BIT_RATE, candidateRate)
+                            setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, 16384)
+                        }
+                        codec = createCodec()
+                        codec.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+                        codec.start()
+                        configuredCodec = codec
+                        break@outer
+                    } catch (_: Exception) {
+                        try { codec?.release() } catch (_: Exception) {}
+                    }
                 }
             }
             if (configuredCodec != null) {
@@ -262,6 +298,9 @@ class AacEncoder(
     }
 
     private fun submitOnePcmFrame(frameBytes: ByteArray, byteLength: Int) {
+        if (cancellationCheck?.invoke() == true) {
+            throw java.util.concurrent.CancellationException("AAC encoding cancelled")
+        }
         val rawPtsUs = computePresentationTimeUs(submittedPcmSamples) + cumulativePtsOffsetUs
         val monotonicPtsUs = if (rawPtsUs <= lastQueuedPtsUs) lastQueuedPtsUs + 1L else rawPtsUs
         lastQueuedPtsUs = monotonicPtsUs
@@ -270,8 +309,11 @@ class AacEncoder(
         if (codec != null && !useFallbackPacketizer) {
             var queued = false
             var retries = 0
-            while (!queued && retries < 80) {
-                val inputIndex = codec.dequeueInputBuffer(10_000L)
+            while (!queued && retries < 30) {
+                if (cancellationCheck?.invoke() == true) {
+                    throw java.util.concurrent.CancellationException("AAC encoding cancelled")
+                }
+                val inputIndex = codec.dequeueInputBuffer(5_000L)
                 if (inputIndex >= 0) {
                     val inputBuffer = codec.getInputBuffer(inputIndex)
                     if (inputBuffer != null) {
@@ -280,14 +322,24 @@ class AacEncoder(
                         inputBuffer.put(frameBytes, 0, cap)
                         codec.queueInputBuffer(inputIndex, 0, cap, monotonicPtsUs, 0)
                         submittedPcmSamples += AAC_FRAME_SAMPLES.toLong()
+                        consecutiveFailedFrames = 0
                         queued = true
+                    } else {
+                        retries++
                     }
                 } else {
-                    drainEncoderOutput(eos = false)
+                    // Drain with a brief wait timeout so queued output buffers release input slots cleanly
+                    drainEncoderOutput(eos = false, waitTimeoutUs = 5_000L)
                     retries++
                 }
             }
-            drainEncoderOutput(eos = false)
+            if (!queued) {
+                consecutiveFailedFrames++
+                if (consecutiveFailedFrames >= 3) {
+                    throw IllegalStateException("AAC MediaCodec stalled while queuing PCM input frames.")
+                }
+            }
+            drainEncoderOutput(eos = false, waitTimeoutUs = 0L)
         } else {
             // Deterministic AAC-LC access unit packetizer for JVM/Robolectric test environments
             writeFallbackAccessUnit(frameBytes, byteLength)
@@ -316,7 +368,7 @@ class AacEncoder(
         }
     }
 
-    private fun drainEncoderOutput(eos: Boolean) {
+    private fun drainEncoderOutput(eos: Boolean, waitTimeoutUs: Long = if (eos) 10_000L else 0L) {
         val codec = mediaCodec ?: return
         val outStream = rawOutputStream ?: return
         val bufferInfo = MediaCodec.BufferInfo()
@@ -324,8 +376,11 @@ class AacEncoder(
         if (eos) {
             var eosQueued = false
             var eosRetries = 0
-            while (!eosQueued && eosRetries < 40) {
-                val inputIndex = codec.dequeueInputBuffer(10_000L)
+            while (!eosQueued && eosRetries < 30) {
+                if (cancellationCheck?.invoke() == true) {
+                    throw java.util.concurrent.CancellationException("AAC encoding cancelled during EOS")
+                }
+                val inputIndex = codec.dequeueInputBuffer(5_000L)
                 if (inputIndex >= 0) {
                     val rawPtsUs = computePresentationTimeUs(submittedPcmSamples) + cumulativePtsOffsetUs
                     val eosPtsUs = if (rawPtsUs <= lastQueuedPtsUs) lastQueuedPtsUs + 1L else rawPtsUs
@@ -348,12 +403,23 @@ class AacEncoder(
         }
 
         var emptyLoops = 0
-        while (true) {
-            val outIndex = codec.dequeueOutputBuffer(bufferInfo, if (eos) 10_000L else 0L)
+        var totalDrainIterations = 0
+        val maxDrainIterations = if (eos) 400 else 64
+        while (totalDrainIterations < maxDrainIterations) {
+            totalDrainIterations++
+            if (cancellationCheck?.invoke() == true) {
+                throw java.util.concurrent.CancellationException("AAC output drain cancelled")
+            }
+            val outIndex = codec.dequeueOutputBuffer(bufferInfo, waitTimeoutUs)
             if (outIndex >= 0) {
-                emptyLoops = 0
                 val isStreamEos = processOutputBuffer(codec, outIndex, bufferInfo, outStream)
                 if (isStreamEos) break
+                if (bufferInfo.size > 0) {
+                    emptyLoops = 0
+                } else {
+                    emptyLoops++
+                    if (emptyLoops > 20) break
+                }
             } else if (outIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
                 val newFormat = codec.outputFormat
                 val csd0 = newFormat.getByteBuffer("csd-0")?.duplicate()
@@ -362,6 +428,8 @@ class AacEncoder(
                     csd0.get(cfg)
                     updateCodecConfigIfNeeded(cfg)
                 }
+                emptyLoops++
+                if (emptyLoops > 10) break
             } else if (outIndex == MediaCodec.INFO_TRY_AGAIN_LATER) {
                 if (!eos) break
                 emptyLoops++
@@ -520,8 +588,10 @@ class AacEncoder(
         segment: EncodedAacSegment,
         outputM4aFile: File,
         writeMoovBeforeMdat: Boolean = false,
-        force64BitOffsets: Boolean = false
+        force64BitOffsets: Boolean = false,
+        isCancelled: (() -> Boolean)? = null
     ): Boolean {
+        if (isCancelled?.invoke() == true) return false
         if (!segment.rawAacFile.exists() || segment.frameSizes.isEmpty()) return false
         outputM4aFile.parentFile?.mkdirs()
         val tempOut = File(outputM4aFile.parentFile, ".m4a_new_${System.nanoTime()}.tmp")
@@ -564,7 +634,15 @@ class AacEncoder(
                     fos.write(ftypBytes)
                     fos.write(mdatHeaderBytes)
                     FileInputStream(segment.rawAacFile).use { fis ->
-                        fis.copyTo(fos, 65536)
+                        val copyBuf = ByteArray(65536)
+                        while (true) {
+                            if (isCancelled?.invoke() == true) {
+                                throw java.util.concurrent.CancellationException("M4A write cancelled")
+                            }
+                            val r = fis.read(copyBuf)
+                            if (r <= 0) break
+                            fos.write(copyBuf, 0, r)
+                        }
                     }
                     fos.write(moovBytes)
                     fos.flush()
@@ -598,10 +676,23 @@ class AacEncoder(
                     fos.write(finalMoov)
                     fos.write(mdatHeaderBytes)
                     FileInputStream(segment.rawAacFile).use { fis ->
-                        fis.copyTo(fos, 65536)
+                        val copyBuf = ByteArray(65536)
+                        while (true) {
+                            if (isCancelled?.invoke() == true) {
+                                throw java.util.concurrent.CancellationException("M4A write cancelled")
+                            }
+                            val r = fis.read(copyBuf)
+                            if (r <= 0) break
+                            fos.write(copyBuf, 0, r)
+                        }
                     }
                     fos.flush()
                 }
+            }
+
+            if (isCancelled?.invoke() == true) {
+                tempOut.delete()
+                return false
             }
 
             if (outputM4aFile.exists()) outputM4aFile.delete()
@@ -624,8 +715,10 @@ class AacEncoder(
     fun encodeWavFileToSegment(
         wavFile: File,
         rawAacOutputFile: File,
-        onProgress: ((Float) -> Unit)? = null
+        onProgress: ((Float) -> Unit)? = null,
+        isCancelled: (() -> Boolean)? = null
     ): EncodedAacSegment? {
+        if (isCancelled?.invoke() == true) return null
         if (!wavFile.exists() || wavFile.length() <= 44L) return null
         return try {
             val isRiff = WavFileTools.isRiffWaveFile(wavFile)
@@ -657,7 +750,7 @@ class AacEncoder(
                 WavFileTools.PcmResampler(srcRate, sampleRate, channelCount)
             } else null
 
-            start(rawAacOutputFile)
+            start(rawAacOutputFile, isCancelled = isCancelled)
             RandomAccessFile(wavFile, "r").use { raf ->
                 raf.seek(pcmOffset)
                 val alignedBufSize = 16384 - (16384 % srcBlockAlign)
@@ -665,6 +758,10 @@ class AacEncoder(
                 var remaining = totalPcmBytes
                 var readTotal = 0L
                 while (remaining > 0L) {
+                    if (isCancelled?.invoke() == true) {
+                        abortAndCleanup()
+                        return null
+                    }
                     val toRead = minOf(buf.size.toLong(), remaining).toInt()
                     val r = raf.read(buf, 0, toRead)
                     if (r <= 0) break
@@ -685,8 +782,13 @@ class AacEncoder(
                     onProgress?.invoke((readTotal.toFloat() / totalPcmBytes.toFloat()).coerceIn(0f, 1f))
                 }
             }
+            if (isCancelled?.invoke() == true) {
+                abortAndCleanup()
+                return null
+            }
             finish()
         } catch (_: Exception) {
+            abortAndCleanup()
             null
         }
     }

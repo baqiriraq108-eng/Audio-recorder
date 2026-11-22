@@ -11,6 +11,7 @@ import com.example.data.RecordingRepository
 import com.example.data.StorageDestination
 import com.example.service.RecordingForegroundService
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -2635,7 +2636,219 @@ class ExampleRobolectricTest {
         )
         com.example.service.RecordingIslandOverlayManager.dismissAndReset()
     }
+
+    @Test
+    fun `verify storage tab merge indicator activates on Cloud for Cloud recordings and Local for Local recordings then resets`() {
+        // 1. Merging a Cloud recording -> ONLY Cloud tab shows merging indicator
+        assertTrue(
+            "Cloud tab must transform into merging indicator when merging a Cloud recording",
+            com.example.ui.screens.isStorageTabMerging(
+                tab = StorageDestination.CLOUD,
+                mergeProgress = 45,
+                mergeTargetStorage = StorageDestination.CLOUD
+            )
+        )
+        assertFalse(
+            "Local tab must keep Phone icon when merging a Cloud recording",
+            com.example.ui.screens.isStorageTabMerging(
+                tab = StorageDestination.LOCAL,
+                mergeProgress = 45,
+                mergeTargetStorage = StorageDestination.CLOUD
+            )
+        )
+        assertFalse(
+            "Trash tab must not show merging indicator during Cloud merge",
+            com.example.ui.screens.isStorageTabMerging(
+                tab = StorageDestination.TRASH,
+                mergeProgress = 45,
+                mergeTargetStorage = StorageDestination.CLOUD
+            )
+        )
+
+        // 2. Merging a Local recording -> ONLY Local tab shows merging indicator
+        assertTrue(
+            "Local tab must transform into merging indicator when merging a Local recording",
+            com.example.ui.screens.isStorageTabMerging(
+                tab = StorageDestination.LOCAL,
+                mergeProgress = 72,
+                mergeTargetStorage = StorageDestination.LOCAL
+            )
+        )
+        assertFalse(
+            "Cloud tab must keep Cloud icon when merging a Local recording",
+            com.example.ui.screens.isStorageTabMerging(
+                tab = StorageDestination.CLOUD,
+                mergeProgress = 72,
+                mergeTargetStorage = StorageDestination.LOCAL
+            )
+        )
+
+        // 3. After merge completion (mergeProgress == null) -> both Cloud and Local restore their original icons
+        assertFalse(
+            "Cloud tab must return to Cloud icon after merge completes",
+            com.example.ui.screens.isStorageTabMerging(
+                tab = StorageDestination.CLOUD,
+                mergeProgress = null,
+                mergeTargetStorage = null
+            )
+        )
+        assertFalse(
+            "Local tab must return to Phone icon after merge completes",
+            com.example.ui.screens.isStorageTabMerging(
+                tab = StorageDestination.LOCAL,
+                mergeProgress = null,
+                mergeTargetStorage = null
+            )
+        )
+    }
+
+    @Test
+    fun `verify atomic rollback cancellation leaves original WAV and M4A 100 percent untouched with zero staging files`() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val testDir = File(context.cacheDir, "atomic_rollback_cancel_${System.currentTimeMillis()}").apply {
+            deleteRecursively()
+            mkdirs()
+        }
+
+        // 1. WAV mid-merge cancellation -> original bytes 100% untouched, segment intact, zero temp files
+        val origWav = File(testDir, "base_lecture.wav")
+        val appendWav = File(testDir, "new_segment.wav")
+        WavFileTools.createStudioSampleAudioFile(origWav, durationSeconds = 3, sampleRate = 44100)
+        WavFileTools.createStudioSampleAudioFile(appendWav, durationSeconds = 2, sampleRate = 44100)
+        val origWavBytesBefore = origWav.readBytes()
+        val appendWavBytesBefore = appendWav.readBytes()
+
+        val wavCancelFlag = java.util.concurrent.atomic.AtomicBoolean(false)
+        val wavResult = WavFileTools.appendAudioFilesUniversal(
+            originalFile = origWav,
+            appendedPcmFile = appendWav,
+            sampleRate = 44100,
+            channels = 1,
+            bitsPerSample = 16,
+            onProgress = { ratio ->
+                if (ratio >= 0.25f) {
+                    wavCancelFlag.set(true)
+                }
+            },
+            isCancelled = { wavCancelFlag.get() }
+        )
+
+        assertFalse("Cancelled WAV merge must not report success", wavResult.success)
+        assertTrue("Cancelled WAV merge must report cancelled = true", wavResult.cancelled)
+        assertTrue("Original WAV must still exist", origWav.exists())
+        org.junit.Assert.assertArrayEquals(
+            "Original WAV bytes must be 100% identical after atomic rollback",
+            origWavBytesBefore,
+            origWav.readBytes()
+        )
+        assertTrue("Appended segment must remain intact so it can be saved separately", appendWav.exists())
+        org.junit.Assert.assertArrayEquals(
+            "Appended segment bytes must remain intact",
+            appendWavBytesBefore,
+            appendWav.readBytes()
+        )
+        val leftoverWavTemps = testDir.listFiles()?.filter {
+            it.name.endsWith(".tmp") || it.name.endsWith(".bak") || it.name.startsWith(".wav_")
+        }.orEmpty()
+        assertTrue("Zero temporary WAV staging files may remain after cancel: $leftoverWavTemps", leftoverWavTemps.isEmpty())
+
+        // 2. M4A mid-merge cancellation -> original M4A bytes 100% untouched, zero .mp4_* staging files
+        val m4aDir = File(context.cacheDir, "atomic_rollback_m4a_${System.currentTimeMillis()}").apply {
+            deleteRecursively()
+            mkdirs()
+        }
+        val baseM4a = File(m4aDir, "base_memo.m4a")
+        val rawBase = File(m4aDir, "raw_base.aac")
+        val baseEnc = com.example.audio.AacEncoder(sampleRate = 44100, channelCount = 1, bitrate = 128_000)
+        baseEnc.start(rawBase)
+        val oneSecMono = ShortArray(44100) { idx -> ((idx % 60) * 200).toShort() }
+        baseEnc.encodePcmSamples(oneSecMono, oneSecMono.size)
+        val baseSeg = baseEnc.finish()
+        assertTrue(baseEnc.writeStandaloneM4aFile(baseSeg, baseM4a))
+        rawBase.delete()
+
+        val origM4aBytesBefore = baseM4a.readBytes()
+        val rawAppend = File(m4aDir, "raw_append.aac")
+        val appendEnc = com.example.audio.AacEncoder(sampleRate = 44100, channelCount = 1, bitrate = 128_000)
+        appendEnc.start(rawAppend)
+        appendEnc.encodePcmSamples(oneSecMono, oneSecMono.size)
+        val appendSeg = appendEnc.finish()
+
+        val m4aCancelFlag = java.util.concurrent.atomic.AtomicBoolean(false)
+        val m4aOutcome = com.example.audio.Mp4Appender.appendEncodedSegmentToM4a(
+            baseM4aFile = baseM4a,
+            segment = appendSeg,
+            onProgress = { ratio ->
+                if (ratio >= 0.15f) {
+                    m4aCancelFlag.set(true)
+                }
+            },
+            isCancelled = { m4aCancelFlag.get() }
+        )
+
+        assertFalse("Cancelled M4A merge must not report success", m4aOutcome.success)
+        assertTrue("Cancelled M4A merge must report cancelled = true", m4aOutcome.cancelled)
+        org.junit.Assert.assertArrayEquals(
+            "Original M4A bytes must be 100% identical after atomic rollback",
+            origM4aBytesBefore,
+            baseM4a.readBytes()
+        )
+        val leftoverM4aTemps = m4aDir.listFiles()?.filter {
+            it.name.startsWith(".mp4_") || it.name.endsWith(".tmp") || it.name.endsWith(".bak")
+        }.orEmpty()
+        assertTrue("Zero temporary M4A staging files may remain after cancel: $leftoverM4aTemps", leftoverM4aTemps.isEmpty())
+        rawAppend.delete()
+    }
+
+    @Test
+    fun `verify cancelActiveMerge animates progress backward from 38 percent to 0 then clears state`() = runBlocking {
+        val app = ApplicationProvider.getApplicationContext<android.app.Application>()
+        val vm = com.example.viewmodel.RecorderViewModel(app)
+
+        vm.setMergeProgressForTest(progress = 38, targetStorage = StorageDestination.CLOUD)
+        assertEquals(38, vm.mergeProgress.value)
+        assertEquals(StorageDestination.CLOUD, vm.mergeTargetStorage.value)
+        assertFalse(vm.isMergeCancelling.value)
+
+        val observedProgress = mutableListOf<Int?>()
+        val collectorJob = this.launch(kotlinx.coroutines.Dispatchers.Unconfined) {
+            vm.mergeProgress.collect { value ->
+                if (observedProgress.lastOrNull() != value) {
+                    observedProgress.add(value)
+                }
+            }
+        }
+
+        vm.cancelActiveMerge()
+        assertTrue("isMergeCancelling must become true immediately upon cancel", vm.isMergeCancelling.value)
+
+        // Advance Robolectric main looper clock through the smooth reverse progress animation (38% -> 0% -> null)
+        var ticks = 0
+        while (vm.mergeProgress.value != null && ticks < 200) {
+            org.robolectric.Shadows.shadowOf(android.os.Looper.getMainLooper())
+                .idleFor(java.time.Duration.ofMillis(15))
+            ticks++
+        }
+        collectorJob.cancel()
+
+        org.junit.Assert.assertNull("mergeProgress must clear to null after rollback finishes", vm.mergeProgress.value)
+        org.junit.Assert.assertNull("mergeTargetStorage must clear to null after rollback finishes", vm.mergeTargetStorage.value)
+        assertFalse("isMergeCancelling must reset to false after rollback finishes", vm.isMergeCancelling.value)
+
+        val numericSteps = observedProgress.filterNotNull()
+        assertTrue("Reverse rollback must emit multiple descending progress states: $numericSteps", numericSteps.size >= 5)
+        assertEquals("Rollback must start from 38%", 38, numericSteps.first())
+        assertEquals("Rollback must reach 0% before closing", 0, numericSteps.last())
+        for (i in 1 until numericSteps.size) {
+            assertTrue(
+                "Progress must move strictly backward during rollback: ${numericSteps[i - 1]} -> ${numericSteps[i]}",
+                numericSteps[i] <= numericSteps[i - 1]
+            )
+        }
+    }
 }
+
+
 
 
 

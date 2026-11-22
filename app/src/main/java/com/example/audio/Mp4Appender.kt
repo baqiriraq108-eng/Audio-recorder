@@ -16,7 +16,8 @@ data class Mp4AppendOutcome(
     val totalSamples: Long = 0L,
     val totalDurationMs: Long = 0L,
     val usedTranscodeFallback: Boolean = false,
-    val errorMessage: String? = null
+    val errorMessage: String? = null,
+    val cancelled: Boolean = false
 )
 
 /**
@@ -38,8 +39,17 @@ object Mp4Appender {
         segment: EncodedAacSegment,
         force64BitOffsets: Boolean = false,
         simulateInterruptBeforeRename: Boolean = false,
-        onProgress: ((Float) -> Unit)? = null
+        onProgress: ((Float) -> Unit)? = null,
+        isCancelled: () -> Boolean = { false }
     ): Mp4AppendOutcome {
+        if (isCancelled()) {
+            return Mp4AppendOutcome(
+                success = false,
+                finalFile = baseM4aFile,
+                errorMessage = "Merge cancelled by user.",
+                cancelled = true
+            )
+        }
         if (!baseM4aFile.exists() || baseM4aFile.length() < 32L) {
             return Mp4AppendOutcome(
                 success = false,
@@ -199,16 +209,16 @@ object Mp4Appender {
                     // patch mdat header in-place, append new AAC frames, and write updated moov at EOF.
                     FileOutputStream(stagingFile).use { fos ->
                         RandomAccessFile(baseM4aFile, "r").use { rafIn ->
-                            copyRange(rafIn, fos, 0L, meta.mdatOffset + meta.mdatSize)
+                            copyRange(rafIn, fos, 0L, meta.mdatOffset + meta.mdatSize, isCancelled)
                         }
+                        if (isCancelled()) throw java.util.concurrent.CancellationException("Merge cancelled")
                         onProgress?.invoke(0.60f)
-                        FileInputStream(segment.rawAacFile).use { segIn ->
-                            segIn.copyTo(fos, 65536)
-                        }
+                        copyFileStreamWithCancel(segment.rawAacFile, fos, isCancelled)
                         onProgress?.invoke(0.80f)
                         fos.write(patchedMoovBytes)
                         fos.flush()
                     }
+                    if (isCancelled()) throw java.util.concurrent.CancellationException("Merge cancelled")
                     // Patch updated mdat size header in staging file
                     val updatedMdatHeader = Mp4BoxParser.buildMdatHeader(newMdatTotalSize, force64Bit = needs64BitMdat)
                     RandomAccessFile(stagingFile, "rw").use { rafOut ->
@@ -220,14 +230,13 @@ object Mp4Appender {
                     val updatedMdatHeader = Mp4BoxParser.buildMdatHeader(newMdatTotalSize, force64Bit = needs64BitMdat)
                     FileOutputStream(stagingFile).use { fos ->
                         RandomAccessFile(baseM4aFile, "r").use { rafIn ->
-                            copyRange(rafIn, fos, 0L, meta.mdatOffset)
+                            copyRange(rafIn, fos, 0L, meta.mdatOffset, isCancelled)
                             fos.write(updatedMdatHeader)
-                            copyRange(rafIn, fos, meta.mdatDataOffset, meta.mdatDataSize)
+                            copyRange(rafIn, fos, meta.mdatDataOffset, meta.mdatDataSize, isCancelled)
                         }
+                        if (isCancelled()) throw java.util.concurrent.CancellationException("Merge cancelled")
                         onProgress?.invoke(0.60f)
-                        FileInputStream(segment.rawAacFile).use { segIn ->
-                            segIn.copyTo(fos, 65536)
-                        }
+                        copyFileStreamWithCancel(segment.rawAacFile, fos, isCancelled)
                         onProgress?.invoke(0.80f)
                         fos.write(patchedMoovBytes)
                         fos.flush()
@@ -278,26 +287,35 @@ object Mp4Appender {
                 FileOutputStream(stagingFile).use { fos ->
                     RandomAccessFile(baseM4aFile, "r").use { rafIn ->
                         // 1. Copy prefix before moov (e.g. ftyp)
-                        copyRange(rafIn, fos, 0L, meta.moovOffset)
+                        copyRange(rafIn, fos, 0L, meta.moovOffset, isCancelled)
                         // 2. Write updated moov with shifted chunk offsets
                         fos.write(finalMoovBytes)
                         // 3. Copy any boxes between end of old moov and start of old mdat (e.g. free/skip)
                         val betweenStart = meta.moovOffset + meta.moovSize
                         val betweenLen = (meta.mdatOffset - betweenStart).coerceAtLeast(0L)
                         if (betweenLen > 0L) {
-                            copyRange(rafIn, fos, betweenStart, betweenLen)
+                            copyRange(rafIn, fos, betweenStart, betweenLen, isCancelled)
                         }
                         // 4. Write updated mdat header + original mdat payload
                         fos.write(updatedMdatHeader)
-                        copyRange(rafIn, fos, meta.mdatDataOffset, meta.mdatDataSize)
+                        copyRange(rafIn, fos, meta.mdatDataOffset, meta.mdatDataSize, isCancelled)
                     }
+                    if (isCancelled()) throw java.util.concurrent.CancellationException("Merge cancelled")
                     onProgress?.invoke(0.65f)
                     // 5. Append new AAC access units
-                    FileInputStream(segment.rawAacFile).use { segIn ->
-                        segIn.copyTo(fos, 65536)
-                    }
+                    copyFileStreamWithCancel(segment.rawAacFile, fos, isCancelled)
                     fos.flush()
                 }
+            }
+
+            if (isCancelled()) {
+                stagingFile.delete()
+                return Mp4AppendOutcome(
+                    success = false,
+                    finalFile = baseM4aFile,
+                    errorMessage = "Merge cancelled by user.",
+                    cancelled = true
+                )
             }
 
             if (simulateInterruptBeforeRename) {
@@ -324,6 +342,17 @@ object Mp4Appender {
                 )
             }
 
+            // Final atomic gate before replacing baseM4aFile: never touch base if cancelled
+            if (isCancelled()) {
+                stagingFile.delete()
+                return Mp4AppendOutcome(
+                    success = false,
+                    finalFile = baseM4aFile,
+                    errorMessage = "Merge cancelled by user.",
+                    cancelled = true
+                )
+            }
+
             // Atomically replace baseM4aFile with stagingFile
             if (!atomicSwapFile(stagingFile, baseM4aFile)) {
                 stagingFile.delete()
@@ -343,12 +372,21 @@ object Mp4Appender {
                 totalDurationMs = updatedMeta?.durationMs ?: expectedDurationMs,
                 usedTranscodeFallback = false
             )
+        } catch (e: java.util.concurrent.CancellationException) {
+            stagingFile.delete()
+            Mp4AppendOutcome(
+                success = false,
+                finalFile = baseM4aFile,
+                errorMessage = "Merge cancelled by user.",
+                cancelled = true
+            )
         } catch (e: Exception) {
             stagingFile.delete()
             Mp4AppendOutcome(
                 success = false,
                 finalFile = baseM4aFile,
-                errorMessage = e.localizedMessage ?: "Exception during M4A append."
+                errorMessage = e.localizedMessage ?: "Exception during M4A append.",
+                cancelled = isCancelled()
             )
         }
     }
@@ -368,8 +406,12 @@ object Mp4Appender {
         baseM4aFile: File,
         appendedFile: File,
         targetBitrate: Int = 128_000,
-        onProgress: ((Float) -> Unit)? = null
+        onProgress: ((Float) -> Unit)? = null,
+        isCancelled: () -> Boolean = { false }
     ): Mp4AppendOutcome {
+        if (isCancelled()) {
+            return Mp4AppendOutcome(false, baseM4aFile, errorMessage = "Merge cancelled by user.", cancelled = true)
+        }
         if (!baseM4aFile.exists() || !appendedFile.exists()) {
             return Mp4AppendOutcome(false, baseM4aFile, errorMessage = "Source or append file does not exist.")
         }
@@ -401,8 +443,14 @@ object Mp4Appender {
                     sourceFile = appendedFile,
                     meta = appendMeta,
                     skipFirstFrames = skipFirstPriming,
-                    outRawAacFile = rawExtractTemp
+                    outRawAacFile = rawExtractTemp,
+                    isCancelled = isCancelled
                 )
+
+                if (isCancelled()) {
+                    rawExtractTemp.delete()
+                    return Mp4AppendOutcome(false, baseM4aFile, errorMessage = "Merge cancelled by user.", cancelled = true)
+                }
 
                 if (keptSizes != null && keptSizes.isNotEmpty() && rawExtractTemp.exists() && rawExtractTemp.length() > 0L) {
                     val segment = EncodedAacSegment(
@@ -423,8 +471,13 @@ object Mp4Appender {
                     val outcome = appendEncodedSegmentToM4a(
                         baseM4aFile = baseM4aFile,
                         segment = segment,
-                        onProgress = onProgress
+                        onProgress = onProgress,
+                        isCancelled = isCancelled
                     )
+                    if (outcome.cancelled || isCancelled()) {
+                        rawExtractTemp.delete()
+                        return Mp4AppendOutcome(false, baseM4aFile, errorMessage = "Merge cancelled by user.", cancelled = true)
+                    }
                     if (outcome.success) {
                         rawExtractTemp.delete()
                         try { appendedFile.delete() } catch (_: Exception) {}
@@ -435,9 +488,13 @@ object Mp4Appender {
                     val repackOutcome = repackBaseM4aAndEncodedSegment(
                         baseM4aFile = baseM4aFile,
                         baseMeta = baseMeta,
-                        appendedSegment = segment
+                        appendedSegment = segment,
+                        isCancelled = isCancelled
                     )
                     rawExtractTemp.delete()
+                    if (repackOutcome.cancelled || isCancelled()) {
+                        return Mp4AppendOutcome(false, baseM4aFile, errorMessage = "Merge cancelled by user.", cancelled = true)
+                    }
                     if (repackOutcome.success) {
                         try { appendedFile.delete() } catch (_: Exception) {}
                         return repackOutcome
@@ -447,7 +504,14 @@ object Mp4Appender {
                 }
             } catch (_: Exception) {
                 rawExtractTemp.delete()
+                if (isCancelled()) {
+                    return Mp4AppendOutcome(false, baseM4aFile, errorMessage = "Merge cancelled by user.", cancelled = true)
+                }
             }
+        }
+
+        if (isCancelled()) {
+            return Mp4AppendOutcome(false, baseM4aFile, errorMessage = "Merge cancelled by user.", cancelled = true)
         }
 
         // Case 2: baseM4aFile is valid M4A and appendedFile is PCM WAV -> encode WAV to matching AAC frames & remux
@@ -460,14 +524,24 @@ object Mp4Appender {
                     val encodedSegment = encoder.encodeWavFileToSegment(
                         wavFile = appendedFile,
                         rawAacOutputFile = rawAacTemp,
-                        onProgress = { p -> onProgress?.invoke(p * 0.55f) }
+                        onProgress = { p -> onProgress?.invoke(p * 0.55f) },
+                        isCancelled = isCancelled
                     )
+                    if (isCancelled()) {
+                        rawAacTemp.delete()
+                        return Mp4AppendOutcome(false, baseM4aFile, errorMessage = "Merge cancelled by user.", cancelled = true)
+                    }
                     if (encodedSegment != null && encodedSegment.frameSizes.isNotEmpty()) {
                         val outcome = appendEncodedSegmentToM4a(
                             baseM4aFile = baseM4aFile,
                             segment = encodedSegment,
-                            onProgress = { p -> onProgress?.invoke(0.55f + p * 0.45f) }
+                            onProgress = { p -> onProgress?.invoke(0.55f + p * 0.45f) },
+                            isCancelled = isCancelled
                         )
+                        if (outcome.cancelled || isCancelled()) {
+                            rawAacTemp.delete()
+                            return Mp4AppendOutcome(false, baseM4aFile, errorMessage = "Merge cancelled by user.", cancelled = true)
+                        }
                         if (outcome.success) {
                             rawAacTemp.delete()
                             try { appendedFile.delete() } catch (_: Exception) {}
@@ -476,9 +550,13 @@ object Mp4Appender {
                         val repackOutcome = repackBaseM4aAndEncodedSegment(
                             baseM4aFile = baseM4aFile,
                             baseMeta = baseMeta,
-                            appendedSegment = encodedSegment
+                            appendedSegment = encodedSegment,
+                            isCancelled = isCancelled
                         )
                         rawAacTemp.delete()
+                        if (repackOutcome.cancelled || isCancelled()) {
+                            return Mp4AppendOutcome(false, baseM4aFile, errorMessage = "Merge cancelled by user.", cancelled = true)
+                        }
                         if (repackOutcome.success) {
                             try { appendedFile.delete() } catch (_: Exception) {}
                             return repackOutcome
@@ -488,8 +566,15 @@ object Mp4Appender {
                     }
                 } catch (_: Exception) {
                     rawAacTemp.delete()
+                    if (isCancelled()) {
+                        return Mp4AppendOutcome(false, baseM4aFile, errorMessage = "Merge cancelled by user.", cancelled = true)
+                    }
                 }
             }
+        }
+
+        if (isCancelled()) {
+            return Mp4AppendOutcome(false, baseM4aFile, errorMessage = "Merge cancelled by user.", cancelled = true)
         }
 
         // Case 3: Parameter mismatch or unsupported source container -> explicit background transcode fallback
@@ -501,7 +586,8 @@ object Mp4Appender {
             targetSampleRate = fallbackRate,
             targetChannels = fallbackChannels,
             targetBitrate = safeBitrate,
-            onProgress = onProgress
+            onProgress = onProgress,
+            isCancelled = isCancelled
         )
     }
 
@@ -513,8 +599,12 @@ object Mp4Appender {
     private fun repackBaseM4aAndEncodedSegment(
         baseM4aFile: File,
         baseMeta: Mp4AudioMetadata,
-        appendedSegment: EncodedAacSegment
+        appendedSegment: EncodedAacSegment,
+        isCancelled: () -> Boolean = { false }
     ): Mp4AppendOutcome {
+        if (isCancelled()) {
+            return Mp4AppendOutcome(false, baseM4aFile, errorMessage = "Merge cancelled by user.", cancelled = true)
+        }
         val parentDir = baseM4aFile.parentFile ?: File(".")
         val stamp = System.nanoTime()
         val baseRawTemp = File(parentDir, ".mp4_brep_$stamp.aac")
@@ -525,16 +615,23 @@ object Mp4Appender {
                 sourceFile = baseM4aFile,
                 meta = baseMeta,
                 skipFirstFrames = 0,
-                outRawAacFile = baseRawTemp
+                outRawAacFile = baseRawTemp,
+                isCancelled = isCancelled
             )
+            if (isCancelled()) {
+                return Mp4AppendOutcome(false, baseM4aFile, errorMessage = "Merge cancelled by user.", cancelled = true)
+            }
             if (baseSizes == null || baseSizes.isEmpty() || !baseRawTemp.exists() || baseRawTemp.length() == 0L) {
                 return Mp4AppendOutcome(false, baseM4aFile, errorMessage = "Failed to extract base AAC frames for repack.")
             }
 
             FileOutputStream(combinedRawTemp).use { fos ->
-                FileInputStream(baseRawTemp).use { fis -> fis.copyTo(fos, 65536) }
-                FileInputStream(appendedSegment.rawAacFile).use { fis -> fis.copyTo(fos, 65536) }
+                copyFileStreamWithCancel(baseRawTemp, fos, isCancelled)
+                copyFileStreamWithCancel(appendedSegment.rawAacFile, fos, isCancelled)
                 fos.flush()
+            }
+            if (isCancelled()) {
+                return Mp4AppendOutcome(false, baseM4aFile, errorMessage = "Merge cancelled by user.", cancelled = true)
             }
 
             val totalFrames = baseSizes.size + appendedSegment.frameSizes.size
@@ -562,9 +659,11 @@ object Mp4Appender {
                 sampleRate = baseMeta.sampleRate,
                 channelCount = baseMeta.channelCount
             )
-            if (!writer.writeStandaloneM4aFile(combinedSegment, stagingM4a) ||
-                !atomicSwapFile(stagingM4a, baseM4aFile)
-            ) {
+            val wroteStaging = writer.writeStandaloneM4aFile(combinedSegment, stagingM4a, isCancelled = isCancelled)
+            if (isCancelled()) {
+                return Mp4AppendOutcome(false, baseM4aFile, errorMessage = "Merge cancelled by user.", cancelled = true)
+            }
+            if (!wroteStaging || !atomicSwapFile(stagingM4a, baseM4aFile)) {
                 return Mp4AppendOutcome(false, baseM4aFile, errorMessage = "Failed to write or swap repacked M4A.")
             }
             val updatedMeta = Mp4BoxParser.parseM4a(baseM4aFile)
@@ -577,8 +676,10 @@ object Mp4Appender {
                 totalDurationMs = updatedMeta?.durationMs ?: fallbackDurationMs,
                 usedTranscodeFallback = false
             )
+        } catch (e: java.util.concurrent.CancellationException) {
+            Mp4AppendOutcome(false, baseM4aFile, errorMessage = "Merge cancelled by user.", cancelled = true)
         } catch (e: Exception) {
-            Mp4AppendOutcome(false, baseM4aFile, errorMessage = e.localizedMessage)
+            Mp4AppendOutcome(false, baseM4aFile, errorMessage = e.localizedMessage, cancelled = isCancelled())
         } finally {
             baseRawTemp.delete()
             combinedRawTemp.delete()
@@ -599,8 +700,12 @@ object Mp4Appender {
         targetSampleRate: Int = 44100,
         targetChannels: Int = 1,
         targetBitrate: Int = 128_000,
-        onProgress: ((Float) -> Unit)? = null
+        onProgress: ((Float) -> Unit)? = null,
+        isCancelled: () -> Boolean = { false }
     ): Mp4AppendOutcome {
+        if (isCancelled()) {
+            return Mp4AppendOutcome(false, baseFile, usedTranscodeFallback = true, errorMessage = "Merge cancelled by user.", cancelled = true)
+        }
         val parentDir = baseFile.parentFile ?: File(".")
         val stamp = System.nanoTime()
         val basePcmTemp = File(parentDir, ".mp4_tb_$stamp.pcm")
@@ -608,37 +713,46 @@ object Mp4Appender {
         val rawAacTemp = File(parentDir, ".mp4_tr_$stamp.aac")
         val stagingM4a = File(parentDir, ".mp4_ts_$stamp.m4a.tmp")
 
+        var activeEncoder: AacEncoder? = null
         return try {
             onProgress?.invoke(0.05f)
             val baseDecoded = if (WavFileTools.isRiffWaveFile(baseFile)) {
-                extractOrResampleWavToRawPcm(baseFile, basePcmTemp, targetSampleRate, targetChannels)
+                extractOrResampleWavToRawPcm(baseFile, basePcmTemp, targetSampleRate, targetChannels, isCancelled)
             } else {
                 WavFileTools.decodeAudioToPcm(
                     sourceFile = baseFile,
                     outputPcmFile = basePcmTemp,
                     targetSampleRate = targetSampleRate,
                     targetChannels = targetChannels,
-                    onProgress = { p -> onProgress?.invoke(0.05f + p * 0.30f) }
+                    onProgress = { p -> onProgress?.invoke(0.05f + p * 0.30f) },
+                    isCancelled = isCancelled
                 )
             }
 
+            if (isCancelled()) {
+                return Mp4AppendOutcome(false, baseFile, usedTranscodeFallback = true, errorMessage = "Merge cancelled by user.", cancelled = true)
+            }
             if (!baseDecoded || !basePcmTemp.exists() || basePcmTemp.length() == 0L) {
                 return Mp4AppendOutcome(false, baseFile, errorMessage = "Failed to decode base file for transcode fallback.")
             }
 
             onProgress?.invoke(0.35f)
             val appendDecoded = if (WavFileTools.isRiffWaveFile(appendedFile)) {
-                extractOrResampleWavToRawPcm(appendedFile, appendPcmTemp, targetSampleRate, targetChannels)
+                extractOrResampleWavToRawPcm(appendedFile, appendPcmTemp, targetSampleRate, targetChannels, isCancelled)
             } else {
                 WavFileTools.decodeAudioToPcm(
                     sourceFile = appendedFile,
                     outputPcmFile = appendPcmTemp,
                     targetSampleRate = targetSampleRate,
                     targetChannels = targetChannels,
-                    onProgress = { p -> onProgress?.invoke(0.35f + p * 0.25f) }
+                    onProgress = { p -> onProgress?.invoke(0.35f + p * 0.25f) },
+                    isCancelled = isCancelled
                 )
             }
 
+            if (isCancelled()) {
+                return Mp4AppendOutcome(false, baseFile, usedTranscodeFallback = true, errorMessage = "Merge cancelled by user.", cancelled = true)
+            }
             if (!appendDecoded || !appendPcmTemp.exists() || appendPcmTemp.length() == 0L) {
                 return Mp4AppendOutcome(false, baseFile, errorMessage = "Failed to decode appended file for transcode fallback.")
             }
@@ -651,7 +765,8 @@ object Mp4Appender {
                 bitrate = safeBitrate,
                 skipPrimingFrame = false
             )
-            encoder.start(rawAacTemp)
+            activeEncoder = encoder
+            encoder.start(rawAacTemp, isCancelled = isCancelled)
 
             val totalPcmBytes = (basePcmTemp.length() + appendPcmTemp.length()).coerceAtLeast(1L)
             var processedBytes = 0L
@@ -660,6 +775,9 @@ object Mp4Appender {
             for (pcmFile in listOf(basePcmTemp, appendPcmTemp)) {
                 FileInputStream(pcmFile).use { fis ->
                     while (true) {
+                        if (isCancelled()) {
+                            throw java.util.concurrent.CancellationException("Transcode cancelled")
+                        }
                         val r = fis.read(buf)
                         if (r <= 0) break
                         encoder.encodePcmBytes(buf, r)
@@ -670,8 +788,16 @@ object Mp4Appender {
                 }
             }
 
+            if (isCancelled()) {
+                throw java.util.concurrent.CancellationException("Transcode cancelled")
+            }
+
             val segment = encoder.finish()
-            val wroteM4a = encoder.writeStandaloneM4aFile(segment, stagingM4a)
+            activeEncoder = null
+            val wroteM4a = encoder.writeStandaloneM4aFile(segment, stagingM4a, isCancelled = isCancelled)
+            if (isCancelled()) {
+                return Mp4AppendOutcome(false, baseFile, usedTranscodeFallback = true, errorMessage = "Merge cancelled by user.", cancelled = true)
+            }
             if (!wroteM4a || !stagingM4a.exists() || stagingM4a.length() <= 32L) {
                 return Mp4AppendOutcome(false, baseFile, errorMessage = "Failed to write transcoded M4A container.")
             }
@@ -689,6 +815,10 @@ object Mp4Appender {
                     usedTranscodeFallback = true,
                     errorMessage = transcodeErr ?: "Transcoded M4A failed integrity verification."
                 )
+            }
+
+            if (isCancelled()) {
+                return Mp4AppendOutcome(false, baseFile, usedTranscodeFallback = true, errorMessage = "Merge cancelled by user.", cancelled = true)
             }
 
             val targetFinalM4a = if (baseFile.extension.equals("m4a", ignoreCase = true)) {
@@ -720,12 +850,23 @@ object Mp4Appender {
                     ?: ((segment.totalEncodedSamples * 1000L) / targetSampleRate.toLong()),
                 usedTranscodeFallback = true
             )
-        } catch (e: Exception) {
+        } catch (e: java.util.concurrent.CancellationException) {
+            activeEncoder?.abortAndCleanup()
             Mp4AppendOutcome(
                 success = false,
                 finalFile = baseFile,
                 usedTranscodeFallback = true,
-                errorMessage = e.localizedMessage
+                errorMessage = "Merge cancelled by user.",
+                cancelled = true
+            )
+        } catch (e: Exception) {
+            activeEncoder?.abortAndCleanup()
+            Mp4AppendOutcome(
+                success = false,
+                finalFile = baseFile,
+                usedTranscodeFallback = true,
+                errorMessage = e.localizedMessage,
+                cancelled = isCancelled()
             )
         } finally {
             basePcmTemp.delete()
@@ -739,7 +880,8 @@ object Mp4Appender {
         wavFile: File,
         outputPcmFile: File,
         targetSampleRate: Int,
-        targetChannels: Int
+        targetChannels: Int,
+        isCancelled: () -> Boolean = { false }
     ): Boolean {
         return try {
             val header = WavFileTools.readWavHeaderInfo(wavFile)
@@ -753,6 +895,9 @@ object Mp4Appender {
                 FileOutputStream(outputPcmFile).use { fos ->
                     val buf = ByteArray(16384)
                     while (true) {
+                        if (isCancelled()) {
+                            return false
+                        }
                         val r = raf.read(buf)
                         if (r <= 0) break
                         val rawChunk = if (r == buf.size) buf else buf.copyOf(r)
@@ -763,7 +908,7 @@ object Mp4Appender {
                     fos.flush()
                 }
             }
-            outputPcmFile.exists() && outputPcmFile.length() > 0L
+            !isCancelled() && outputPcmFile.exists() && outputPcmFile.length() > 0L
         } catch (_: Exception) {
             false
         }
@@ -872,8 +1017,10 @@ object Mp4Appender {
         sourceFile: File,
         meta: Mp4AudioMetadata,
         skipFirstFrames: Int = 0,
-        outRawAacFile: File
+        outRawAacFile: File,
+        isCancelled: () -> Boolean = { false }
     ): IntArray? {
+        if (isCancelled()) return null
         if (!sourceFile.exists() || meta.sampleSizes.isEmpty() || meta.chunkOffsets.isEmpty()) return null
         val fileLen = sourceFile.length()
         val totalSamples = meta.sampleSizes.size
@@ -892,6 +1039,7 @@ object Mp4Appender {
                     val buf = ByteArray(65536)
 
                     for (chunkIdxZero in 0 until totalChunks) {
+                        if (isCancelled()) return null
                         if (sampleIndex >= totalSamples) break
                         val chunkNumberOneBased = chunkIdxZero + 1
                         val activeStsc = sortedStsc.lastOrNull { it.firstChunk <= chunkNumberOneBased }
@@ -905,6 +1053,7 @@ object Mp4Appender {
 
                         val countForChunk = minOf(samplesInThisChunk, totalSamples - sampleIndex)
                         for (s in 0 until countForChunk) {
+                            if (isCancelled()) return null
                             val sz = meta.sampleSizes[sampleIndex]
                             if (sz <= 0 || currentOffset + sz > fileLen) {
                                 sampleIndex = totalSamples // stop at first truncated sample
@@ -931,7 +1080,7 @@ object Mp4Appender {
                     fos.flush()
                 }
             }
-            if (extractedSizes.isEmpty()) null else extractedSizes.toIntArray()
+            if (isCancelled() || extractedSizes.isEmpty()) null else extractedSizes.toIntArray()
         } catch (_: Exception) {
             null
         }
@@ -1206,17 +1355,40 @@ object Mp4Appender {
         return results
     }
 
-    private fun copyRange(rafIn: RandomAccessFile, fosOut: FileOutputStream, startOffset: Long, byteCount: Long) {
+    private fun copyRange(
+        rafIn: RandomAccessFile,
+        fosOut: FileOutputStream,
+        startOffset: Long,
+        byteCount: Long,
+        isCancelled: () -> Boolean = { false }
+    ) {
         if (byteCount <= 0L) return
         rafIn.seek(startOffset)
         val buf = ByteArray(65536)
         var remaining = byteCount
         while (remaining > 0L) {
+            if (isCancelled()) throw java.util.concurrent.CancellationException("Merge cancelled")
             val toRead = minOf(buf.size.toLong(), remaining).toInt()
             val r = rafIn.read(buf, 0, toRead)
             if (r <= 0) break
             fosOut.write(buf, 0, r)
             remaining -= r.toLong()
+        }
+    }
+
+    private fun copyFileStreamWithCancel(
+        srcFile: File,
+        fosOut: FileOutputStream,
+        isCancelled: () -> Boolean = { false }
+    ) {
+        FileInputStream(srcFile).use { fis ->
+            val buf = ByteArray(65536)
+            while (true) {
+                if (isCancelled()) throw java.util.concurrent.CancellationException("Merge cancelled")
+                val r = fis.read(buf)
+                if (r <= 0) break
+                fosOut.write(buf, 0, r)
+            }
         }
     }
 

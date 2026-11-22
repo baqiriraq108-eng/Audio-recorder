@@ -126,6 +126,77 @@ class RecorderViewModel(application: Application) : AndroidViewModel(application
     private val _mergeProgress = MutableStateFlow<Int?>(null)
     val mergeProgress: StateFlow<Int?> = _mergeProgress.asStateFlow()
 
+    // True while an active merge is rolling back with reverse progress animation (current% -> 0%)
+    private val _isMergeCancelling = MutableStateFlow(false)
+    val isMergeCancelling: StateFlow<Boolean> = _isMergeCancelling.asStateFlow()
+
+    // Storage tab (LOCAL or CLOUD) where the active merge/repair operation is occurring
+    private val _mergeTargetStorage = MutableStateFlow<StorageDestination?>(null)
+    val mergeTargetStorage: StateFlow<StorageDestination?> = _mergeTargetStorage.asStateFlow()
+
+    private val activeMergeCancelled = java.util.concurrent.atomic.AtomicBoolean(false)
+    private var activeMergeJob: Job? = null
+    private var activeRollbackJob: Job? = null
+
+    private fun resolveMergeStorageDestination(storageLocationId: String?): StorageDestination {
+        return if (storageLocationId.equals(StorageDestination.CLOUD.id, ignoreCase = true)) {
+            StorageDestination.CLOUD
+        } else {
+            StorageDestination.LOCAL
+        }
+    }
+
+    /**
+     * Aborts any active background audio merge immediately with strict atomic rollback:
+     * 1. Signals cancellation so the background pipeline halts and deletes all temporary staging files
+     *    without ever modifying the original base recording.
+     * 2. Smoothly animates the merging progress indicator backward from its current percentage down to 0%
+     *    before clearing the UI state.
+     */
+    fun cancelActiveMerge() {
+        val currentProgress = _mergeProgress.value ?: return
+        if (_isMergeCancelling.value) return
+        activeMergeCancelled.set(true)
+        _isMergeCancelling.value = true
+        activeRollbackJob?.cancel()
+        activeRollbackJob = viewModelScope.launch {
+            try {
+                val startPct = currentProgress.coerceIn(0, 100)
+                if (startPct > 0) {
+                    val totalDurationMs = (startPct * 12L).coerceIn(320L, 850L)
+                    val stepDelayMs = (totalDurationMs / startPct.toLong()).coerceAtLeast(8L)
+                    for (pct in startPct downTo 0) {
+                        _mergeProgress.value = pct
+                        if (pct > 0) {
+                            kotlinx.coroutines.delay(stepDelayMs)
+                        }
+                    }
+                } else {
+                    _mergeProgress.value = 0
+                    kotlinx.coroutines.delay(220L)
+                }
+                withTimeoutOrNull(4_000L) {
+                    activeMergeJob?.join()
+                }
+                kotlinx.coroutines.delay(90L)
+            } finally {
+                _mergeProgress.value = null
+                _mergeTargetStorage.value = null
+                _isMergeCancelling.value = false
+                activeMergeCancelled.set(false)
+            }
+        }
+    }
+
+    internal fun setMergeProgressForTest(progress: Int?, targetStorage: StorageDestination? = StorageDestination.LOCAL) {
+        _mergeTargetStorage.value = if (progress != null) targetStorage else null
+        _mergeProgress.value = progress
+        if (progress == null) {
+            _isMergeCancelling.value = false
+            activeMergeCancelled.set(false)
+        }
+    }
+
     // Confirmation popup when pressing Save while appending to an existing recording
     private val _showAppendSaveConfirmDialog = MutableStateFlow(false)
     val showAppendSaveConfirmDialog: StateFlow<Boolean> = _showAppendSaveConfirmDialog.asStateFlow()
@@ -766,8 +837,13 @@ class RecorderViewModel(application: Application) : AndroidViewModel(application
                 _recordingStatus.value = RecordingStatus.READY
                 isStopSavingInProgress.set(false)
 
-                viewModelScope.launch(Dispatchers.IO + NonCancellable) {
+                val appendTargetStorage = resolveMergeStorageDestination(appendTargetItem.storageLocation)
+                activeRollbackJob?.cancel()
+                activeMergeCancelled.set(false)
+                _isMergeCancelling.value = false
+                activeMergeJob = viewModelScope.launch(Dispatchers.IO + NonCancellable) {
                     try {
+                        _mergeTargetStorage.value = appendTargetStorage
                         _mergeProgress.value = 0
                         val origFile = repository.resolveAudioFile(appendTargetItem)
                             ?: File(appendTargetItem.filePath)
@@ -785,14 +861,34 @@ class RecorderViewModel(application: Application) : AndroidViewModel(application
                             bitsPerSample = appendTargetItem.bitDepth,
                             targetBitrate = safeTargetBitrate,
                             onProgress = { ratio ->
-                                _mergeProgress.value = (ratio * 100).toInt().coerceIn(0, 100)
-                            }
+                                if (!activeMergeCancelled.get()) {
+                                    _mergeProgress.value = (ratio * 100).toInt().coerceIn(0, 100)
+                                }
+                            },
+                            isCancelled = { activeMergeCancelled.get() }
                         )
 
-                        if (appendResult != null && appendResult.success &&
+                        if (activeMergeCancelled.get() || appendResult.cancelled) {
+                            stopForegroundServiceNotification()
+                            audioEngine.resetSessionDisplayState()
+                            saveCancelledSegmentSeparately(
+                                segmentFile = sessionFile,
+                                baseTitle = appendTargetItem.title,
+                                durationMs = finalDuration,
+                                sampleRate = effSampleRate,
+                                channels = effChannels,
+                                bitDepth = effBitDepth,
+                                targetStorage = appendTargetStorage
+                            )
+                            return@launch
+                        }
+
+                        if (appendResult.success &&
                             appendResult.finalFile.exists() && appendResult.finalFile.length() > 32L
                         ) {
-                            _mergeProgress.value = 100
+                            if (!activeMergeCancelled.get()) {
+                                _mergeProgress.value = 100
+                            }
                             val mergedFile = appendResult.finalFile
                             val isMergedM4a = appendResult.format.equals("M4A", ignoreCase = true) ||
                                 mergedFile.extension.equals("m4a", ignoreCase = true)
@@ -973,16 +1069,32 @@ class RecorderViewModel(application: Application) : AndroidViewModel(application
                         }
                     } catch (e: Exception) {
                         stopForegroundServiceNotification()
-                        saveOrphanedSegmentAsRecoveryRecording(
-                            segmentFile = sessionFile,
-                            baseTitle = cleanTitle,
-                            durationMs = finalDuration,
-                            sampleRate = effSampleRate,
-                            channels = effChannels,
-                            bitDepth = effBitDepth
-                        )
+                        if (activeMergeCancelled.get()) {
+                            audioEngine.resetSessionDisplayState()
+                            saveCancelledSegmentSeparately(
+                                segmentFile = sessionFile,
+                                baseTitle = appendTargetItem.title,
+                                durationMs = finalDuration,
+                                sampleRate = effSampleRate,
+                                channels = effChannels,
+                                bitDepth = effBitDepth,
+                                targetStorage = appendTargetStorage
+                            )
+                        } else {
+                            saveOrphanedSegmentAsRecoveryRecording(
+                                segmentFile = sessionFile,
+                                baseTitle = cleanTitle,
+                                durationMs = finalDuration,
+                                sampleRate = effSampleRate,
+                                channels = effChannels,
+                                bitDepth = effBitDepth
+                            )
+                        }
                     } finally {
-                        _mergeProgress.value = null
+                        if (!activeMergeCancelled.get() && !_isMergeCancelling.value) {
+                            _mergeProgress.value = null
+                            _mergeTargetStorage.value = null
+                        }
                     }
                 }
             } else {
@@ -1836,9 +1948,11 @@ class RecorderViewModel(application: Application) : AndroidViewModel(application
         val dateStamp = SimpleDateFormat("MMM d, HH:mm", Locale.US).format(Date())
         val cleanTitle = customTitle.trim().ifBlank { "Merged Audio — $dateStamp" }
 
-        viewModelScope.launch(Dispatchers.IO + NonCancellable) {
+        activeRollbackJob?.cancel()
+        activeMergeCancelled.set(false)
+        _isMergeCancelling.value = false
+        activeMergeJob = viewModelScope.launch(Dispatchers.IO + NonCancellable) {
             try {
-                _mergeProgress.value = 0
                 val recordingsMap = allRecordings.value.associateBy { it.id }
                 // Strictly preserve exact chronological user selection order (do not sort by date or title)
                 val orderedItems = orderedIds.mapNotNull { id ->
@@ -1848,6 +1962,15 @@ class RecorderViewModel(application: Application) : AndroidViewModel(application
                     postSnackbar("Unable to locate selected recordings")
                     return@launch
                 }
+                _mergeTargetStorage.value = if (orderedItems.all {
+                        it.storageLocation.equals(StorageDestination.CLOUD.id, ignoreCase = true)
+                    }
+                ) {
+                    StorageDestination.CLOUD
+                } else {
+                    StorageDestination.LOCAL
+                }
+                _mergeProgress.value = 0
                 val firstItem = orderedItems.first()
                 val firstSourceFile = File(firstItem.filePath)
                 val isM4aMerge = (!WavFileTools.isRiffWaveFile(firstSourceFile) && (
@@ -1901,12 +2024,21 @@ class RecorderViewModel(application: Application) : AndroidViewModel(application
                     bitsPerSample = effBitDepth,
                     targetBitrate = effBitrateKbps * 1000,
                     onProgress = { ratio ->
-                        _mergeProgress.value = (ratio * 85f).toInt().coerceIn(0, 85)
+                        if (!activeMergeCancelled.get()) {
+                            _mergeProgress.value = (ratio * 85f).toInt().coerceIn(0, 85)
+                        }
                     }
                 )
 
+                if (activeMergeCancelled.get()) {
+                    if (mergedFile.exists()) mergedFile.delete()
+                    if (mergeResult.finalFile.exists()) mergeResult.finalFile.delete()
+                    postSnackbar("Merge cancelled — original recordings kept untouched")
+                    return@launch
+                }
+
                 if (mergeResult.success && mergeResult.finalFile.exists()) {
-                    _mergeProgress.value = 88
+                    if (!activeMergeCancelled.get()) _mergeProgress.value = 88
                     val finalFile = mergeResult.finalFile
                     val finalM4aMeta = if (mergeResult.format.equals("M4A", ignoreCase = true) ||
                         finalFile.extension.equals("m4a", ignoreCase = true)
@@ -1937,6 +2069,11 @@ class RecorderViewModel(application: Application) : AndroidViewModel(application
                     }
 
                     val mergedPeaks = WavFileTools.extractWaveformFromFile(finalFile)
+                    if (activeMergeCancelled.get()) {
+                        if (finalFile.exists()) finalFile.delete()
+                        postSnackbar("Merge cancelled — original recordings kept untouched")
+                        return@launch
+                    }
                     _mergeProgress.value = 94
                     val mergedSilenceMap = WavFileTools.generateSilenceMapIndex(
                         sourceFile = finalFile,
@@ -1959,6 +2096,11 @@ class RecorderViewModel(application: Application) : AndroidViewModel(application
                         runningOffsetMs += item.durationMs
                     }
 
+                    if (activeMergeCancelled.get()) {
+                        if (finalFile.exists()) finalFile.delete()
+                        postSnackbar("Merge cancelled — original recordings kept untouched")
+                        return@launch
+                    }
                     _mergeProgress.value = 100
                     // Register exclusively into Local category
                     val mergedEntity = RecordingEntity(
@@ -1989,9 +2131,16 @@ class RecorderViewModel(application: Application) : AndroidViewModel(application
                     postSnackbar("Unable to merge selected recordings")
                 }
             } catch (e: Exception) {
-                postSnackbar("Merge failed: ${e.localizedMessage ?: "Unknown error"}")
+                if (activeMergeCancelled.get()) {
+                    postSnackbar("Merge cancelled — original recordings kept untouched")
+                } else {
+                    postSnackbar("Merge failed: ${e.localizedMessage ?: "Unknown error"}")
+                }
             } finally {
-                _mergeProgress.value = null
+                if (!activeMergeCancelled.get() && !_isMergeCancelling.value) {
+                    _mergeProgress.value = null
+                    _mergeTargetStorage.value = null
+                }
             }
         }
     }
@@ -3157,8 +3306,13 @@ class RecorderViewModel(application: Application) : AndroidViewModel(application
         if (_openedPlayerRecording.value?.id == recording.id && audioEngine.isPlaying.value) {
             audioEngine.stopPlayback()
         }
-        viewModelScope.launch(Dispatchers.IO + NonCancellable) {
+        val repairTargetStorage = resolveMergeStorageDestination(recording.storageLocation)
+        activeRollbackJob?.cancel()
+        activeMergeCancelled.set(false)
+        _isMergeCancelling.value = false
+        activeMergeJob = viewModelScope.launch(Dispatchers.IO + NonCancellable) {
             try {
+                _mergeTargetStorage.value = repairTargetStorage
                 _mergeProgress.value = 5
                 val sourceFile = repository.resolveAudioFile(recording) ?: File(recording.filePath)
                 val repairResult = WavFileTools.repairAndRebuildCorruptedRecording(
@@ -3167,9 +3321,15 @@ class RecorderViewModel(application: Application) : AndroidViewModel(application
                     fallbackChannels = recording.channels,
                     fallbackBitsPerSample = recording.bitDepth,
                     onProgress = { ratio ->
-                        _mergeProgress.value = (ratio * 100).toInt().coerceIn(5, 95)
+                        if (!activeMergeCancelled.get()) {
+                            _mergeProgress.value = (ratio * 100).toInt().coerceIn(5, 95)
+                        }
                     }
                 )
+                if (activeMergeCancelled.get()) {
+                    postSnackbar("Repair cancelled")
+                    return@launch
+                }
                 if (repairResult.success && repairResult.finalFile.exists()) {
                     val repairedFile = repairResult.finalFile
                     val repairedDurationMs = if (repairResult.durationMs > 0L) {
@@ -3199,7 +3359,9 @@ class RecorderViewModel(application: Application) : AndroidViewModel(application
                     if (_openedPlayerRecording.value?.id == updatedEntity.id) {
                         _openedPlayerRecording.value = updatedEntity
                     }
-                    _mergeProgress.value = 100
+                    if (!activeMergeCancelled.get()) {
+                        _mergeProgress.value = 100
+                    }
                     postSnackbar(
                         "Recording \"${recording.title}\" repaired (${AudioFormatUtils.formatDurationCompact(repairedDurationMs)})"
                     )
@@ -3209,8 +3371,76 @@ class RecorderViewModel(application: Application) : AndroidViewModel(application
             } catch (e: Exception) {
                 postSnackbar("Repair failed: ${e.localizedMessage ?: "Unexpected error"}")
             } finally {
-                _mergeProgress.value = null
+                if (!activeMergeCancelled.get() && !_isMergeCancelling.value) {
+                    _mergeProgress.value = null
+                    _mergeTargetStorage.value = null
+                }
             }
+        }
+    }
+
+    /**
+     * Safely saves the newly recorded Continue Recording segment as a standalone file when the user
+     * cancels an active merge, ensuring zero audio loss while keeping the original base recording untouched.
+     */
+    private suspend fun saveCancelledSegmentSeparately(
+        segmentFile: File,
+        baseTitle: String,
+        durationMs: Long,
+        sampleRate: Int,
+        channels: Int,
+        bitDepth: Int,
+        targetStorage: StorageDestination
+    ) {
+        if (!segmentFile.exists() || segmentFile.length() == 0L) {
+            postSnackbar("Merge cancelled — original recording kept untouched")
+            return
+        }
+        try {
+            val targetDir = repository.getRecordingsDir(
+                subFolderName = _settings.value.localFolderName,
+                folderPath = _settings.value.localFolderPath
+            )
+            targetDir.mkdirs()
+            val ext = segmentFile.extension.ifBlank { "wav" }.lowercase(Locale.US)
+            val partTitle = "$baseTitle (Part 2)"
+            val destFile = repository.resolveUniqueLocalFile(targetDir, partTitle, ext)
+            if (!segmentFile.renameTo(destFile)) {
+                segmentFile.copyTo(destFile, overwrite = true)
+                segmentFile.delete()
+            }
+            val finalSavedFile = if (destFile.exists()) destFile else segmentFile
+            val peaks = WavFileTools.extractWaveformFromFile(finalSavedFile)
+            val silenceMap = WavFileTools.generateSilenceMapIndex(
+                sourceFile = finalSavedFile,
+                durationMs = durationMs,
+                peaks = peaks,
+                config = _settings.value.silenceConfig,
+                fallbackSampleRate = sampleRate,
+                fallbackChannels = channels,
+                fallbackBitsPerSample = bitDepth
+            )
+            val entity = RecordingEntity(
+                title = partTitle,
+                filePath = finalSavedFile.absolutePath,
+                durationMs = durationMs.coerceAtLeast(1000L),
+                format = ext.uppercase(Locale.US),
+                sampleRate = sampleRate,
+                bitDepth = bitDepth,
+                channels = channels,
+                bitrate = 128_000,
+                sizeBytes = finalSavedFile.length(),
+                waveformPeaks = AudioFormatUtils.serializePeaks(peaks),
+                silenceMap = AudioFormatUtils.serializeSilenceMap(silenceMap),
+                storageLocation = targetStorage.id,
+                isCloudSynced = false,
+                tags = "Saved Separately",
+                notes = "Saved separately when merge was cancelled"
+            )
+            repository.insertRecording(entity)
+            postSnackbar("Merge cancelled — original kept untouched, new clip saved as \"$partTitle\"")
+        } catch (_: Exception) {
+            postSnackbar("Merge cancelled — original recording kept untouched")
         }
     }
 

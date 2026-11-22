@@ -35,7 +35,8 @@ data class AppendResult(
     val finalFile: File,
     val format: String = "WAV",
     val mimeType: String = "audio/wav",
-    val durationMs: Long = 0L
+    val durationMs: Long = 0L,
+    val cancelled: Boolean = false
 )
 
 object WavFileTools {
@@ -521,8 +522,10 @@ object WavFileTools {
         outputPcmFile: File,
         targetSampleRate: Int = 44100,
         targetChannels: Int = 1,
-        onProgress: ((Float) -> Unit)? = null
+        onProgress: ((Float) -> Unit)? = null,
+        isCancelled: () -> Boolean = { false }
     ): Boolean {
+        if (isCancelled()) return false
         if (!sourceFile.exists() || sourceFile.length() < 16L) return false
         if (isRiffWaveFile(sourceFile)) {
             return try {
@@ -547,6 +550,9 @@ object WavFileTools {
                         var remaining = rawPcmBytes
                         var processed = 0L
                         while (remaining > 0L) {
+                            if (isCancelled()) {
+                                break
+                            }
                             val toRead = minOf(buf.size.toLong(), remaining).toInt()
                             val r = raf.read(buf, 0, toRead)
                             if (r <= 0) break
@@ -565,6 +571,10 @@ object WavFileTools {
                         fos.flush()
                     }
                 }
+                if (isCancelled()) {
+                    if (outputPcmFile.exists()) outputPcmFile.delete()
+                    return false
+                }
                 outputPcmFile.exists() && outputPcmFile.length() > 0L
             } catch (_: Exception) {
                 false
@@ -573,6 +583,7 @@ object WavFileTools {
         var extractor: MediaExtractor? = null
         var codec: MediaCodec? = null
         return try {
+            if (isCancelled()) return false
             extractor = MediaExtractor()
             FileInputStream(sourceFile).use { fis ->
                 extractor.setDataSource(fis.fd)
@@ -603,9 +614,11 @@ object WavFileTools {
 
             val bufferInfo = MediaCodec.BufferInfo()
             var sawInputEOS = false
+            var extractorExhausted = false
             var sawOutputEOS = false
-            val timeoutUs = 5000L
-            var consecutiveTryAgainCount = 0
+            var noProgressIterations = 0
+            var lastProgressWallMs = System.currentTimeMillis()
+            val maxStallWallMs = 8_000L
 
             var srcChannels = if (audioFormat.containsKey(MediaFormat.KEY_CHANNEL_COUNT)) {
                 audioFormat.getInteger(MediaFormat.KEY_CHANNEL_COUNT)
@@ -623,46 +636,69 @@ object WavFileTools {
 
             FileOutputStream(outputPcmFile).use { fos ->
                 while (!sawOutputEOS) {
+                    if (isCancelled()) {
+                        break
+                    }
+                    var madeProgressThisIter = false
+
                     if (!sawInputEOS) {
-                        val inputBufIndex = codec.dequeueInputBuffer(10_000L)
+                        val inputBufIndex = codec.dequeueInputBuffer(5_000L)
                         if (inputBufIndex >= 0) {
-                            val inputBuf = codec.getInputBuffer(inputBufIndex)
-                            if (inputBuf != null) {
-                                inputBuf.clear()
-                                val sampleSize = extractor.readSampleData(inputBuf, 0)
-                                if (sampleSize < 0) {
-                                    sawInputEOS = true
-                                    codec.queueInputBuffer(
-                                        inputBufIndex,
-                                        0,
-                                        0,
-                                        0L,
-                                        MediaCodec.BUFFER_FLAG_END_OF_STREAM
-                                    )
-                                } else {
-                                    val presentationTimeUs = extractor.sampleTime.coerceAtLeast(0L)
-                                    codec.queueInputBuffer(
-                                        inputBufIndex,
-                                        0,
-                                        sampleSize,
-                                        presentationTimeUs,
-                                        0
-                                    )
-                                    extractor.advance()
+                            if (extractorExhausted) {
+                                sawInputEOS = true
+                                codec.queueInputBuffer(
+                                    inputBufIndex,
+                                    0,
+                                    0,
+                                    0L,
+                                    MediaCodec.BUFFER_FLAG_END_OF_STREAM
+                                )
+                                madeProgressThisIter = true
+                            } else {
+                                val inputBuf = codec.getInputBuffer(inputBufIndex)
+                                if (inputBuf != null) {
+                                    inputBuf.clear()
+                                    val sampleSize = extractor.readSampleData(inputBuf, 0)
+                                    if (sampleSize < 0) {
+                                        sawInputEOS = true
+                                        codec.queueInputBuffer(
+                                            inputBufIndex,
+                                            0,
+                                            0,
+                                            0L,
+                                            MediaCodec.BUFFER_FLAG_END_OF_STREAM
+                                        )
+                                        madeProgressThisIter = true
+                                    } else {
+                                        val presentationTimeUs = extractor.sampleTime.coerceAtLeast(0L)
+                                        val hasMoreSamples = extractor.advance()
+                                        if (!hasMoreSamples) {
+                                            extractorExhausted = true
+                                        }
+                                        codec.queueInputBuffer(
+                                            inputBufIndex,
+                                            0,
+                                            sampleSize,
+                                            presentationTimeUs,
+                                            0
+                                        )
+                                        madeProgressThisIter = true
+                                    }
                                 }
                             }
                         }
                     }
 
-                    val outputBufIndex = codec.dequeueOutputBuffer(bufferInfo, 10_000L)
+                    val outputBufIndex = codec.dequeueOutputBuffer(bufferInfo, 5_000L)
                     if (outputBufIndex >= 0) {
-                        consecutiveTryAgainCount = 0
                         if ((bufferInfo.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0) {
                             sawOutputEOS = true
+                            madeProgressThisIter = true
                         }
                         val isCodecCfg = (bufferInfo.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0
                         val outBuf = codec.getOutputBuffer(outputBufIndex)
                         if (!isCodecCfg && outBuf != null && bufferInfo.size > 0) {
+                            madeProgressThisIter = true
                             outBuf.position(bufferInfo.offset)
                             outBuf.limit(bufferInfo.offset + bufferInfo.size)
                             val chunk = ByteArray(bufferInfo.size)
@@ -691,7 +727,7 @@ object WavFileTools {
                         }
                         codec.releaseOutputBuffer(outputBufIndex, false)
                     } else if (outputBufIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
-                        consecutiveTryAgainCount = 0
+                        madeProgressThisIter = true
                         val newFormat = codec.outputFormat
                         if (newFormat.containsKey(MediaFormat.KEY_CHANNEL_COUNT)) {
                             srcChannels = newFormat.getInteger(MediaFormat.KEY_CHANNEL_COUNT)
@@ -703,19 +739,38 @@ object WavFileTools {
                                 resampler = PcmResampler(srcSampleRate, targetSampleRate, targetChannels)
                             }
                         }
+                    } else if (outputBufIndex == MediaCodec.INFO_OUTPUT_BUFFERS_CHANGED) {
+                        // Deprecated status on newer APIs; continue draining without counting as stall
+                        noProgressIterations++
                     } else if (outputBufIndex == MediaCodec.INFO_TRY_AGAIN_LATER) {
-                        consecutiveTryAgainCount++
-                        if (sawInputEOS && consecutiveTryAgainCount > 60) {
+                        noProgressIterations++
+                    }
+
+                    if (madeProgressThisIter) {
+                        noProgressIterations = 0
+                        lastProgressWallMs = System.currentTimeMillis()
+                    } else {
+                        noProgressIterations++
+                        val stalledMs = System.currentTimeMillis() - lastProgressWallMs
+                        if (stalledMs > maxStallWallMs) {
                             break
-                        } else if (!sawInputEOS && consecutiveTryAgainCount > 250) {
+                        }
+                        if (sawInputEOS && noProgressIterations > 80) {
+                            break
+                        } else if (!sawInputEOS && noProgressIterations > 250) {
                             break
                         }
                     }
                 }
                 fos.flush()
             }
+            if (isCancelled()) {
+                if (outputPcmFile.exists()) outputPcmFile.delete()
+                return false
+            }
             outputPcmFile.exists() && outputPcmFile.length() > 0L
         } catch (_: Exception) {
+            if (isCancelled() && outputPcmFile.exists()) outputPcmFile.delete()
             false
         } finally {
             try { codec?.stop() } catch (_: Exception) {}
@@ -733,8 +788,10 @@ object WavFileTools {
         targetSampleRate: Int = 44100,
         targetChannels: Int = 1,
         bitsPerSample: Int = 16,
-        onProgress: ((Float) -> Unit)? = null
+        onProgress: ((Float) -> Unit)? = null,
+        isCancelled: () -> Boolean = { false }
     ): Boolean {
+        if (isCancelled()) return false
         val parent = outputWavFile.parentFile ?: sourceFile.parentFile ?: return false
         val tempPcmFile = File(parent, "${outputWavFile.name}.pcm.tmp")
         try {
@@ -743,10 +800,12 @@ object WavFileTools {
                 outputPcmFile = tempPcmFile,
                 targetSampleRate = targetSampleRate,
                 targetChannels = targetChannels,
-                onProgress = onProgress
+                onProgress = onProgress,
+                isCancelled = isCancelled
             )
-            if (!decoded || !tempPcmFile.exists() || tempPcmFile.length() == 0L) {
+            if (isCancelled() || !decoded || !tempPcmFile.exists() || tempPcmFile.length() == 0L) {
                 tempPcmFile.delete()
+                if (outputWavFile.exists() && isCancelled()) outputWavFile.delete()
                 return false
             }
             val pcmBytes = tempPcmFile.length()
@@ -762,15 +821,23 @@ object WavFileTools {
                     val buf = ByteArray(65536)
                     var read: Int
                     while (fis.read(buf).also { read = it } != -1) {
+                        if (isCancelled()) {
+                            break
+                        }
                         fos.write(buf, 0, read)
                     }
                     fos.flush()
                 }
             }
             tempPcmFile.delete()
+            if (isCancelled()) {
+                if (outputWavFile.exists()) outputWavFile.delete()
+                return false
+            }
             return outputWavFile.exists() && outputWavFile.length() > 44L
         } catch (_: Exception) {
             tempPcmFile.delete()
+            if (isCancelled() && outputWavFile.exists()) outputWavFile.delete()
             return false
         }
     }
@@ -878,30 +945,37 @@ object WavFileTools {
         originalFile: File,
         appendedPcmFile: File,
         sampleRate: Int,
-        channels: Int,
+        channels: Int = 1,
         bitsPerSample: Int = 16,
         targetBitrate: Int = 128_000,
-        onProgress: ((Float) -> Unit)? = null
+        onProgress: ((Float) -> Unit)? = null,
+        isCancelled: () -> Boolean = { false }
     ): AppendResult {
+        if (isCancelled()) {
+            return AppendResult(success = false, finalFile = originalFile, cancelled = true)
+        }
         if (!originalFile.exists() || !appendedPcmFile.exists()) {
             return AppendResult(success = false, finalFile = originalFile)
         }
 
         onProgress?.invoke(0.05f)
-        val repairedOriginal = repairCorruptedAudioFileIfNeeded(originalFile)
+        // Strict Atomic Rollback guarantee: NEVER open or modify originalFile in-place before atomic commit.
+        // Read originalFile strictly read-only into isolated staging files.
+        val readOnlyOriginal = originalFile
 
         // Direct Native M4A/MP4 Append Path (never falls back to WAV conversion)
-        val isOriginalM4a = !isRiffWaveFile(repairedOriginal) && (
-            Mp4BoxParser.isMp4File(repairedOriginal) ||
-                repairedOriginal.extension.equals("m4a", ignoreCase = true) ||
-                repairedOriginal.extension.equals("mp4", ignoreCase = true)
+        val isOriginalM4a = !isRiffWaveFile(readOnlyOriginal) && (
+            Mp4BoxParser.isMp4File(readOnlyOriginal) ||
+                readOnlyOriginal.extension.equals("m4a", ignoreCase = true) ||
+                readOnlyOriginal.extension.equals("mp4", ignoreCase = true)
             )
         if (isOriginalM4a) {
             val m4aOutcome = Mp4Appender.appendAudioToM4aUniversal(
-                baseM4aFile = repairedOriginal,
+                baseM4aFile = readOnlyOriginal,
                 appendedFile = appendedPcmFile,
                 targetBitrate = targetBitrate,
-                onProgress = onProgress
+                onProgress = onProgress,
+                isCancelled = isCancelled
             )
             return if (m4aOutcome.success) {
                 AppendResult(
@@ -914,28 +988,30 @@ object WavFileTools {
             } else {
                 AppendResult(
                     success = false,
-                    finalFile = repairedOriginal,
+                    finalFile = readOnlyOriginal,
                     format = "M4A",
-                    mimeType = "audio/mp4"
+                    mimeType = "audio/mp4",
+                    cancelled = m4aOutcome.cancelled || isCancelled()
                 )
             }
         }
 
         // Native WAV-to-WAV Merge Path (for RIFF WAVE recordings)
         // Non-M4A/non-WAV imported formats (e.g. MP3, FLAC, OGG, OPUS, AAC) are transcoded and merged into M4A
-        if (!isRiffWaveFile(repairedOriginal)) {
+        if (!isRiffWaveFile(readOnlyOriginal)) {
             val safeRate = sampleRate.coerceIn(8000, 48000).let { r ->
                 if (r in setOf(8000, 11025, 12000, 16000, 22050, 24000, 32000, 44100, 48000)) r else 44100
             }
             val safeCh = channels.coerceIn(1, 2)
             val safeBr = AacEncoder.clampBitrateForAacLc(targetBitrate, safeRate, safeCh)
             val transcodeOutcome = Mp4Appender.transcodeAndAppendFallback(
-                baseFile = repairedOriginal,
+                baseFile = readOnlyOriginal,
                 appendedFile = appendedPcmFile,
                 targetSampleRate = safeRate,
                 targetChannels = safeCh,
                 targetBitrate = safeBr,
-                onProgress = onProgress
+                onProgress = onProgress,
+                isCancelled = isCancelled
             )
             return if (transcodeOutcome.success) {
                 AppendResult(
@@ -948,15 +1024,16 @@ object WavFileTools {
             } else {
                 AppendResult(
                     success = false,
-                    finalFile = repairedOriginal,
-                    format = repairedOriginal.extension.uppercase().ifBlank { "M4A" },
-                    mimeType = "audio/mp4"
+                    finalFile = readOnlyOriginal,
+                    format = readOnlyOriginal.extension.uppercase().ifBlank { "M4A" },
+                    mimeType = "audio/mp4",
+                    cancelled = transcodeOutcome.cancelled || isCancelled()
                 )
             }
         }
 
-        val origHeader = readWavHeaderInfo(repairedOriginal, sampleRate, channels, bitsPerSample)
-        val parentDir = repairedOriginal.parentFile ?: appendedPcmFile.parentFile ?: return AppendResult(false, repairedOriginal)
+        val origHeader = readWavHeaderInfo(readOnlyOriginal, sampleRate, channels, bitsPerSample)
+        val parentDir = readOnlyOriginal.parentFile ?: appendedPcmFile.parentFile ?: return AppendResult(false, readOnlyOriginal)
         val stamp = System.nanoTime()
 
         val effectiveRate = origHeader.sampleRate.coerceIn(8000, 192000)
@@ -974,11 +1051,12 @@ object WavFileTools {
                 outputWavFile = tempWav,
                 targetSampleRate = effectiveRate,
                 targetChannels = effectiveChannels,
-                bitsPerSample = effectiveBits
+                bitsPerSample = effectiveBits,
+                isCancelled = isCancelled
             )
-            if (!ok || !tempWav.exists()) {
+            if (isCancelled() || !ok || !tempWav.exists()) {
                 tempWav.delete()
-                return AppendResult(success = false, finalFile = repairedOriginal)
+                return AppendResult(success = false, finalFile = readOnlyOriginal, cancelled = isCancelled())
             }
             decodedAppendTempWav = tempWav
             tempWav
@@ -995,7 +1073,7 @@ object WavFileTools {
         return try {
             onProgress?.invoke(0.15f)
 
-            val (basePcmOffset, rawOrigPcmBytes) = locatePcmDataChunkBounds(repairedOriginal, blockAlign)
+            val (basePcmOffset, rawOrigPcmBytes) = locatePcmDataChunkBounds(readOnlyOriginal, blockAlign)
             val (appendPcmOffset, rawAppendPcmBytes) = locatePcmDataChunkBounds(sourceAppendWavFile, appendBlockAlign)
 
             val origPcmBytes = rawOrigPcmBytes.coerceAtLeast(0L)
@@ -1015,10 +1093,13 @@ object WavFileTools {
 
                 val origBuffer = ByteArray(65536 - (65536 % blockAlign))
                 if (origPcmBytes > 0L) {
-                    RandomAccessFile(repairedOriginal, "r").use { rafIn ->
+                    RandomAccessFile(readOnlyOriginal, "r").use { rafIn ->
                         rafIn.seek(basePcmOffset)
                         var remaining = origPcmBytes
                         while (remaining > 0L) {
+                            if (isCancelled()) {
+                                throw java.util.concurrent.CancellationException("WAV merge cancelled")
+                            }
                             val toRead = minOf(origBuffer.size.toLong(), remaining).toInt()
                             val read = rafIn.read(origBuffer, 0, toRead)
                             if (read <= 0) break
@@ -1044,6 +1125,9 @@ object WavFileTools {
                         rafIn.seek(appendPcmOffset)
                         var remaining = appendPcmBytes
                         while (remaining > 0L) {
+                            if (isCancelled()) {
+                                throw java.util.concurrent.CancellationException("WAV merge cancelled")
+                            }
                             val toRead = minOf(appendBuffer.size.toLong(), remaining).toInt()
                             val read = rafIn.read(appendBuffer, 0, toRead)
                             if (read <= 0) break
@@ -1077,45 +1161,57 @@ object WavFileTools {
                 out.flush()
             }
 
+            if (isCancelled()) {
+                decodedAppendTempWav?.delete()
+                stagingFile.delete()
+                return AppendResult(success = false, finalFile = readOnlyOriginal, cancelled = true)
+            }
+
             // Update staging WAV header so RIFF and data chunk sizes match exact writtenPcmBytes
             updateWavHeader(stagingFile, effectiveRate, effectiveChannels, effectiveBits)
             decodedAppendTempWav?.delete()
 
             onProgress?.invoke(0.92f)
 
+            // Final atomic gate before swapping: never touch readOnlyOriginal if cancelled
+            if (isCancelled()) {
+                stagingFile.delete()
+                return AppendResult(success = false, finalFile = readOnlyOriginal, cancelled = true)
+            }
+
             if (stagingFile.exists() && stagingFile.length() > 44L && writtenPcmBytes > 0L && isRiffWaveFile(stagingFile)) {
                 val backupFile = File(parentDir, ".wav_swap_$stamp.bak")
                 if (backupFile.exists()) backupFile.delete()
 
                 var replaced = false
-                if (repairedOriginal.exists()) {
-                    if (repairedOriginal.renameTo(backupFile)) {
-                        if (stagingFile.renameTo(repairedOriginal)) {
+                if (readOnlyOriginal.exists()) {
+                    if (readOnlyOriginal.renameTo(backupFile)) {
+                        if (stagingFile.renameTo(readOnlyOriginal)) {
                             backupFile.delete()
                             replaced = true
                         } else {
                             try {
-                                stagingFile.copyTo(repairedOriginal, overwrite = true)
+                                stagingFile.copyTo(readOnlyOriginal, overwrite = true)
                                 stagingFile.delete()
                                 backupFile.delete()
                                 replaced = true
                             } catch (_: Exception) {
-                                backupFile.renameTo(repairedOriginal)
+                                backupFile.renameTo(readOnlyOriginal)
                             }
                         }
                     } else {
                         try {
-                            stagingFile.copyTo(repairedOriginal, overwrite = true)
+                            stagingFile.copyTo(readOnlyOriginal, overwrite = true)
                             stagingFile.delete()
                             replaced = true
                         } catch (_: Exception) {}
                     }
                 } else {
-                    if (stagingFile.renameTo(repairedOriginal)) {
+                    if (stagingFile.renameTo(readOnlyOriginal)) {
                         replaced = true
                     } else {
                         try {
-                            stagingFile.copyTo(repairedOriginal, overwrite = true)
+                            stagingFile.copyTo(readOnlyOriginal, overwrite = true)
                             stagingFile.delete()
                             replaced = true
                         } catch (_: Exception) {}
@@ -1127,28 +1223,32 @@ object WavFileTools {
                     try { appendedPcmFile.delete() } catch (_: Exception) {}
 
                     onProgress?.invoke(1.0f)
-                    val updatedHeader = readWavHeaderInfo(repairedOriginal, effectiveRate, effectiveChannels, effectiveBits)
+                    val updatedHeader = readWavHeaderInfo(readOnlyOriginal, effectiveRate, effectiveChannels, effectiveBits)
                     val bytesPerSec = (updatedHeader.sampleRate.toLong() * updatedHeader.blockAlign.toLong()).coerceAtLeast(1L)
                     val computedDurationMs = (updatedHeader.pcmDataBytes * 1000L) / bytesPerSec
                     AppendResult(
                         success = true,
-                        finalFile = repairedOriginal,
+                        finalFile = readOnlyOriginal,
                         format = "WAV",
                         mimeType = "audio/wav",
                         durationMs = computedDurationMs
                     )
                 } else {
                     stagingFile.delete()
-                    AppendResult(success = false, finalFile = repairedOriginal)
+                    AppendResult(success = false, finalFile = readOnlyOriginal)
                 }
             } else {
                 stagingFile.delete()
-                AppendResult(success = false, finalFile = repairedOriginal)
+                AppendResult(success = false, finalFile = readOnlyOriginal)
             }
+        } catch (_: java.util.concurrent.CancellationException) {
+            decodedAppendTempWav?.delete()
+            stagingFile.delete()
+            AppendResult(success = false, finalFile = readOnlyOriginal, cancelled = true)
         } catch (_: Exception) {
             decodedAppendTempWav?.delete()
             stagingFile.delete()
-            AppendResult(success = false, finalFile = repairedOriginal)
+            AppendResult(success = false, finalFile = readOnlyOriginal, cancelled = isCancelled())
         }
     }
 

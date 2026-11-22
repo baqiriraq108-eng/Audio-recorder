@@ -46,4 +46,10 @@
     <string name="mic_indicator_bluetooth">Bluetooth Headset Active</string>
     <string name="mic_indicator_connecting_bluetooth">Connecting Bluetooth Microphone</string>
     <string name="mic_indicator_wired_headset">Wired Headset Active</string>
+    <string name="btn_cancel_merge">Cancel</string>
+    <string name="merge_status_merging">Merging audio… %1$d%%</string>
+    <string name="merge_status_reverting">Reverting… %1$d%%</string>
+    <string name="merge_cancelling_badge">Undoing</string>
+    <string name="library_tab_merging">Merging</string>
+    <string name="library_tab_reverting">Reverting</string>
 </resources>

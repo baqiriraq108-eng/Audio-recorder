@@ -482,6 +482,7 @@ private fun RecorderDestination(
     val settings by viewModel.settings.collectAsStateWithLifecycle()
     val appendTarget by viewModel.appendTarget.collectAsStateWithLifecycle()
     val mergeProgress by viewModel.mergeProgress.collectAsStateWithLifecycle()
+    val isMergeCancelling by viewModel.isMergeCancelling.collectAsStateWithLifecycle()
     val showAppendSaveConfirmDialog by viewModel.showAppendSaveConfirmDialog.collectAsStateWithLifecycle()
     val liveBookmarks by viewModel.liveBookmarks.collectAsStateWithLifecycle()
     val elapsedMs by viewModel.audioEngine.elapsedMs.collectAsStateWithLifecycle()
@@ -499,6 +500,8 @@ private fun RecorderDestination(
         liveBookmarks = liveBookmarks,
         appendTarget = appendTarget,
         mergeProgress = mergeProgress,
+        isMergeCancelling = isMergeCancelling,
+        onCancelMerge = { viewModel.cancelActiveMerge() },
         activeAudioDeviceName = activeAudioDeviceName,
         isConnectingBluetoothMic = isConnectingBluetoothMic,
         onStartRecording = { viewModel.startRecording() },
@@ -543,6 +546,8 @@ private fun LibraryDestination(viewModel: RecorderViewModel) {
     val cloudSyncingIds by viewModel.cloudSyncingIds.collectAsStateWithLifecycle()
     val downloadingCloudIds by viewModel.downloadingCloudIds.collectAsStateWithLifecycle()
     val mergeProgress by viewModel.mergeProgress.collectAsStateWithLifecycle()
+    val mergeTargetStorage by viewModel.mergeTargetStorage.collectAsStateWithLifecycle()
+    val isMergeCancelling by viewModel.isMergeCancelling.collectAsStateWithLifecycle()
 
     LibraryScreen(
         activeStorageTab = activeLibraryStorageTab,
@@ -566,6 +571,8 @@ private fun LibraryDestination(viewModel: RecorderViewModel) {
         syncingIds = cloudSyncingIds,
         downloadingIds = downloadingCloudIds,
         mergeProgress = mergeProgress,
+        mergeTargetStorage = mergeTargetStorage,
+        isMergeCancelling = isMergeCancelling,
         onSelectStorageTab = { viewModel.selectLibraryStorageTab(it) },
         onSearchQueryChange = { viewModel.updateSearchQuery(it) },
         onSelectFilter = { viewModel.selectFilterChip(it) },
