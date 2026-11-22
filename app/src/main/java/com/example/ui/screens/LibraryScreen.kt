@@ -161,6 +161,7 @@ fun LibraryScreen(
     mergeProgress: Int? = null,
     mergeTargetStorage: StorageDestination? = null,
     isMergeCancelling: Boolean = false,
+    onRequestCancelMerge: () -> Unit = {},
     onSelectStorageTab: (StorageDestination) -> Unit,
     onSearchQueryChange: (String) -> Unit,
     onSelectFilter: (LibraryFilterChip) -> Unit,
@@ -585,6 +586,7 @@ fun LibraryScreen(
             mergeProgress = mergeProgress,
             mergeTargetStorage = mergeTargetStorage,
             isMergeCancelling = isMergeCancelling,
+            onRequestCancelMerge = onRequestCancelMerge,
             onSelectTab = onSelectStorageTab
         )
 
@@ -1349,6 +1351,36 @@ fun isStorageTabMerging(
     return tab == effectiveTarget
 }
 
+enum class LibraryTabTapAction {
+    SELECT_TAB,
+    PROMPT_CANCEL_MERGE,
+    IGNORE_REVERTING
+}
+
+/**
+ * Determines the exact tap behavior when the user taps a Library storage tab:
+ * - Tapping the tab currently displaying an active merging indicator intercepts the tap and opens
+ *   the "Cancel merging?" confirmation dialog (unless rollback is already unwinding).
+ * - Tapping any other non-merging storage tab switches tabs normally while the merge runs.
+ */
+fun resolveLibraryTabTapAction(
+    tappedTab: StorageDestination,
+    mergeProgress: Int?,
+    mergeTargetStorage: StorageDestination?,
+    isMergeCancelling: Boolean
+): LibraryTabTapAction {
+    val isTappedTabMerging = isStorageTabMerging(
+        tab = tappedTab,
+        mergeProgress = mergeProgress,
+        mergeTargetStorage = mergeTargetStorage
+    )
+    return when {
+        isTappedTabMerging && isMergeCancelling -> LibraryTabTapAction.IGNORE_REVERTING
+        isTappedTabMerging -> LibraryTabTapAction.PROMPT_CANCEL_MERGE
+        else -> LibraryTabTapAction.SELECT_TAB
+    }
+}
+
 @Composable
 private fun LibraryStorageTabSwitcher(
     activeTab: StorageDestination,
@@ -1358,6 +1390,7 @@ private fun LibraryStorageTabSwitcher(
     mergeProgress: Int? = null,
     mergeTargetStorage: StorageDestination? = null,
     isMergeCancelling: Boolean = false,
+    onRequestCancelMerge: () -> Unit = {},
     onSelectTab: (StorageDestination) -> Unit
 ) {
     val tabs = StorageDestination.entries
@@ -1433,7 +1466,20 @@ private fun LibraryStorageTabSwitcher(
                         .clickable(
                             interactionSource = interactionSource,
                             indication = null,
-                            onClick = { onSelectTab(tab) }
+                            onClick = {
+                                when (
+                                    resolveLibraryTabTapAction(
+                                        tappedTab = tab,
+                                        mergeProgress = mergeProgress,
+                                        mergeTargetStorage = mergeTargetStorage,
+                                        isMergeCancelling = isMergeCancelling
+                                    )
+                                ) {
+                                    LibraryTabTapAction.PROMPT_CANCEL_MERGE -> onRequestCancelMerge()
+                                    LibraryTabTapAction.SELECT_TAB -> onSelectTab(tab)
+                                    LibraryTabTapAction.IGNORE_REVERTING -> Unit
+                                }
+                            }
                         )
                         .testTag("library_storage_tab_${tab.id.lowercase()}")
                 ) {

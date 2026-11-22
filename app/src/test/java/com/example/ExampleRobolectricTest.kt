@@ -10,6 +10,7 @@ import com.example.data.RecordingEntity
 import com.example.data.RecordingRepository
 import com.example.data.StorageDestination
 import com.example.service.RecordingForegroundService
+import com.example.service.RecordingIslandOverlayManager
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
@@ -19,7 +20,9 @@ import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
+import org.robolectric.Robolectric
 import org.robolectric.RobolectricTestRunner
+import org.robolectric.Shadows
 import org.robolectric.annotation.Config
 import java.io.File
 
@@ -2846,7 +2849,430 @@ class ExampleRobolectricTest {
             )
         }
     }
+
+    @Test
+    fun `verify cancelled merge job permanently dies and never auto-resumes after rollback hits 0 percent`() = runBlocking {
+        val app = ApplicationProvider.getApplicationContext<android.app.Application>()
+        val vm = com.example.viewmodel.RecorderViewModel(app)
+
+        vm.setMergeProgressForTest(progress = 45, targetStorage = StorageDestination.LOCAL)
+        assertFalse(vm.showCancelMergeConfirmDialog.value)
+
+        // 1. Tapping Cancel opens confirmation dialog; dismissing keeps merge running
+        vm.requestCancelMergeConfirmation()
+        assertTrue("Confirmation dialog must open when merge is active", vm.showCancelMergeConfirmDialog.value)
+        vm.dismissCancelMergeConfirmation()
+        assertFalse("Continue Merging must dismiss dialog without cancelling", vm.showCancelMergeConfirmDialog.value)
+        assertFalse(vm.isMergeCancelling.value)
+        assertEquals(45, vm.mergeProgress.value)
+
+        // 2. Attach a simulated active background worker Job and confirm Abort Merge
+        val jobStarted = java.util.concurrent.CountDownLatch(1)
+        val workerJob = this.launch(kotlinx.coroutines.Dispatchers.IO) {
+            jobStarted.countDown()
+            kotlinx.coroutines.delay(60_000L)
+        }
+        jobStarted.await(2, java.util.concurrent.TimeUnit.SECONDS)
+        val (mergeId, cancelToken) = vm.attachActiveMergeJobForTest(workerJob)
+
+        vm.requestCancelMergeConfirmation()
+        assertTrue(vm.showCancelMergeConfirmDialog.value)
+        vm.confirmCancelActiveMerge()
+
+        assertFalse("Confirming abort must dismiss dialog immediately", vm.showCancelMergeConfirmDialog.value)
+        assertTrue("One-way cancellation token must flip to true immediately", cancelToken.get())
+        assertTrue("Background coroutine Job must be cancelled immediately", workerJob.isCancelled)
+        assertTrue(vm.isMergeCancelling.value)
+
+        // Advance Robolectric main looper until rollback reaches 0% -> null
+        var ticks = 0
+        while (vm.mergeProgress.value != null && ticks < 250) {
+            org.robolectric.Shadows.shadowOf(android.os.Looper.getMainLooper())
+                .idleFor(java.time.Duration.ofMillis(15))
+            ticks++
+        }
+
+        org.junit.Assert.assertNull("mergeProgress must be null after rollback finishes", vm.mergeProgress.value)
+        assertFalse("isMergeCancelling must be false after rollback finishes", vm.isMergeCancelling.value)
+        assertTrue("One-way token must stay permanently true and NEVER reset to false", cancelToken.get())
+
+        // 3. Prove stale worker attempting to emit progress after rollback hits 0% can NEVER resurrect the merge
+        vm.emitMergeProgressForTest(mergeId, cancelToken, 62)
+        vm.emitMergeProgressForTest(mergeId, cancelToken, 85)
+        org.junit.Assert.assertNull(
+            "Stale killed merge job must NEVER resume or overwrite mergeProgress after rollback reaches 0%",
+            vm.mergeProgress.value
+        )
+    }
+
+    @Test
+    fun `verify Library tab tap intercepts active merging tab while switching non-merging tabs normally`() {
+        // Active Cloud merge: tapping Cloud prompts cancel confirmation, tapping Local or Trash switches tabs
+        assertEquals(
+            com.example.ui.screens.LibraryTabTapAction.PROMPT_CANCEL_MERGE,
+            com.example.ui.screens.resolveLibraryTabTapAction(
+                tappedTab = StorageDestination.CLOUD,
+                mergeProgress = 42,
+                mergeTargetStorage = StorageDestination.CLOUD,
+                isMergeCancelling = false
+            )
+        )
+        assertEquals(
+            com.example.ui.screens.LibraryTabTapAction.SELECT_TAB,
+            com.example.ui.screens.resolveLibraryTabTapAction(
+                tappedTab = StorageDestination.LOCAL,
+                mergeProgress = 42,
+                mergeTargetStorage = StorageDestination.CLOUD,
+                isMergeCancelling = false
+            )
+        )
+        assertEquals(
+            com.example.ui.screens.LibraryTabTapAction.SELECT_TAB,
+            com.example.ui.screens.resolveLibraryTabTapAction(
+                tappedTab = StorageDestination.TRASH,
+                mergeProgress = 42,
+                mergeTargetStorage = StorageDestination.CLOUD,
+                isMergeCancelling = false
+            )
+        )
+
+        // While already reverting on Local: tapping Local is ignored, tapping Cloud switches normally
+        assertEquals(
+            com.example.ui.screens.LibraryTabTapAction.IGNORE_REVERTING,
+            com.example.ui.screens.resolveLibraryTabTapAction(
+                tappedTab = StorageDestination.LOCAL,
+                mergeProgress = 18,
+                mergeTargetStorage = StorageDestination.LOCAL,
+                isMergeCancelling = true
+            )
+        )
+        assertEquals(
+            com.example.ui.screens.LibraryTabTapAction.SELECT_TAB,
+            com.example.ui.screens.resolveLibraryTabTapAction(
+                tappedTab = StorageDestination.CLOUD,
+                mergeProgress = 18,
+                mergeTargetStorage = StorageDestination.LOCAL,
+                isMergeCancelling = true
+            )
+        )
+
+        // No active merge: all tabs select normally
+        assertEquals(
+            com.example.ui.screens.LibraryTabTapAction.SELECT_TAB,
+            com.example.ui.screens.resolveLibraryTabTapAction(
+                tappedTab = StorageDestination.LOCAL,
+                mergeProgress = null,
+                mergeTargetStorage = null,
+                isMergeCancelling = false
+            )
+        )
+    }
+
+    @Test
+    fun `verify Mp4Appender 256KB whole-frame batch extraction preserves exact frame boundaries across 350KB+ payload`() {
+        val dir = File(ApplicationProvider.getApplicationContext<android.app.Application>().cacheDir, "batch_256k_test_${System.nanoTime()}")
+        dir.mkdirs()
+        try {
+            // Build synthetic raw AAC stream > 360 KB with variable frame sizes (300..900 bytes)
+            // so batch flushes MUST trigger multiple times across the 256 KB boundary without splitting any frame.
+            val rawExpectedFile = File(dir, "expected_raw.aac")
+            val frameCount = 650
+            val frameSizes = IntArray(frameCount) { idx -> 317 + ((idx * 97) % 521) }
+            val expectedBytes = java.io.ByteArrayOutputStream()
+            for (i in 0 until frameCount) {
+                val sz = frameSizes[i]
+                val frame = ByteArray(sz) { b -> ((i * 31 + b * 7) and 0xFF).toByte() }
+                expectedBytes.write(frame)
+            }
+            val expectedPayload = expectedBytes.toByteArray()
+            assertTrue("Test payload must exceed 256 KB staging buffer", expectedPayload.size > com.example.audio.Mp4Appender.STAGING_BUFFER_SIZE + 64_000)
+            rawExpectedFile.writeBytes(expectedPayload)
+
+            val m4aFile = File(dir, "large_multi_frame.m4a")
+            val dummyEnc = com.example.audio.AacEncoder(sampleRate = 44100, channelCount = 1, bitrate = 128_000)
+            val seg = com.example.audio.EncodedAacSegment(
+                rawAacFile = rawExpectedFile,
+                frameSizes = frameSizes,
+                sampleRate = 44100,
+                channelCount = 1,
+                aacObjectType = 2,
+                audioSpecificConfig = com.example.audio.Mp4BoxParser.buildAudioSpecificConfig(44100, 1),
+                startPtsSamples = 0L,
+                totalEncodedSamples = frameCount.toLong() * com.example.audio.AacEncoder.AAC_FRAME_SAMPLES.toLong(),
+                primingFramesSkipped = 0
+            )
+            assertTrue("Must write valid standalone M4A", dummyEnc.writeStandaloneM4aFile(seg, m4aFile))
+
+            val meta = com.example.audio.Mp4BoxParser.parseM4a(m4aFile)
+            org.junit.Assert.assertNotNull("Parsed M4A metadata must not be null", meta)
+
+            val extractedRawFile = File(dir, "extracted_raw.aac")
+            val extractedSizes = com.example.audio.Mp4Appender.extractRawAacFramesViaChunkTable(
+                sourceFile = m4aFile,
+                meta = meta!!,
+                skipFirstFrames = 0,
+                outRawAacFile = extractedRawFile
+            )
+            org.junit.Assert.assertNotNull("Batch extraction must succeed", extractedSizes)
+            org.junit.Assert.assertArrayEquals(
+                "Extracted frame size table must match every whole frame exactly",
+                frameSizes,
+                extractedSizes
+            )
+            org.junit.Assert.assertArrayEquals(
+                "Extracted AAC byte stream across >256 KB boundary must match byte-for-byte with zero split frames",
+                expectedPayload,
+                extractedRawFile.readBytes()
+            )
+        } finally {
+            dir.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun `verify MediaCodec slice capacity guard and reusable PCM buffer pool prevent BufferOverflow`() {
+        // 1. Hardware capacities (4 KB, 8 KB, 16 KB, odd non-aligned 8195 B) feeding a 256 KB block
+        val stereoBlockAlign = 4
+        val monoBlockAlign = 2
+        val bigBlock = com.example.audio.AacEncoder.STAGING_BUFFER_SIZE
+
+        assertEquals(
+            "4 KB hardware buffer must cap 256 KB block to 4096 aligned bytes",
+            4096,
+            com.example.audio.AacEncoder.computeSafeMediaCodecSliceSize(bigBlock, 4096, stereoBlockAlign)
+        )
+        assertEquals(
+            "8 KB hardware buffer must cap 256 KB block to 8192 aligned bytes",
+            8192,
+            com.example.audio.AacEncoder.computeSafeMediaCodecSliceSize(bigBlock, 8192, stereoBlockAlign)
+        )
+        assertEquals(
+            "Unaligned 8195-byte buffer must floor down to 8192 stereo frame-aligned bytes",
+            8192,
+            com.example.audio.AacEncoder.computeSafeMediaCodecSliceSize(bigBlock, 8195, stereoBlockAlign)
+        )
+        assertEquals(
+            "Tiny remaining tail smaller than capacity must keep exact frame-aligned tail",
+            1020,
+            com.example.audio.AacEncoder.computeSafeMediaCodecSliceSize(1022, 16384, stereoBlockAlign)
+        )
+        assertEquals(
+            "Mono 2-byte alignment must preserve 2-byte boundaries",
+            1022,
+            com.example.audio.AacEncoder.computeSafeMediaCodecSliceSize(1023, 16384, monoBlockAlign)
+        )
+
+        // 2. Reusable buffer pool channel conversion + resampling across a 256 KB stereo -> mono stream
+        val stereoInput = ByteArray(com.example.audio.WavFileTools.STAGING_BUFFER_SIZE) { i -> (i and 0x7F).toByte() }
+        val channelScratch = ByteArray(stereoInput.size)
+        val (monoBuf, monoLen) = com.example.audio.WavFileTools.convertPcmChannelsInto(
+            pcmBytes = stereoInput,
+            length = stereoInput.size,
+            srcChannels = 2,
+            targetChannels = 1,
+            reusableOut = channelScratch
+        )
+        assertTrue("Channel conversion must reuse provided scratch buffer without reallocating", monoBuf === channelScratch)
+        assertEquals("Stereo->Mono must halve byte count exactly", stereoInput.size / 2, monoLen)
+
+        val resampler = com.example.audio.WavFileTools.PcmResampler(
+            srcSampleRate = 48000,
+            targetSampleRate = 44100,
+            channels = 1
+        )
+        val (out1, len1) = resampler.resampleChunkReusable(monoBuf, monoLen)
+        val (out2, len2) = resampler.resampleChunkReusable(monoBuf, monoLen)
+        assertTrue("Second resampled chunk must reuse pooled internal scratch array", out2 === out1)
+        assertTrue("Resampled chunks must produce non-empty valid PCM", len1 > 0 && len2 > 0)
+    }
+
+    @Test
+    fun `verify active and paused recordings survive Recent Apps task removal with Dynamic Island and notification intact`() {
+        val app = ApplicationProvider.getApplicationContext<android.app.Application>()
+        assertTrue(
+            "Application must be AudioRecorderApplication implementing ViewModelStoreOwner so ViewModel survives UI swipe",
+            app is AudioRecorderApplication && app is androidx.lifecycle.ViewModelStoreOwner
+        )
+
+        // Verify manifest configures android:stopWithTask="false" on RecordingForegroundService
+        val serviceInfo = app.packageManager.getServiceInfo(
+            android.content.ComponentName(app, RecordingForegroundService::class.java),
+            0
+        )
+        assertEquals(
+            "RecordingForegroundService must set android:stopWithTask=\"false\"",
+            0,
+            serviceInfo.flags and android.content.pm.ServiceInfo.FLAG_STOP_WITH_TASK
+        )
+
+        RecordingIslandOverlayManager.dismissAndReset()
+        RecordingForegroundService.activeShouldSurviveTaskRemovalProvider = null
+        var stopSaveInvoked = false
+        var playbackStopInvoked = false
+        RecordingForegroundService.activeStopSaveHandler = { stopSaveInvoked = true }
+        RecordingForegroundService.activePlaybackStopHandler = { playbackStopInvoked = true }
+
+        try {
+            val serviceController = Robolectric.buildService(RecordingForegroundService::class.java).create()
+            val service = serviceController.get()
+            val shadowService = Shadows.shadowOf(service)
+
+            // 1. Active recording started
+            val startIntent = Intent(app, RecordingForegroundService::class.java).apply {
+                action = RecordingForegroundService.ACTION_START_FOREGROUND
+                putExtra(RecordingForegroundService.EXTRA_TITLE, "Lecture Recording")
+                putExtra(RecordingForegroundService.EXTRA_IS_PAUSED, false)
+            }
+            val startMode = service.onStartCommand(startIntent, 0, 1)
+            assertEquals("Active recording service must use START_STICKY", android.app.Service.START_STICKY, startMode)
+            assertTrue("Active recording must survive task removal", service.shouldSurviveTaskRemoval())
+
+            // Simulate user swiping app away from Recent Apps while actively recording
+            service.onTaskRemoved(Intent(Intent.ACTION_MAIN))
+
+            assertFalse("Active recording must NOT trigger stop/save on task removal", stopSaveInvoked)
+            assertFalse("Active recording must NOT trigger playback stop on task removal", playbackStopInvoked)
+            assertFalse("Active recording service must NOT call stopSelf on task removal", shadowService.isStoppedBySelf)
+            assertTrue("Dynamic Island session must stay active after task removal", RecordingIslandOverlayManager.isRecordingSessionActive)
+            assertTrue("Dynamic Island must remain displayable after task removal", RecordingIslandOverlayManager.shouldDisplayOverlay())
+
+            // 2. Pause mid-recording and swipe away again -> BOTH notification and Dynamic Island must remain active
+            val pauseIntent = Intent(app, RecordingForegroundService::class.java).apply {
+                action = RecordingForegroundService.ACTION_NOTIFICATION_PAUSE
+            }
+            service.onStartCommand(pauseIntent, 0, 2)
+            assertTrue("Paused mid-recording must survive task removal", service.shouldSurviveTaskRemoval())
+
+            service.onTaskRemoved(Intent(Intent.ACTION_MAIN))
+
+            assertFalse("Paused recording must NOT stop service on task removal", shadowService.isStoppedBySelf)
+            assertTrue("Dynamic Island must stay visible while paused after task removal", RecordingIslandOverlayManager.shouldDisplayOverlay())
+            assertTrue("Dynamic Island must reflect paused state", RecordingIslandOverlayManager.lastIsPaused)
+        } finally {
+            RecordingForegroundService.activeStopSaveHandler = null
+            RecordingForegroundService.activePlaybackStopHandler = null
+            RecordingForegroundService.activeShouldSurviveTaskRemovalProvider = null
+            RecordingIslandOverlayManager.dismissAndReset()
+        }
+    }
+
+    @Test
+    fun `verify playback and idle states terminate cleanly on Recent Apps task removal`() {
+        val app = ApplicationProvider.getApplicationContext<android.app.Application>()
+        RecordingIslandOverlayManager.dismissAndReset()
+        RecordingForegroundService.activeShouldSurviveTaskRemovalProvider = null
+
+        var playbackStopCount = 0
+        RecordingForegroundService.activePlaybackStopHandler = { playbackStopCount++ }
+
+        try {
+            // 1. Playback mode -> MUST terminate cleanly on task removal
+            val playbackService = Robolectric.buildService(RecordingForegroundService::class.java).create().get()
+            val shadowPlaybackService = Shadows.shadowOf(playbackService)
+            val playbackIntent = Intent(app, RecordingForegroundService::class.java).apply {
+                action = RecordingForegroundService.ACTION_START_PLAYBACK
+                putExtra(RecordingForegroundService.EXTRA_TITLE, "Saved Memo")
+                putExtra(RecordingForegroundService.EXTRA_PLAYBACK_IS_PLAYING, true)
+                putExtra(RecordingForegroundService.EXTRA_PLAYBACK_DURATION_MS, 60_000L)
+            }
+            val playbackStartMode = playbackService.onStartCommand(playbackIntent, 0, 1)
+            assertEquals("Playback service must return START_NOT_STICKY", android.app.Service.START_NOT_STICKY, playbackStartMode)
+            assertFalse("Playback mode must NOT survive task removal", playbackService.shouldSurviveTaskRemoval())
+
+            playbackService.onTaskRemoved(Intent(Intent.ACTION_MAIN))
+
+            assertEquals("Playback stop handler must be called when swiped away during playback", 1, playbackStopCount)
+            assertTrue("Playback service must call stopSelf on task removal", shadowPlaybackService.isStoppedBySelf)
+            assertFalse("Dynamic Island must not be active after playback termination", RecordingIslandOverlayManager.isRecordingSessionActive)
+
+            // 2. Idle state -> MUST terminate cleanly on task removal
+            val idleService = Robolectric.buildService(RecordingForegroundService::class.java).create().get()
+            val shadowIdleService = Shadows.shadowOf(idleService)
+            assertFalse("Idle service must NOT survive task removal", idleService.shouldSurviveTaskRemoval())
+
+            idleService.onTaskRemoved(Intent(Intent.ACTION_MAIN))
+
+            assertTrue("Idle service must call stopSelf on task removal", shadowIdleService.isStoppedBySelf)
+            assertFalse("Dynamic Island must stay inactive when idle", RecordingIslandOverlayManager.shouldDisplayOverlay())
+
+            // 3. ViewModel conditional gate: false when idle, true during silent background merge, false when complete
+            val vm = com.example.viewmodel.RecorderViewModel(app)
+            assertFalse("Idle ViewModel must not survive task removal", vm.shouldSurviveTaskRemoval())
+            vm.setMergeProgressForTest(progress = 40, targetStorage = StorageDestination.LOCAL)
+            assertTrue("Active silent background merge must survive task removal until complete", vm.shouldSurviveTaskRemoval())
+            vm.setMergeProgressForTest(progress = null, targetStorage = null)
+            assertFalse("ViewModel must return to terminable state once merge completes", vm.shouldSurviveTaskRemoval())
+        } finally {
+            RecordingForegroundService.activePlaybackStopHandler = null
+            RecordingForegroundService.activeShouldSurviveTaskRemovalProvider = null
+            RecordingIslandOverlayManager.dismissAndReset()
+        }
+    }
+
+    @Test
+    fun `verify cold launch MainActivity boots without crash and reuses Application-scoped RecorderViewModel`() {
+        val app = ApplicationProvider.getApplicationContext<android.app.Application>()
+        assertTrue(
+            "Application must be AudioRecorderApplication",
+            app is AudioRecorderApplication
+        )
+        val audioApp = app as AudioRecorderApplication
+        assertTrue(
+            "AudioRecorderApplication must implement HasDefaultViewModelProviderFactory",
+            audioApp is androidx.lifecycle.HasDefaultViewModelProviderFactory
+        )
+        assertEquals(
+            "defaultViewModelCreationExtras must provide APPLICATION_KEY",
+            audioApp,
+            audioApp.defaultViewModelCreationExtras[
+                androidx.lifecycle.ViewModelProvider.AndroidViewModelFactory.APPLICATION_KEY
+            ]
+        )
+
+        // Direct ViewModelProvider(owner) resolution (no explicit factory) must succeed without NoSuchMethodException
+        val resolvedBeforeLaunch = androidx.lifecycle.ViewModelProvider(audioApp)[
+            com.example.viewmodel.RecorderViewModel::class.java
+        ]
+        org.junit.Assert.assertNotNull(resolvedBeforeLaunch)
+
+        // Full cold launch of MainActivity including Compose setContent
+        val firstController = Robolectric.buildActivity(MainActivity::class.java).setup()
+        Shadows.shadowOf(android.os.Looper.getMainLooper()).idle()
+        org.junit.Assert.assertNotNull(firstController.get())
+        assertFalse("MainActivity must remain alive after cold launch", firstController.get().isFinishing)
+
+        val resolvedDuringFirstLaunch = androidx.lifecycle.ViewModelProvider(audioApp)[
+            com.example.viewmodel.RecorderViewModel::class.java
+        ]
+        org.junit.Assert.assertSame(
+            "MainActivity must attach to the shared Application-scoped RecorderViewModel",
+            resolvedBeforeLaunch,
+            resolvedDuringFirstLaunch
+        )
+
+        // Simulate swiping away / destroying MainActivity and reopening it
+        firstController.pause().stop().destroy()
+        Shadows.shadowOf(android.os.Looper.getMainLooper()).idle()
+
+        val secondController = Robolectric.buildActivity(MainActivity::class.java).setup()
+        Shadows.shadowOf(android.os.Looper.getMainLooper()).idle()
+        org.junit.Assert.assertNotNull(secondController.get())
+        assertFalse("Recreated MainActivity must remain alive", secondController.get().isFinishing)
+
+        val resolvedAfterRelaunch = androidx.lifecycle.ViewModelProvider(audioApp)[
+            com.example.viewmodel.RecorderViewModel::class.java
+        ]
+        org.junit.Assert.assertSame(
+            "Relaunching MainActivity must reuse the exact same Application-scoped RecorderViewModel",
+            resolvedBeforeLaunch,
+            resolvedAfterRelaunch
+        )
+
+        secondController.pause().stop().destroy()
+    }
 }
+
+
 
 
 

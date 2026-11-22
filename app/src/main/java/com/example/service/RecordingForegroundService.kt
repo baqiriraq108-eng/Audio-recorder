@@ -32,6 +32,8 @@ class RecordingForegroundService : Service() {
     private var hasEmittedFinishedConfirmation: Boolean = false
     @Volatile
     private var isRecordingSessionStoppedOrDiscarded: Boolean = false
+    @Volatile
+    private var isForegroundRecordingStarted: Boolean = false
     private var sessionStartTimeMs: Long = System.currentTimeMillis()
     private var pauseStartedAtMs: Long = 0L
     private var accumulatedPausedMs: Long = 0L
@@ -757,6 +759,7 @@ class RecordingForegroundService : Service() {
         when (intent?.action) {
             ACTION_START_FOREGROUND -> {
                 isRecordingSessionStoppedOrDiscarded = false
+                isForegroundRecordingStarted = true
                 isPlaybackMode = false
                 isShowingAppendSaveConfirmation = false
                 hasEmittedFinishedConfirmation = false
@@ -854,6 +857,7 @@ class RecordingForegroundService : Service() {
             }
 
             ACTION_START_PLAYBACK -> {
+                isForegroundRecordingStarted = false
                 isPlaybackMode = true
                 playbackTitle = intent.getStringExtra(EXTRA_TITLE)?.takeIf { it.isNotBlank() } ?: "Recording"
                 playbackIsPlaying = intent.getBooleanExtra(EXTRA_PLAYBACK_IS_PLAYING, true)
@@ -884,9 +888,11 @@ class RecordingForegroundService : Service() {
                 }
                 val nm = getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager
                 nm?.notify(NOTIFICATION_ID, notification)
+                return START_NOT_STICKY
             }
 
             ACTION_UPDATE_PLAYBACK -> {
+                isForegroundRecordingStarted = false
                 isPlaybackMode = true
                 playbackTitle = intent.getStringExtra(EXTRA_TITLE)?.takeIf { it.isNotBlank() } ?: playbackTitle
                 playbackIsPlaying = intent.getBooleanExtra(EXTRA_PLAYBACK_IS_PLAYING, playbackIsPlaying)
@@ -907,6 +913,7 @@ class RecordingForegroundService : Service() {
                         durationMs = playbackDurationMs
                     )
                 )
+                return START_NOT_STICKY
             }
 
             ACTION_NOTIFICATION_PAUSE -> {
@@ -939,11 +946,14 @@ class RecordingForegroundService : Service() {
                 val title = intent.getStringExtra(EXTRA_TITLE)?.takeIf { it.isNotBlank() }
                     ?: getString(R.string.notification_finished_recording)
                 showFinishedSavedConfirmation(title)
+                return START_NOT_STICKY
             }
 
             ACTION_DISMISS_FINISHED_NOTIFICATION -> {
+                isForegroundRecordingStarted = false
                 RecordingIslandOverlayManager.dismissBothFinishedNotificationAndOverlay(this)
                 stopSelf()
+                return START_NOT_STICKY
             }
 
             ACTION_NOTIFICATION_BOOKMARK -> {
@@ -987,11 +997,12 @@ class RecordingForegroundService : Service() {
 
             ACTION_STOP_FOREGROUND -> {
                 isRecordingSessionStoppedOrDiscarded = true
+                isForegroundRecordingStarted = false
                 stopForegroundInternal()
                 return START_NOT_STICKY
             }
         }
-        return START_STICKY
+        return if (shouldSurviveTaskRemoval()) START_STICKY else START_NOT_STICKY
     }
 
     private fun acquireWakeLock() {
@@ -1561,6 +1572,8 @@ class RecordingForegroundService : Service() {
 
     fun showFinishedSavedConfirmation(title: String = getString(R.string.notification_finished_recording)) {
         isShowingAppendSaveConfirmation = false
+        isForegroundRecordingStarted = false
+        isRecordingSessionStoppedOrDiscarded = true
         RecordingIslandOverlayManager.showFinishedCompletionOverlay(this, title)
         if (hasEmittedFinishedConfirmation) {
             return
@@ -1597,6 +1610,8 @@ class RecordingForegroundService : Service() {
 
     private fun stopForegroundInternal() {
         isRecordingSessionStoppedOrDiscarded = true
+        isForegroundRecordingStarted = false
+        isPlaybackMode = false
         RecordingIslandOverlayManager.dismissAndReset()
         releaseWakeLock()
         lastRecordedMetadataTitle = null
@@ -1770,10 +1785,50 @@ class RecordingForegroundService : Service() {
 
     override fun onBind(intent: Intent?): IBinder? = null
 
+    internal fun shouldSurviveTaskRemoval(): Boolean {
+        return evaluateTaskRemovalPersistence(
+            isForegroundRecordingStarted = isForegroundRecordingStarted,
+            isPlaybackMode = isPlaybackMode,
+            isRecordingSessionStoppedOrDiscarded = isRecordingSessionStoppedOrDiscarded,
+            hasEmittedFinishedConfirmation = hasEmittedFinishedConfirmation,
+            isShowingAppendSaveConfirmation = isShowingAppendSaveConfirmation,
+            externalRecordingOrMergeActive = activeShouldSurviveTaskRemovalProvider?.invoke()
+        )
+    }
+
     override fun onTaskRemoved(rootIntent: Intent?) {
         super.onTaskRemoved(rootIntent)
+        if (shouldSurviveTaskRemoval()) {
+            // Strict Conditional Persistence:
+            // Keep active or paused recording sessions (and in-flight headless save/merge)
+            // completely uninterrupted when the main UI task is swiped away from Recent Apps.
+            try {
+                RecordingIslandOverlayManager.onAppForegroundChanged(applicationContext, false)
+                val nm = getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager
+                if (isShowingAppendSaveConfirmation) {
+                    nm?.notify(
+                        NOTIFICATION_ID,
+                        buildAppendSaveConfirmationNotification()
+                    )
+                } else if (isForegroundRecordingStarted && !isPlaybackMode && !isRecordingSessionStoppedOrDiscarded) {
+                    nm?.notify(
+                        NOTIFICATION_ID,
+                        buildRecordingNotification(
+                            title = currentTitle,
+                            statusText = currentStatus,
+                            isPaused = isPausedState,
+                            isSkipSilence = isSkipSilenceActive,
+                            isAwaitingSave = false
+                        )
+                    )
+                }
+            } catch (_: Exception) {}
+            return
+        }
+
+        // Audio playback or completely idle: terminate playback cleanly and shut down service.
         try {
-            activeStopSaveHandler?.invoke()
+            activePlaybackStopHandler?.invoke()
         } catch (_: Exception) {}
         stopForegroundInternal()
     }
@@ -1922,5 +1977,37 @@ class RecordingForegroundService : Service() {
 
         @Volatile
         var activePlaybackSeekHandler: ((Long) -> Unit)? = null
+
+        @Volatile
+        var activePlaybackStopHandler: (() -> Unit)? = null
+
+        @Volatile
+        var activeShouldSurviveTaskRemovalProvider: (() -> Boolean)? = null
+
+        /**
+         * Pure deterministic gate controlling strict conditional task-removal persistence:
+         * - Returns `true` ONLY when an audio recording is actively running, paused mid-recording,
+         *   awaiting inline Save confirmation in the Dynamic Island, or finalizing a headless merge/save.
+         * - Returns `false` during audio playback or when completely idle so the service terminates cleanly.
+         */
+        fun evaluateTaskRemovalPersistence(
+            isForegroundRecordingStarted: Boolean,
+            isPlaybackMode: Boolean,
+            isRecordingSessionStoppedOrDiscarded: Boolean,
+            hasEmittedFinishedConfirmation: Boolean,
+            isShowingAppendSaveConfirmation: Boolean,
+            externalRecordingOrMergeActive: Boolean? = null
+        ): Boolean {
+            if (externalRecordingOrMergeActive != null) {
+                return externalRecordingOrMergeActive
+            }
+            if (isPlaybackMode || hasEmittedFinishedConfirmation) {
+                return false
+            }
+            if (isShowingAppendSaveConfirmation) {
+                return true
+            }
+            return isForegroundRecordingStarted && !isRecordingSessionStoppedOrDiscarded
+        }
     }
 }

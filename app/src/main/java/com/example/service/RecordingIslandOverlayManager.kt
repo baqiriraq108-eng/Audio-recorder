@@ -355,7 +355,10 @@ object RecordingIslandOverlayManager {
             if (previousInForeground && !canDrawSystemOverlay(context)) {
                 maybePromptOverlayPermissionOnce(context)
             }
-            if (!lastIsShowingAppendConfirm && !lastIsShowingFinishedCompletion) {
+            if ((previousInForeground || !isOverlayAttachedToWindow) &&
+                !lastIsShowingAppendConfirm &&
+                !lastIsShowingFinishedCompletion
+            ) {
                 currentMode = OverlayMode.DOCKED_PILL
                 currentMorphProgress = 0f
                 pillDragOffsetX = 0

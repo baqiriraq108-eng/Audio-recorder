@@ -4,9 +4,11 @@ import android.media.MediaExtractor
 import android.media.MediaFormat
 import android.media.MediaMetadataRetriever
 import android.os.Build
+import java.io.BufferedOutputStream
 import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
+import java.io.OutputStream
 import java.io.RandomAccessFile
 import kotlin.math.abs
 
@@ -28,6 +30,8 @@ data class Mp4AppendOutcome(
  * on a staging copy before atomically replacing the original file.
  */
 object Mp4Appender {
+
+    const val STAGING_BUFFER_SIZE = 262_144
 
     /**
      * Appends an [EncodedAacSegment] onto [baseM4aFile] without re-encoding existing audio.
@@ -204,16 +208,17 @@ object Mp4Appender {
                     forceCo64 = useCo64
                 )
 
+                val stagingBuf = ByteArray(STAGING_BUFFER_SIZE)
                 if (mdatHeaderDelta == 0L && meta.moovOffset == meta.mdatOffset + meta.mdatSize) {
                     // Fast path: copy up to end of mdat (or copy file and overwrite old moov at mdat end),
                     // patch mdat header in-place, append new AAC frames, and write updated moov at EOF.
-                    FileOutputStream(stagingFile).use { fos ->
+                    BufferedOutputStream(FileOutputStream(stagingFile), STAGING_BUFFER_SIZE).use { fos ->
                         RandomAccessFile(baseM4aFile, "r").use { rafIn ->
-                            copyRange(rafIn, fos, 0L, meta.mdatOffset + meta.mdatSize, isCancelled)
+                            copyRange(rafIn, fos, 0L, meta.mdatOffset + meta.mdatSize, isCancelled, stagingBuf)
                         }
                         if (isCancelled()) throw java.util.concurrent.CancellationException("Merge cancelled")
                         onProgress?.invoke(0.60f)
-                        copyFileStreamWithCancel(segment.rawAacFile, fos, isCancelled)
+                        copyFileStreamWithCancel(segment.rawAacFile, fos, isCancelled, stagingBuf)
                         onProgress?.invoke(0.80f)
                         fos.write(patchedMoovBytes)
                         fos.flush()
@@ -228,15 +233,15 @@ object Mp4Appender {
                 } else {
                     // Header size upgraded (8 -> 16 bytes) or extra boxes existed between mdat and moov
                     val updatedMdatHeader = Mp4BoxParser.buildMdatHeader(newMdatTotalSize, force64Bit = needs64BitMdat)
-                    FileOutputStream(stagingFile).use { fos ->
+                    BufferedOutputStream(FileOutputStream(stagingFile), STAGING_BUFFER_SIZE).use { fos ->
                         RandomAccessFile(baseM4aFile, "r").use { rafIn ->
-                            copyRange(rafIn, fos, 0L, meta.mdatOffset, isCancelled)
+                            copyRange(rafIn, fos, 0L, meta.mdatOffset, isCancelled, stagingBuf)
                             fos.write(updatedMdatHeader)
-                            copyRange(rafIn, fos, meta.mdatDataOffset, meta.mdatDataSize, isCancelled)
+                            copyRange(rafIn, fos, meta.mdatDataOffset, meta.mdatDataSize, isCancelled, stagingBuf)
                         }
                         if (isCancelled()) throw java.util.concurrent.CancellationException("Merge cancelled")
                         onProgress?.invoke(0.60f)
-                        copyFileStreamWithCancel(segment.rawAacFile, fos, isCancelled)
+                        copyFileStreamWithCancel(segment.rawAacFile, fos, isCancelled, stagingBuf)
                         onProgress?.invoke(0.80f)
                         fos.write(patchedMoovBytes)
                         fos.flush()
@@ -284,26 +289,27 @@ object Mp4Appender {
                 )
 
                 val updatedMdatHeader = Mp4BoxParser.buildMdatHeader(newMdatTotalSize, force64Bit = needs64BitMdat)
-                FileOutputStream(stagingFile).use { fos ->
+                val stagingBuf = ByteArray(STAGING_BUFFER_SIZE)
+                BufferedOutputStream(FileOutputStream(stagingFile), STAGING_BUFFER_SIZE).use { fos ->
                     RandomAccessFile(baseM4aFile, "r").use { rafIn ->
                         // 1. Copy prefix before moov (e.g. ftyp)
-                        copyRange(rafIn, fos, 0L, meta.moovOffset, isCancelled)
+                        copyRange(rafIn, fos, 0L, meta.moovOffset, isCancelled, stagingBuf)
                         // 2. Write updated moov with shifted chunk offsets
                         fos.write(finalMoovBytes)
                         // 3. Copy any boxes between end of old moov and start of old mdat (e.g. free/skip)
                         val betweenStart = meta.moovOffset + meta.moovSize
                         val betweenLen = (meta.mdatOffset - betweenStart).coerceAtLeast(0L)
                         if (betweenLen > 0L) {
-                            copyRange(rafIn, fos, betweenStart, betweenLen, isCancelled)
+                            copyRange(rafIn, fos, betweenStart, betweenLen, isCancelled, stagingBuf)
                         }
                         // 4. Write updated mdat header + original mdat payload
                         fos.write(updatedMdatHeader)
-                        copyRange(rafIn, fos, meta.mdatDataOffset, meta.mdatDataSize, isCancelled)
+                        copyRange(rafIn, fos, meta.mdatDataOffset, meta.mdatDataSize, isCancelled, stagingBuf)
                     }
                     if (isCancelled()) throw java.util.concurrent.CancellationException("Merge cancelled")
                     onProgress?.invoke(0.65f)
                     // 5. Append new AAC access units
-                    copyFileStreamWithCancel(segment.rawAacFile, fos, isCancelled)
+                    copyFileStreamWithCancel(segment.rawAacFile, fos, isCancelled, stagingBuf)
                     fos.flush()
                 }
             }
@@ -625,9 +631,10 @@ object Mp4Appender {
                 return Mp4AppendOutcome(false, baseM4aFile, errorMessage = "Failed to extract base AAC frames for repack.")
             }
 
-            FileOutputStream(combinedRawTemp).use { fos ->
-                copyFileStreamWithCancel(baseRawTemp, fos, isCancelled)
-                copyFileStreamWithCancel(appendedSegment.rawAacFile, fos, isCancelled)
+            val stagingBuf = ByteArray(STAGING_BUFFER_SIZE)
+            BufferedOutputStream(FileOutputStream(combinedRawTemp), STAGING_BUFFER_SIZE).use { fos ->
+                copyFileStreamWithCancel(baseRawTemp, fos, isCancelled, stagingBuf)
+                copyFileStreamWithCancel(appendedSegment.rawAacFile, fos, isCancelled, stagingBuf)
                 fos.flush()
             }
             if (isCancelled()) {
@@ -770,17 +777,21 @@ object Mp4Appender {
 
             val totalPcmBytes = (basePcmTemp.length() + appendPcmTemp.length()).coerceAtLeast(1L)
             var processedBytes = 0L
-            val buf = ByteArray(16384)
+            // Single reusable 256 KB staging buffer allocated upfront for PCM -> AAC feed
+            val stagingBuf = ByteArray(STAGING_BUFFER_SIZE)
 
             for (pcmFile in listOf(basePcmTemp, appendPcmTemp)) {
+                if (isCancelled()) {
+                    throw java.util.concurrent.CancellationException("Transcode cancelled")
+                }
                 FileInputStream(pcmFile).use { fis ->
                     while (true) {
                         if (isCancelled()) {
                             throw java.util.concurrent.CancellationException("Transcode cancelled")
                         }
-                        val r = fis.read(buf)
+                        val r = fis.read(stagingBuf)
                         if (r <= 0) break
-                        encoder.encodePcmBytes(buf, r)
+                        encoder.encodePcmBytes(stagingBuf, r)
                         processedBytes += r
                         val p = 0.60f + 0.30f * (processedBytes.toFloat() / totalPcmBytes.toFloat()).coerceIn(0f, 1f)
                         onProgress?.invoke(p)
@@ -885,31 +896,64 @@ object Mp4Appender {
     ): Boolean {
         return try {
             val header = WavFileTools.readWavHeaderInfo(wavFile)
-            val pcmOffset = WavFileTools.locatePcmDataOffset(wavFile)
+            val srcBlockAlign = header.blockAlign.coerceAtLeast(2)
+            val (pcmOffset, boundedPcmBytes) = WavFileTools.locatePcmDataChunkBounds(wavFile, srcBlockAlign)
+            if (boundedPcmBytes <= 0L) return false
             val resampler = if (header.sampleRate != targetSampleRate) {
                 WavFileTools.PcmResampler(header.sampleRate, targetSampleRate, targetChannels)
             } else null
 
             RandomAccessFile(wavFile, "r").use { raf ->
                 raf.seek(pcmOffset)
-                FileOutputStream(outputPcmFile).use { fos ->
-                    val buf = ByteArray(16384)
-                    while (true) {
+                BufferedOutputStream(FileOutputStream(outputPcmFile), STAGING_BUFFER_SIZE).use { fos ->
+                    val alignedSize = STAGING_BUFFER_SIZE - (STAGING_BUFFER_SIZE % srcBlockAlign)
+                    val stagingBuf = ByteArray(alignedSize)
+                    var channelScratch: ByteArray? = null
+                    var remaining = boundedPcmBytes
+                    while (remaining > 0L) {
                         if (isCancelled()) {
                             return false
                         }
-                        val r = raf.read(buf)
+                        val toRead = minOf(stagingBuf.size.toLong(), remaining).toInt()
+                        val r = raf.read(stagingBuf, 0, toRead)
                         if (r <= 0) break
-                        val rawChunk = if (r == buf.size) buf else buf.copyOf(r)
-                        val chConverted = WavFileTools.convertPcmChannels(rawChunk, header.channels, targetChannels)
-                        val finalBytes = resampler?.resampleChunk(chConverted) ?: chConverted
-                        fos.write(finalBytes)
+                        val alignedRead = r - (r % srcBlockAlign)
+                        if (alignedRead <= 0) break
+                        val chBuf: ByteArray
+                        val chLen: Int
+                        if (header.channels != targetChannels) {
+                            val (convertedBuf, convertedLen) = WavFileTools.convertPcmChannelsInto(
+                                pcmBytes = stagingBuf,
+                                length = alignedRead,
+                                srcChannels = header.channels,
+                                targetChannels = targetChannels,
+                                reusableOut = channelScratch
+                            )
+                            channelScratch = convertedBuf
+                            chBuf = convertedBuf
+                            chLen = convertedLen
+                        } else {
+                            chBuf = stagingBuf
+                            chLen = alignedRead
+                        }
+                        if (resampler != null) {
+                            val (resBuf, resLen) = resampler.resampleChunkReusable(chBuf, chLen)
+                            if (resLen > 0) fos.write(resBuf, 0, resLen)
+                        } else if (chLen > 0) {
+                            fos.write(chBuf, 0, chLen)
+                        }
+                        remaining -= alignedRead.toLong()
                     }
                     fos.flush()
                 }
             }
-            !isCancelled() && outputPcmFile.exists() && outputPcmFile.length() > 0L
+            if (isCancelled()) {
+                if (outputPcmFile.exists()) outputPcmFile.delete()
+                return false
+            }
+            outputPcmFile.exists() && outputPcmFile.length() > 0L
         } catch (_: Exception) {
+            if (isCancelled() && outputPcmFile.exists()) outputPcmFile.delete()
             false
         }
     }
@@ -1032,14 +1076,47 @@ object Mp4Appender {
                 .filter { it.firstChunk >= 1 && it.samplesPerChunk > 0 }
                 .sortedBy { it.firstChunk }
 
+            // Single reusable 256 KB staging buffer allocated upfront for the entire extraction session
+            val stagingBuf = ByteArray(STAGING_BUFFER_SIZE)
+            var aborted = false
+
             RandomAccessFile(sourceFile, "r").use { raf ->
-                FileOutputStream(outRawAacFile).use { fos ->
+                BufferedOutputStream(FileOutputStream(outRawAacFile), STAGING_BUFFER_SIZE).use { bos ->
                     var sampleIndex = 0
                     val totalChunks = meta.chunkOffsets.size
-                    val buf = ByteArray(65536)
+
+                    fun flushWholeFrameBatch(startOffset: Long, totalBatchBytes: Int, firstIdxInclusive: Int, endIdxExclusive: Int): Boolean {
+                        if (totalBatchBytes <= 0) return true
+                        if (isCancelled()) {
+                            aborted = true
+                            return false
+                        }
+                        raf.seek(startOffset)
+                        var readSoFar = 0
+                        while (readSoFar < totalBatchBytes) {
+                            if (isCancelled()) {
+                                aborted = true
+                                return false
+                            }
+                            val r = raf.read(stagingBuf, readSoFar, totalBatchBytes - readSoFar)
+                            if (r <= 0) break
+                            readSoFar += r
+                        }
+                        if (readSoFar != totalBatchBytes) {
+                            return false
+                        }
+                        bos.write(stagingBuf, 0, totalBatchBytes)
+                        for (idx in firstIdxInclusive until endIdxExclusive) {
+                            extractedSizes.add(meta.sampleSizes[idx])
+                        }
+                        return true
+                    }
 
                     for (chunkIdxZero in 0 until totalChunks) {
-                        if (isCancelled()) return null
+                        if (isCancelled()) {
+                            aborted = true
+                            break
+                        }
                         if (sampleIndex >= totalSamples) break
                         val chunkNumberOneBased = chunkIdxZero + 1
                         val activeStsc = sortedStsc.lastOrNull { it.firstChunk <= chunkNumberOneBased }
@@ -1052,36 +1129,106 @@ object Mp4Appender {
                         }
 
                         val countForChunk = minOf(samplesInThisChunk, totalSamples - sampleIndex)
+                        var batchStartOffset = -1L
+                        var batchBytes = 0
+                        var batchFirstSampleIdx = -1
+                        var batchEndSampleIdx = -1
+                        var hitTruncation = false
+
                         for (s in 0 until countForChunk) {
-                            if (isCancelled()) return null
+                            if (isCancelled()) {
+                                aborted = true
+                                break
+                            }
                             val sz = meta.sampleSizes[sampleIndex]
                             if (sz <= 0 || currentOffset + sz > fileLen) {
-                                sampleIndex = totalSamples // stop at first truncated sample
+                                hitTruncation = true
                                 break
                             }
                             if (sampleIndex >= skipFirstFrames) {
-                                raf.seek(currentOffset)
-                                var remaining = sz
-                                while (remaining > 0) {
-                                    val toRead = minOf(buf.size, remaining)
-                                    val r = raf.read(buf, 0, toRead)
-                                    if (r <= 0) break
-                                    fos.write(buf, 0, r)
-                                    remaining -= r
-                                }
-                                if (remaining == 0) {
-                                    extractedSizes.add(sz)
+                                if (sz > stagingBuf.size) {
+                                    // Flush any pending whole-frame batch first, then stream this single oversized frame
+                                    if (batchBytes > 0) {
+                                        if (!flushWholeFrameBatch(batchStartOffset, batchBytes, batchFirstSampleIdx, batchEndSampleIdx)) {
+                                            hitTruncation = true
+                                            break
+                                        }
+                                        batchStartOffset = -1L
+                                        batchBytes = 0
+                                        batchFirstSampleIdx = -1
+                                        batchEndSampleIdx = -1
+                                    }
+                                    raf.seek(currentOffset)
+                                    var remaining = sz
+                                    while (remaining > 0) {
+                                        if (isCancelled()) {
+                                            aborted = true
+                                            break
+                                        }
+                                        val toRead = minOf(stagingBuf.size, remaining)
+                                        val r = raf.read(stagingBuf, 0, toRead)
+                                        if (r <= 0) break
+                                        bos.write(stagingBuf, 0, r)
+                                        remaining -= r
+                                    }
+                                    if (aborted) break
+                                    if (remaining == 0) {
+                                        extractedSizes.add(sz)
+                                    } else {
+                                        hitTruncation = true
+                                        break
+                                    }
+                                } else {
+                                    // Whole-frame boundary integrity: never slice a frame across a 256 KB cutoff.
+                                    // If adding this complete frame would exceed 256 KB, flush the accumulated whole frames first.
+                                    if (batchBytes > 0 && batchBytes + sz > stagingBuf.size) {
+                                        if (!flushWholeFrameBatch(batchStartOffset, batchBytes, batchFirstSampleIdx, batchEndSampleIdx)) {
+                                            hitTruncation = true
+                                            break
+                                        }
+                                        batchStartOffset = -1L
+                                        batchBytes = 0
+                                        batchFirstSampleIdx = -1
+                                        batchEndSampleIdx = -1
+                                    }
+                                    if (batchBytes == 0) {
+                                        batchStartOffset = currentOffset
+                                        batchFirstSampleIdx = sampleIndex
+                                    }
+                                    batchBytes += sz
+                                    batchEndSampleIdx = sampleIndex + 1
                                 }
                             }
                             currentOffset += sz.toLong()
                             sampleIndex++
                         }
+
+                        if (!aborted && batchBytes > 0) {
+                            flushWholeFrameBatch(batchStartOffset, batchBytes, batchFirstSampleIdx, batchEndSampleIdx)
+                        }
+                        if (aborted) break
+                        if (hitTruncation) {
+                            sampleIndex = totalSamples
+                            break
+                        }
                     }
-                    fos.flush()
+                    if (!aborted) {
+                        bos.flush()
+                    }
                 }
             }
-            if (isCancelled() || extractedSizes.isEmpty()) null else extractedSizes.toIntArray()
+            if (aborted || isCancelled() || extractedSizes.isEmpty()) {
+                if (aborted || isCancelled()) {
+                    try { outRawAacFile.delete() } catch (_: Exception) {}
+                }
+                null
+            } else {
+                extractedSizes.toIntArray()
+            }
         } catch (_: Exception) {
+            if (isCancelled()) {
+                try { outRawAacFile.delete() } catch (_: Exception) {}
+            }
             null
         }
     }
@@ -1105,8 +1252,12 @@ object Mp4Appender {
         fallbackSampleRate: Int = 44100,
         fallbackChannels: Int = 1,
         targetBitrate: Int = 128_000,
-        onProgress: ((Float) -> Unit)? = null
+        onProgress: ((Float) -> Unit)? = null,
+        isCancelled: () -> Boolean = { false }
     ): Mp4AppendOutcome {
+        if (isCancelled()) {
+            return Mp4AppendOutcome(false, corruptedFile, errorMessage = "Repair cancelled by user.", cancelled = true)
+        }
         val parentDir = corruptedFile.parentFile ?: File(".")
         val backupCandidate = File(parentDir, "${corruptedFile.name}.bak")
         if ((!corruptedFile.exists() || corruptedFile.length() < 32L) &&
@@ -1127,9 +1278,15 @@ object Mp4Appender {
         if (unpackedRawAac.exists()) unpackedRawAac.delete()
         if (stagingM4a.exists()) stagingM4a.delete()
 
+        val stagingBuf = ByteArray(STAGING_BUFFER_SIZE)
+        var activeEncoder: AacEncoder? = null
+
         try {
             // Discover all moov metadata segments inside corruptedFile (supports single or concatenated M4As)
             val discoveredMetas = scanAllMoovSegmentsInFile(corruptedFile)
+            if (isCancelled()) {
+                return Mp4AppendOutcome(false, corruptedFile, errorMessage = "Repair cancelled by user.", cancelled = true)
+            }
             val combinedFrameSizes = ArrayList<Int>()
             var resolvedSampleRate = fallbackSampleRate.coerceIn(8000, 96000)
             var resolvedChannels = fallbackChannels.coerceIn(1, 2)
@@ -1143,20 +1300,27 @@ object Mp4Appender {
                     resolvedAsc = primaryMeta.audioSpecificConfig
                 }
 
-                FileOutputStream(unpackedRawAac).use { mergedFos ->
+                BufferedOutputStream(FileOutputStream(unpackedRawAac), STAGING_BUFFER_SIZE).use { mergedFos ->
                     val segTemp = File(parentDir, "${corruptedFile.name}.seg_unpack.aac")
                     for (metaSeg in discoveredMetas) {
+                        if (isCancelled()) {
+                            if (segTemp.exists()) segTemp.delete()
+                            throw java.util.concurrent.CancellationException("Repair cancelled")
+                        }
                         if (segTemp.exists()) segTemp.delete()
                         val segSizes = extractRawAacFramesViaChunkTable(
                             sourceFile = corruptedFile,
                             meta = metaSeg,
                             skipFirstFrames = 0,
-                            outRawAacFile = segTemp
+                            outRawAacFile = segTemp,
+                            isCancelled = isCancelled
                         )
+                        if (isCancelled()) {
+                            if (segTemp.exists()) segTemp.delete()
+                            throw java.util.concurrent.CancellationException("Repair cancelled")
+                        }
                         if (segSizes != null && segSizes.isNotEmpty() && segTemp.exists()) {
-                            FileInputStream(segTemp).use { fis ->
-                                fis.copyTo(mergedFos, 65536)
-                            }
+                            copyFileStreamWithCancel(segTemp, mergedFos, isCancelled, stagingBuf)
                             for (sz in segSizes) {
                                 combinedFrameSizes.add(sz)
                             }
@@ -1167,6 +1331,9 @@ object Mp4Appender {
                 }
             }
 
+            if (isCancelled()) {
+                return Mp4AppendOutcome(false, corruptedFile, errorMessage = "Repair cancelled by user.", cancelled = true)
+            }
             onProgress?.invoke(0.55f)
 
             // If chunk-table unpacking salvaged valid AAC frames, rebuild a clean single-chunk M4A container
@@ -1203,14 +1370,16 @@ object Mp4Appender {
                         forceCo64 = needs64
                     )
 
-                    FileOutputStream(stagingM4a).use { fos ->
+                    BufferedOutputStream(FileOutputStream(stagingM4a), STAGING_BUFFER_SIZE).use { fos ->
                         fos.write(ftypBytes)
                         fos.write(mdatHeaderBytes)
-                        FileInputStream(unpackedRawAac).use { fis ->
-                            fis.copyTo(fos, 65536)
-                        }
+                        copyFileStreamWithCancel(unpackedRawAac, fos, isCancelled, stagingBuf)
                         fos.write(freshMoovBytes)
                         fos.flush()
+                    }
+
+                    if (isCancelled()) {
+                        return Mp4AppendOutcome(false, corruptedFile, errorMessage = "Repair cancelled by user.", cancelled = true)
                     }
 
                     val expectedDurationMs = (frameSizesArray.size.toLong() * AacEncoder.AAC_FRAME_SAMPLES * 1000L) /
@@ -1232,6 +1401,10 @@ object Mp4Appender {
                 }
             }
 
+            if (isCancelled()) {
+                return Mp4AppendOutcome(false, corruptedFile, errorMessage = "Repair cancelled by user.", cancelled = true)
+            }
+
             // Fallback: Decode readable audio stream to PCM and re-encode a clean M4A container
             val decodedPcmTemp = File(parentDir, "${corruptedFile.name}.repair_dec.pcm")
             try {
@@ -1240,8 +1413,12 @@ object Mp4Appender {
                     outputPcmFile = decodedPcmTemp,
                     targetSampleRate = resolvedSampleRate,
                     targetChannels = resolvedChannels,
-                    onProgress = { p -> onProgress?.invoke(0.55f + p * 0.25f) }
+                    onProgress = { p -> onProgress?.invoke(0.55f + p * 0.25f) },
+                    isCancelled = isCancelled
                 )
+                if (isCancelled()) {
+                    return Mp4AppendOutcome(false, corruptedFile, errorMessage = "Repair cancelled by user.", cancelled = true)
+                }
                 if (decodedOk && decodedPcmTemp.exists() && decodedPcmTemp.length() > 0L) {
                     val encoder = AacEncoder(
                         sampleRate = resolvedSampleRate,
@@ -1249,17 +1426,25 @@ object Mp4Appender {
                         bitrate = targetBitrate,
                         skipPrimingFrame = false
                     )
-                    encoder.start(unpackedRawAac)
-                    val buf = ByteArray(16384)
+                    activeEncoder = encoder
+                    encoder.start(unpackedRawAac, isCancelled = isCancelled)
                     FileInputStream(decodedPcmTemp).use { fis ->
                         while (true) {
-                            val r = fis.read(buf)
+                            if (isCancelled()) {
+                                throw java.util.concurrent.CancellationException("Repair cancelled")
+                            }
+                            val r = fis.read(stagingBuf)
                             if (r <= 0) break
-                            encoder.encodePcmBytes(buf, r)
+                            encoder.encodePcmBytes(stagingBuf, r)
                         }
                     }
                     val seg = encoder.finish()
-                    if (encoder.writeStandaloneM4aFile(seg, stagingM4a) &&
+                    activeEncoder = null
+                    if (isCancelled()) {
+                        return Mp4AppendOutcome(false, corruptedFile, errorMessage = "Repair cancelled by user.", cancelled = true)
+                    }
+                    if (encoder.writeStandaloneM4aFile(seg, stagingM4a, isCancelled = isCancelled) &&
+                        !isCancelled() &&
                         atomicSwapFile(stagingM4a, corruptedFile)
                     ) {
                         onProgress?.invoke(1.0f)
@@ -1281,13 +1466,24 @@ object Mp4Appender {
             return Mp4AppendOutcome(
                 success = false,
                 finalFile = corruptedFile,
-                errorMessage = "Unable to salvage M4A frames from corrupted container."
+                errorMessage = "Unable to salvage M4A frames from corrupted container.",
+                cancelled = isCancelled()
             )
-        } catch (e: Exception) {
+        } catch (e: java.util.concurrent.CancellationException) {
+            activeEncoder?.abortAndCleanup()
             return Mp4AppendOutcome(
                 success = false,
                 finalFile = corruptedFile,
-                errorMessage = e.localizedMessage ?: "Failed to repair M4A container."
+                errorMessage = "Repair cancelled by user.",
+                cancelled = true
+            )
+        } catch (e: Exception) {
+            activeEncoder?.abortAndCleanup()
+            return Mp4AppendOutcome(
+                success = false,
+                finalFile = corruptedFile,
+                errorMessage = e.localizedMessage ?: "Failed to repair M4A container.",
+                cancelled = isCancelled()
             )
         } finally {
             if (unpackedRawAac.exists()) unpackedRawAac.delete()
@@ -1357,37 +1553,37 @@ object Mp4Appender {
 
     private fun copyRange(
         rafIn: RandomAccessFile,
-        fosOut: FileOutputStream,
+        outStream: OutputStream,
         startOffset: Long,
         byteCount: Long,
-        isCancelled: () -> Boolean = { false }
+        isCancelled: () -> Boolean = { false },
+        stagingBuf: ByteArray = ByteArray(STAGING_BUFFER_SIZE)
     ) {
         if (byteCount <= 0L) return
         rafIn.seek(startOffset)
-        val buf = ByteArray(65536)
         var remaining = byteCount
         while (remaining > 0L) {
             if (isCancelled()) throw java.util.concurrent.CancellationException("Merge cancelled")
-            val toRead = minOf(buf.size.toLong(), remaining).toInt()
-            val r = rafIn.read(buf, 0, toRead)
+            val toRead = minOf(stagingBuf.size.toLong(), remaining).toInt()
+            val r = rafIn.read(stagingBuf, 0, toRead)
             if (r <= 0) break
-            fosOut.write(buf, 0, r)
+            outStream.write(stagingBuf, 0, r)
             remaining -= r.toLong()
         }
     }
 
     private fun copyFileStreamWithCancel(
         srcFile: File,
-        fosOut: FileOutputStream,
-        isCancelled: () -> Boolean = { false }
+        outStream: OutputStream,
+        isCancelled: () -> Boolean = { false },
+        stagingBuf: ByteArray = ByteArray(STAGING_BUFFER_SIZE)
     ) {
         FileInputStream(srcFile).use { fis ->
-            val buf = ByteArray(65536)
             while (true) {
                 if (isCancelled()) throw java.util.concurrent.CancellationException("Merge cancelled")
-                val r = fis.read(buf)
+                val r = fis.read(stagingBuf)
                 if (r <= 0) break
-                fosOut.write(buf, 0, r)
+                outStream.write(stagingBuf, 0, r)
             }
         }
     }

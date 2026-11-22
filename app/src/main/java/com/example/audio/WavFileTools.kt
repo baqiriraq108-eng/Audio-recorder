@@ -3,6 +3,7 @@ package com.example.audio
 import com.example.data.AudioFormatUtils
 import com.example.data.SilenceInterval
 import com.example.data.SilenceSkipConfig
+import java.io.BufferedOutputStream
 import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
@@ -40,6 +41,10 @@ data class AppendResult(
 )
 
 object WavFileTools {
+
+    const val STAGING_BUFFER_SIZE = 262_144
+    const val DECODER_ACTIVE_STALL_WATCHDOG_MS = 15_000L
+    const val DECODER_EOS_STALL_WATCHDOG_MS = 4_000L
 
     /**
      * Reads the 44-byte RIFF/WAV header from [file] to preserve exact original audio parameters
@@ -168,7 +173,7 @@ object WavFileTools {
      * Writes a standard 44-byte RIFF/WAV header for 16-bit or 24-bit PCM audio.
      */
     fun writeWavHeader(
-        out: FileOutputStream,
+        out: java.io.OutputStream,
         pcmDataBytes: Long,
         sampleRate: Int,
         channels: Int,
@@ -303,10 +308,37 @@ object WavFileTools {
         targetChannels: Int
     ): ByteArray {
         if (srcChannels == targetChannels || pcmBytes.size < 2) return pcmBytes
+        val (buf, len) = convertPcmChannelsInto(
+            pcmBytes = pcmBytes,
+            length = pcmBytes.size,
+            srcChannels = srcChannels,
+            targetChannels = targetChannels,
+            reusableOut = null
+        )
+        return if (len == buf.size) buf else buf.copyOf(len)
+    }
+
+    /**
+     * Converts [length] bytes of 16-bit PCM in [pcmBytes] between mono and stereo into a
+     * reusable scratch buffer to prevent per-iteration heap allocations during 256 KB batch processing.
+     */
+    fun convertPcmChannelsInto(
+        pcmBytes: ByteArray,
+        length: Int,
+        srcChannels: Int,
+        targetChannels: Int,
+        reusableOut: ByteArray? = null
+    ): Pair<ByteArray, Int> {
+        val safeLen = length.coerceIn(0, pcmBytes.size)
+        if (srcChannels == targetChannels || safeLen < 2) return pcmBytes to safeLen
         return if (srcChannels == 2 && targetChannels == 1) {
-            // Stereo to Mono: average L and R 16-bit samples safely
-            val frameCount = pcmBytes.size / 4
-            val monoBytes = ByteArray(frameCount * 2)
+            val frameCount = safeLen / 4
+            val needed = frameCount * 2
+            val monoBytes = if (reusableOut != null && reusableOut.size >= needed) {
+                reusableOut
+            } else {
+                ByteArray(needed)
+            }
             for (i in 0 until frameCount) {
                 val base = i * 4
                 val left = ((pcmBytes[base + 1].toInt() shl 8) or (pcmBytes[base].toInt() and 0xFF)).toShort()
@@ -315,11 +347,15 @@ object WavFileTools {
                 monoBytes[i * 2] = (avg.toInt() and 0xFF).toByte()
                 monoBytes[i * 2 + 1] = ((avg.toInt() shr 8) and 0xFF).toByte()
             }
-            monoBytes
+            monoBytes to needed
         } else if (srcChannels == 1 && targetChannels == 2) {
-            // Mono to Stereo: duplicate mono sample to L and R
-            val frameCount = pcmBytes.size / 2
-            val stereoBytes = ByteArray(frameCount * 4)
+            val frameCount = safeLen / 2
+            val needed = frameCount * 4
+            val stereoBytes = if (reusableOut != null && reusableOut.size >= needed) {
+                reusableOut
+            } else {
+                ByteArray(needed)
+            }
             for (i in 0 until frameCount) {
                 val b0 = pcmBytes[i * 2]
                 val b1 = pcmBytes[i * 2 + 1]
@@ -329,9 +365,9 @@ object WavFileTools {
                 stereoBytes[outBase + 2] = b0
                 stereoBytes[outBase + 3] = b1
             }
-            stereoBytes
+            stereoBytes to needed
         } else {
-            pcmBytes
+            pcmBytes to safeLen
         }
     }
 
@@ -346,6 +382,9 @@ object WavFileTools {
         private var carryOverLeft: Short = 0
         private var carryOverRight: Short = 0
         private var hasCarryOver = false
+        private var scratchInLeft = ShortArray(0)
+        private var scratchInRight = ShortArray(0)
+        private var scratchOutBytes = ByteArray(0)
 
         fun reset() {
             resamplePos = 0.0
@@ -356,12 +395,30 @@ object WavFileTools {
 
         fun resampleChunk(inputPcmBytes: ByteArray): ByteArray {
             if (srcSampleRate == targetSampleRate || inputPcmBytes.isEmpty()) return inputPcmBytes
-            val bytesPerFrame = safeChannels * 2
-            val inputFrameCount = inputPcmBytes.size / bytesPerFrame
-            if (inputFrameCount <= 0) return ByteArray(0)
+            val (buf, len) = resampleChunkReusable(inputPcmBytes, inputPcmBytes.size)
+            return if (len == 0) ByteArray(0) else buf.copyOf(len)
+        }
 
-            val inLeft = ShortArray(inputFrameCount)
-            val inRight = if (safeChannels == 2) ShortArray(inputFrameCount) else null
+        /**
+         * Resamples [length] bytes from [inputPcmBytes] using internally pooled scratch buffers
+         * to eliminate GC thrashing across 256 KB streaming iterations.
+         */
+        fun resampleChunkReusable(inputPcmBytes: ByteArray, length: Int = inputPcmBytes.size): Pair<ByteArray, Int> {
+            val safeLen = length.coerceIn(0, inputPcmBytes.size)
+            if (srcSampleRate == targetSampleRate || safeLen <= 0) return inputPcmBytes to safeLen
+            val bytesPerFrame = safeChannels * 2
+            val inputFrameCount = safeLen / bytesPerFrame
+            if (inputFrameCount <= 0) return scratchOutBytes to 0
+
+            if (scratchInLeft.size < inputFrameCount) {
+                scratchInLeft = ShortArray(inputFrameCount)
+            }
+            if (safeChannels == 2 && scratchInRight.size < inputFrameCount) {
+                scratchInRight = ShortArray(inputFrameCount)
+            }
+
+            val inLeft = scratchInLeft
+            val inRight = if (safeChannels == 2) scratchInRight else null
 
             for (i in 0 until inputFrameCount) {
                 val base = i * bytesPerFrame
@@ -375,9 +432,12 @@ object WavFileTools {
                 }
             }
 
-            // Pre-allocate primitive output buffer sized generously for the chunk ratio
             val estimatedFrames = (kotlin.math.ceil((inputFrameCount + 2.0) / ratio).toInt()).coerceAtLeast(4)
-            var outBytes = ByteArray(estimatedFrames * bytesPerFrame)
+            val estimatedBytes = estimatedFrames * bytesPerFrame
+            if (scratchOutBytes.size < estimatedBytes) {
+                scratchOutBytes = ByteArray(estimatedBytes)
+            }
+            var outBytes = scratchOutBytes
             var outFrameCount = 0
             var pos = resamplePos
             val maxReadablePos = (inputFrameCount - 1).toDouble()
@@ -410,6 +470,7 @@ object WavFileTools {
                 val neededBytes = (outFrameCount + 1) * bytesPerFrame
                 if (neededBytes > outBytes.size) {
                     outBytes = outBytes.copyOf((outBytes.size * 2).coerceAtLeast(neededBytes))
+                    scratchOutBytes = outBytes
                 }
                 val base = outFrameCount * bytesPerFrame
                 outBytes[base] = (interpLeft and 0xFF).toByte()
@@ -434,7 +495,7 @@ object WavFileTools {
             resamplePos = pos - inputFrameCount.toDouble()
 
             val exactByteLen = outFrameCount * bytesPerFrame
-            return if (exactByteLen == outBytes.size) outBytes else outBytes.copyOf(exactByteLen)
+            return outBytes to exactByteLen
         }
     }
 
@@ -544,25 +605,45 @@ object WavFileTools {
 
                 RandomAccessFile(sourceFile, "r").use { raf ->
                     raf.seek(pcmOffset)
-                    FileOutputStream(outputPcmFile).use { fos ->
-                        val bufSize = 16384 - (16384 % srcBlockAlign)
-                        val buf = ByteArray(bufSize)
+                    BufferedOutputStream(FileOutputStream(outputPcmFile), STAGING_BUFFER_SIZE).use { fos ->
+                        val bufSize = STAGING_BUFFER_SIZE - (STAGING_BUFFER_SIZE % srcBlockAlign)
+                        val stagingBuf = ByteArray(bufSize)
+                        var channelScratch: ByteArray? = null
                         var remaining = rawPcmBytes
                         var processed = 0L
                         while (remaining > 0L) {
                             if (isCancelled()) {
                                 break
                             }
-                            val toRead = minOf(buf.size.toLong(), remaining).toInt()
-                            val r = raf.read(buf, 0, toRead)
+                            val toRead = minOf(stagingBuf.size.toLong(), remaining).toInt()
+                            val r = raf.read(stagingBuf, 0, toRead)
                             if (r <= 0) break
                             val alignedRead = r - (r % srcBlockAlign)
                             if (alignedRead <= 0) break
-                            val rawChunk = if (alignedRead == buf.size) buf else buf.copyOf(alignedRead)
-                            val chConverted = convertPcmChannels(rawChunk, srcChannels, safeTargetChannels)
-                            val finalBytes = resampler?.resampleChunk(chConverted) ?: chConverted
-                            if (finalBytes.isNotEmpty()) {
-                                fos.write(finalBytes)
+
+                            val chBuf: ByteArray
+                            val chLen: Int
+                            if (srcChannels != safeTargetChannels) {
+                                val (convertedBuf, convertedLen) = convertPcmChannelsInto(
+                                    pcmBytes = stagingBuf,
+                                    length = alignedRead,
+                                    srcChannels = srcChannels,
+                                    targetChannels = safeTargetChannels,
+                                    reusableOut = channelScratch
+                                )
+                                channelScratch = convertedBuf
+                                chBuf = convertedBuf
+                                chLen = convertedLen
+                            } else {
+                                chBuf = stagingBuf
+                                chLen = alignedRead
+                            }
+
+                            if (resampler != null) {
+                                val (resBuf, resLen) = resampler.resampleChunkReusable(chBuf, chLen)
+                                if (resLen > 0) fos.write(resBuf, 0, resLen)
+                            } else if (chLen > 0) {
+                                fos.write(chBuf, 0, chLen)
                             }
                             remaining -= alignedRead.toLong()
                             processed += alignedRead.toLong()
@@ -616,9 +697,7 @@ object WavFileTools {
             var sawInputEOS = false
             var extractorExhausted = false
             var sawOutputEOS = false
-            var noProgressIterations = 0
             var lastProgressWallMs = System.currentTimeMillis()
-            val maxStallWallMs = 8_000L
 
             var srcChannels = if (audioFormat.containsKey(MediaFormat.KEY_CHANNEL_COUNT)) {
                 audioFormat.getInteger(MediaFormat.KEY_CHANNEL_COUNT)
@@ -633,17 +712,24 @@ object WavFileTools {
             }
 
             var resampler: PcmResampler? = null
+            // Pooled scratch buffers to prevent per-frame heap allocations during decoding
+            var pcmOutScratch = ByteArray(16384)
+            var channelScratch: ByteArray? = null
 
-            FileOutputStream(outputPcmFile).use { fos ->
+            BufferedOutputStream(FileOutputStream(outputPcmFile), STAGING_BUFFER_SIZE).use { fos ->
                 while (!sawOutputEOS) {
                     if (isCancelled()) {
                         break
                     }
                     var madeProgressThisIter = false
 
+                    // 1. Batch-feed all immediately ready hardware decoder input slots (0 us wait)
                     if (!sawInputEOS) {
-                        val inputBufIndex = codec.dequeueInputBuffer(5_000L)
-                        if (inputBufIndex >= 0) {
+                        var fedCount = 0
+                        while (!sawInputEOS && fedCount < 8) {
+                            if (isCancelled()) break
+                            val inputBufIndex = codec.dequeueInputBuffer(0L)
+                            if (inputBufIndex < 0) break
                             if (extractorExhausted) {
                                 sawInputEOS = true
                                 codec.queueInputBuffer(
@@ -654,11 +740,18 @@ object WavFileTools {
                                     MediaCodec.BUFFER_FLAG_END_OF_STREAM
                                 )
                                 madeProgressThisIter = true
+                                break
                             } else {
                                 val inputBuf = codec.getInputBuffer(inputBufIndex)
                                 if (inputBuf != null) {
                                     inputBuf.clear()
-                                    val sampleSize = extractor.readSampleData(inputBuf, 0)
+                                    val sampleSize = try {
+                                        extractor.readSampleData(inputBuf, 0)
+                                    } catch (_: IllegalArgumentException) {
+                                        // Guard against oversized container packet exceeding hardware buffer capacity
+                                        extractor.advance()
+                                        0
+                                    }
                                     if (sampleSize < 0) {
                                         sawInputEOS = true
                                         codec.queueInputBuffer(
@@ -669,6 +762,7 @@ object WavFileTools {
                                             MediaCodec.BUFFER_FLAG_END_OF_STREAM
                                         )
                                         madeProgressThisIter = true
+                                        break
                                     } else {
                                         val presentationTimeUs = extractor.sampleTime.coerceAtLeast(0L)
                                         val hasMoreSamples = extractor.advance()
@@ -683,81 +777,104 @@ object WavFileTools {
                                             0
                                         )
                                         madeProgressThisIter = true
+                                        fedCount++
                                     }
+                                } else {
+                                    break
                                 }
                             }
                         }
                     }
 
-                    val outputBufIndex = codec.dequeueOutputBuffer(bufferInfo, 5_000L)
-                    if (outputBufIndex >= 0) {
-                        if ((bufferInfo.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0) {
-                            sawOutputEOS = true
-                            madeProgressThisIter = true
-                        }
-                        val isCodecCfg = (bufferInfo.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0
-                        val outBuf = codec.getOutputBuffer(outputBufIndex)
-                        if (!isCodecCfg && outBuf != null && bufferInfo.size > 0) {
-                            madeProgressThisIter = true
-                            outBuf.position(bufferInfo.offset)
-                            outBuf.limit(bufferInfo.offset + bufferInfo.size)
-                            val chunk = ByteArray(bufferInfo.size)
-                            outBuf.get(chunk)
+                    if (isCancelled()) break
 
-                            val convertedBytes = convertPcmChannels(
-                                pcmBytes = chunk,
-                                srcChannels = srcChannels,
-                                targetChannels = targetChannels
-                            )
+                    // 2. Drain all immediately available decoder output buffers (0 us wait first, brief 1 ms wait only when idle)
+                    var drainedCount = 0
+                    while (!sawOutputEOS && drainedCount < 16) {
+                        if (isCancelled()) break
+                        val waitUs = if (drainedCount == 0 && !madeProgressThisIter) 1_000L else 0L
+                        val outputBufIndex = codec.dequeueOutputBuffer(bufferInfo, waitUs)
+                        if (outputBufIndex >= 0) {
+                            if ((bufferInfo.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0) {
+                                sawOutputEOS = true
+                                madeProgressThisIter = true
+                            }
+                            val isCodecCfg = (bufferInfo.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0
+                            val outBuf = codec.getOutputBuffer(outputBufIndex)
+                            if (!isCodecCfg && outBuf != null && bufferInfo.size > 0) {
+                                madeProgressThisIter = true
+                                val chunkLen = bufferInfo.size
+                                if (pcmOutScratch.size < chunkLen) {
+                                    pcmOutScratch = ByteArray(maxOf(chunkLen, pcmOutScratch.size * 2))
+                                }
+                                outBuf.position(bufferInfo.offset)
+                                outBuf.limit(bufferInfo.offset + chunkLen)
+                                outBuf.get(pcmOutScratch, 0, chunkLen)
 
-                            if (srcSampleRate != targetSampleRate) {
-                                if (resampler == null) {
+                                val chBuf: ByteArray
+                                val chLen: Int
+                                if (srcChannels != targetChannels) {
+                                    val (convBuf, convLen) = convertPcmChannelsInto(
+                                        pcmBytes = pcmOutScratch,
+                                        length = chunkLen,
+                                        srcChannels = srcChannels,
+                                        targetChannels = targetChannels,
+                                        reusableOut = channelScratch
+                                    )
+                                    channelScratch = convBuf
+                                    chBuf = convBuf
+                                    chLen = convLen
+                                } else {
+                                    chBuf = pcmOutScratch
+                                    chLen = chunkLen
+                                }
+
+                                if (srcSampleRate != targetSampleRate) {
+                                    if (resampler == null) {
+                                        resampler = PcmResampler(srcSampleRate, targetSampleRate, targetChannels)
+                                    }
+                                    val (resBuf, resLen) = resampler!!.resampleChunkReusable(chBuf, chLen)
+                                    if (resLen > 0) fos.write(resBuf, 0, resLen)
+                                } else if (chLen > 0) {
+                                    fos.write(chBuf, 0, chLen)
+                                }
+
+                                if (durationUs > 0L && bufferInfo.presentationTimeUs > 0L) {
+                                    val decRatio = (bufferInfo.presentationTimeUs.toFloat() / durationUs.toFloat()).coerceIn(0f, 1f)
+                                    onProgress?.invoke(decRatio)
+                                }
+                            }
+                            codec.releaseOutputBuffer(outputBufIndex, false)
+                            drainedCount++
+                        } else if (outputBufIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
+                            madeProgressThisIter = true
+                            val newFormat = codec.outputFormat
+                            if (newFormat.containsKey(MediaFormat.KEY_CHANNEL_COUNT)) {
+                                srcChannels = newFormat.getInteger(MediaFormat.KEY_CHANNEL_COUNT)
+                            }
+                            if (newFormat.containsKey(MediaFormat.KEY_SAMPLE_RATE)) {
+                                val newRate = newFormat.getInteger(MediaFormat.KEY_SAMPLE_RATE)
+                                if (newRate != srcSampleRate) {
+                                    srcSampleRate = newRate
                                     resampler = PcmResampler(srcSampleRate, targetSampleRate, targetChannels)
                                 }
-                                val resampledBytes = resampler!!.resampleChunk(convertedBytes)
-                                fos.write(resampledBytes)
-                            } else {
-                                fos.write(convertedBytes)
                             }
-
-                            if (durationUs > 0L && bufferInfo.presentationTimeUs > 0L) {
-                                val decRatio = (bufferInfo.presentationTimeUs.toFloat() / durationUs.toFloat()).coerceIn(0f, 1f)
-                                onProgress?.invoke(decRatio)
-                            }
+                            drainedCount++
+                        } else {
+                            break
                         }
-                        codec.releaseOutputBuffer(outputBufIndex, false)
-                    } else if (outputBufIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
-                        madeProgressThisIter = true
-                        val newFormat = codec.outputFormat
-                        if (newFormat.containsKey(MediaFormat.KEY_CHANNEL_COUNT)) {
-                            srcChannels = newFormat.getInteger(MediaFormat.KEY_CHANNEL_COUNT)
-                        }
-                        if (newFormat.containsKey(MediaFormat.KEY_SAMPLE_RATE)) {
-                            val newRate = newFormat.getInteger(MediaFormat.KEY_SAMPLE_RATE)
-                            if (newRate != srcSampleRate) {
-                                srcSampleRate = newRate
-                                resampler = PcmResampler(srcSampleRate, targetSampleRate, targetChannels)
-                            }
-                        }
-                    } else if (outputBufIndex == MediaCodec.INFO_OUTPUT_BUFFERS_CHANGED) {
-                        // Deprecated status on newer APIs; continue draining without counting as stall
-                        noProgressIterations++
-                    } else if (outputBufIndex == MediaCodec.INFO_TRY_AGAIN_LATER) {
-                        noProgressIterations++
                     }
 
                     if (madeProgressThisIter) {
-                        noProgressIterations = 0
                         lastProgressWallMs = System.currentTimeMillis()
                     } else {
-                        noProgressIterations++
                         val stalledMs = System.currentTimeMillis() - lastProgressWallMs
-                        if (stalledMs > maxStallWallMs) {
-                            break
+                        val stallLimitMs = if (sawInputEOS) {
+                            DECODER_EOS_STALL_WATCHDOG_MS
+                        } else {
+                            DECODER_ACTIVE_STALL_WATCHDOG_MS
                         }
-                        if (sawInputEOS && noProgressIterations > 80) {
-                            break
-                        } else if (!sawInputEOS && noProgressIterations > 250) {
+                        if (stalledMs > stallLimitMs) {
                             break
                         }
                     }
@@ -809,7 +926,8 @@ object WavFileTools {
                 return false
             }
             val pcmBytes = tempPcmFile.length()
-            FileOutputStream(outputWavFile).use { fos ->
+            val stagingBuf = ByteArray(STAGING_BUFFER_SIZE)
+            BufferedOutputStream(FileOutputStream(outputWavFile), STAGING_BUFFER_SIZE).use { fos ->
                 writeWavHeader(
                     out = fos,
                     pcmDataBytes = pcmBytes,
@@ -818,13 +936,12 @@ object WavFileTools {
                     bitsPerSample = bitsPerSample
                 )
                 FileInputStream(tempPcmFile).use { fis ->
-                    val buf = ByteArray(65536)
                     var read: Int
-                    while (fis.read(buf).also { read = it } != -1) {
+                    while (fis.read(stagingBuf).also { read = it } != -1) {
                         if (isCancelled()) {
                             break
                         }
-                        fos.write(buf, 0, read)
+                        fos.write(stagingBuf, 0, read)
                     }
                     fos.flush()
                 }
@@ -1082,7 +1199,13 @@ object WavFileTools {
             var processedInputBytes = 0L
             var writtenPcmBytes = 0L
 
-            FileOutputStream(stagingFile).use { out ->
+            // Single reusable 256 KB staging buffer pool allocated upfront for the entire WAV merge
+            val sharedStagingBuf = ByteArray(STAGING_BUFFER_SIZE)
+            val origReadCap = STAGING_BUFFER_SIZE - (STAGING_BUFFER_SIZE % blockAlign)
+            val appendReadCap = STAGING_BUFFER_SIZE - (STAGING_BUFFER_SIZE % appendBlockAlign)
+            var channelScratch: ByteArray? = null
+
+            BufferedOutputStream(FileOutputStream(stagingFile), STAGING_BUFFER_SIZE).use { out ->
                 writeWavHeader(
                     out = out,
                     pcmDataBytes = origPcmBytes + appendPcmBytes,
@@ -1091,7 +1214,6 @@ object WavFileTools {
                     bitsPerSample = effectiveBits
                 )
 
-                val origBuffer = ByteArray(65536 - (65536 % blockAlign))
                 if (origPcmBytes > 0L) {
                     RandomAccessFile(readOnlyOriginal, "r").use { rafIn ->
                         rafIn.seek(basePcmOffset)
@@ -1100,12 +1222,12 @@ object WavFileTools {
                             if (isCancelled()) {
                                 throw java.util.concurrent.CancellationException("WAV merge cancelled")
                             }
-                            val toRead = minOf(origBuffer.size.toLong(), remaining).toInt()
-                            val read = rafIn.read(origBuffer, 0, toRead)
+                            val toRead = minOf(origReadCap.toLong(), remaining).toInt()
+                            val read = rafIn.read(sharedStagingBuf, 0, toRead)
                             if (read <= 0) break
                             val alignedRead = read - (read % blockAlign)
                             if (alignedRead <= 0) break
-                            out.write(origBuffer, 0, alignedRead)
+                            out.write(sharedStagingBuf, 0, alignedRead)
                             remaining -= alignedRead.toLong()
                             processedInputBytes += alignedRead.toLong()
                             writtenPcmBytes += alignedRead.toLong()
@@ -1119,7 +1241,6 @@ object WavFileTools {
                     val resampler = if (appendRate != effectiveRate) {
                         PcmResampler(appendRate, effectiveRate, effectiveChannels)
                     } else null
-                    val appendBuffer = ByteArray(65536 - (65536 % appendBlockAlign))
 
                     RandomAccessFile(sourceAppendWavFile, "r").use { rafIn ->
                         rafIn.seek(appendPcmOffset)
@@ -1128,27 +1249,46 @@ object WavFileTools {
                             if (isCancelled()) {
                                 throw java.util.concurrent.CancellationException("WAV merge cancelled")
                             }
-                            val toRead = minOf(appendBuffer.size.toLong(), remaining).toInt()
-                            val read = rafIn.read(appendBuffer, 0, toRead)
+                            val toRead = minOf(appendReadCap.toLong(), remaining).toInt()
+                            val read = rafIn.read(sharedStagingBuf, 0, toRead)
                             if (read <= 0) break
                             val alignedRead = read - (read % appendBlockAlign)
                             if (alignedRead <= 0) break
 
                             if (!needsConversion) {
-                                out.write(appendBuffer, 0, alignedRead)
+                                out.write(sharedStagingBuf, 0, alignedRead)
                                 writtenPcmBytes += alignedRead.toLong()
                             } else {
-                                val rawChunk = if (alignedRead == appendBuffer.size) appendBuffer else appendBuffer.copyOf(alignedRead)
-                                val chMatched = if (appendChannels != effectiveChannels) {
-                                    convertPcmChannels(rawChunk, appendChannels, effectiveChannels)
+                                val chBuf: ByteArray
+                                val chLen: Int
+                                if (appendChannels != effectiveChannels) {
+                                    val (convBuf, convLen) = convertPcmChannelsInto(
+                                        pcmBytes = sharedStagingBuf,
+                                        length = alignedRead,
+                                        srcChannels = appendChannels,
+                                        targetChannels = effectiveChannels,
+                                        reusableOut = channelScratch
+                                    )
+                                    channelScratch = convBuf
+                                    chBuf = convBuf
+                                    chLen = convLen
                                 } else {
-                                    rawChunk
+                                    chBuf = sharedStagingBuf
+                                    chLen = alignedRead
                                 }
-                                val resampled = resampler?.resampleChunk(chMatched) ?: chMatched
-                                val validOutLen = resampled.size - (resampled.size % blockAlign)
-                                if (validOutLen > 0) {
-                                    out.write(resampled, 0, validOutLen)
-                                    writtenPcmBytes += validOutLen.toLong()
+                                if (resampler != null) {
+                                    val (resBuf, resLen) = resampler.resampleChunkReusable(chBuf, chLen)
+                                    val validOutLen = resLen - (resLen % blockAlign)
+                                    if (validOutLen > 0) {
+                                        out.write(resBuf, 0, validOutLen)
+                                        writtenPcmBytes += validOutLen.toLong()
+                                    }
+                                } else {
+                                    val validOutLen = chLen - (chLen % blockAlign)
+                                    if (validOutLen > 0) {
+                                        out.write(chBuf, 0, validOutLen)
+                                        writtenPcmBytes += validOutLen.toLong()
+                                    }
                                 }
                             }
                             remaining -= alignedRead.toLong()
@@ -1270,8 +1410,12 @@ object WavFileTools {
         channels: Int = 1,
         bitsPerSample: Int = 16,
         targetBitrate: Int = 128_000,
-        onProgress: ((Float) -> Unit)? = null
+        onProgress: ((Float) -> Unit)? = null,
+        isCancelled: () -> Boolean = { false }
     ): AppendResult {
+        if (isCancelled()) {
+            return AppendResult(success = false, finalFile = outputFile, cancelled = true)
+        }
         val validSources = sourceFiles.filter { it.exists() && it.length() > 0L }
         if (validSources.size < 2) {
             return AppendResult(success = false, finalFile = outputFile)
@@ -1284,7 +1428,8 @@ object WavFileTools {
                 sampleRate = sampleRate,
                 channels = channels,
                 bitsPerSample = bitsPerSample,
-                onProgress = onProgress
+                onProgress = onProgress,
+                isCancelled = isCancelled
             )
         } else {
             val targetM4a = if (outputFile.extension.equals("m4a", ignoreCase = true)) {
@@ -1298,7 +1443,8 @@ object WavFileTools {
                 targetSampleRate = sampleRate,
                 targetChannels = channels,
                 targetBitrate = targetBitrate,
-                onProgress = onProgress
+                onProgress = onProgress,
+                isCancelled = isCancelled
             )
         }
     }
@@ -1313,8 +1459,12 @@ object WavFileTools {
         targetSampleRate: Int = 44100,
         targetChannels: Int = 1,
         targetBitrate: Int = 128_000,
-        onProgress: ((Float) -> Unit)? = null
+        onProgress: ((Float) -> Unit)? = null,
+        isCancelled: () -> Boolean = { false }
     ): AppendResult {
+        if (isCancelled()) {
+            return AppendResult(success = false, finalFile = outputM4aFile, cancelled = true)
+        }
         val validSources = sourceFiles.filter { it.exists() && it.length() > 0L }
         if (validSources.size < 2) {
             return AppendResult(success = false, finalFile = outputM4aFile)
@@ -1327,6 +1477,9 @@ object WavFileTools {
         if (rawAacTemp.exists()) rawAacTemp.delete()
         if (stagingM4a.exists()) stagingM4a.delete()
 
+        val stagingBuf = ByteArray(STAGING_BUFFER_SIZE)
+        var activeEncoder: AacEncoder? = null
+
         return try {
             onProgress?.invoke(0.05f)
             val totalFiles = validSources.size
@@ -1334,6 +1487,7 @@ object WavFileTools {
 
             // STAGE 1: Direct AAC Frame Muxing (Lossless access unit concatenation across all selected tracks)
             val allM4aMetas = validSources.map { file ->
+                if (isCancelled()) throw java.util.concurrent.CancellationException("Multi-merge cancelled")
                 if (!isRiffWaveFile(file)) Mp4BoxParser.parseM4a(file) else null
             }
             val firstMeta = allM4aMetas.firstOrNull()
@@ -1359,9 +1513,13 @@ object WavFileTools {
                 var tracksExtractedCount = 0
                 var runningCumulativePtsUs = 0L
 
-                FileOutputStream(rawAacTemp).use { mergedFos ->
+                BufferedOutputStream(FileOutputStream(rawAacTemp), STAGING_BUFFER_SIZE).use { mergedFos ->
                     val segTemp = File(parentDir, "${outputM4aFile.name}.seg_ext.aac")
                     for (i in 0 until totalFiles) {
+                        if (isCancelled()) {
+                            if (segTemp.exists()) segTemp.delete()
+                            throw java.util.concurrent.CancellationException("Multi-merge cancelled")
+                        }
                         val srcFile = validSources[i]
                         val srcMeta = allM4aMetas[i]!!
                         if (segTemp.exists()) segTemp.delete()
@@ -1372,11 +1530,23 @@ object WavFileTools {
                             sourceFile = srcFile,
                             meta = srcMeta,
                             skipFirstFrames = skipPriming,
-                            outRawAacFile = segTemp
+                            outRawAacFile = segTemp,
+                            isCancelled = isCancelled
                         )
+                        if (isCancelled()) {
+                            if (segTemp.exists()) segTemp.delete()
+                            throw java.util.concurrent.CancellationException("Multi-merge cancelled")
+                        }
                         if (sizes != null && sizes.isNotEmpty() && segTemp.exists() && segTemp.length() > 0L) {
                             FileInputStream(segTemp).use { fis ->
-                                fis.copyTo(mergedFos, 65536)
+                                while (true) {
+                                    if (isCancelled()) {
+                                        throw java.util.concurrent.CancellationException("Multi-merge cancelled")
+                                    }
+                                    val r = fis.read(stagingBuf)
+                                    if (r <= 0) break
+                                    mergedFos.write(stagingBuf, 0, r)
+                                }
                             }
                             for (sz in sizes) {
                                 combinedFrameSizes.add(sz)
@@ -1393,6 +1563,10 @@ object WavFileTools {
                         onProgress?.invoke(0.05f + ((i + 1).toFloat() / totalFiles.toFloat()) * 0.75f)
                     }
                     mergedFos.flush()
+                }
+
+                if (isCancelled()) {
+                    throw java.util.concurrent.CancellationException("Multi-merge cancelled")
                 }
 
                 // Only commit Stage 1 if EVERY SINGLE selected track (from 0 to totalFiles - 1) was concatenated
@@ -1433,14 +1607,25 @@ object WavFileTools {
                         forceCo64 = needs64
                     )
 
-                    FileOutputStream(stagingM4a).use { fos ->
+                    BufferedOutputStream(FileOutputStream(stagingM4a), STAGING_BUFFER_SIZE).use { fos ->
                         fos.write(ftypBytes)
                         fos.write(mdatHeaderBytes)
                         FileInputStream(rawAacTemp).use { fis ->
-                            fis.copyTo(fos, 65536)
+                            while (true) {
+                                if (isCancelled()) {
+                                    throw java.util.concurrent.CancellationException("Multi-merge cancelled")
+                                }
+                                val r = fis.read(stagingBuf)
+                                if (r <= 0) break
+                                fos.write(stagingBuf, 0, r)
+                            }
                         }
                         fos.write(freshMoovBytes)
                         fos.flush()
+                    }
+
+                    if (isCancelled()) {
+                        throw java.util.concurrent.CancellationException("Multi-merge cancelled")
                     }
 
                     if (stagingM4a.exists() && stagingM4a.length() > 32L) {
@@ -1454,8 +1639,11 @@ object WavFileTools {
                 }
             }
 
+            if (isCancelled()) {
+                throw java.util.concurrent.CancellationException("Multi-merge cancelled")
+            }
+
             // STAGE 2: Continuous PCM Decode + Unified Single-Session AAC Encoding Fallback
-            // Used when merging mixed formats (WAV + M4A), differing sample rates/channels, or when Stage 1 could not directly repack all tracks.
             if (!wroteValidMergedM4a) {
                 if (rawAacTemp.exists()) rawAacTemp.delete()
                 if (stagingM4a.exists()) stagingM4a.delete()
@@ -1466,22 +1654,23 @@ object WavFileTools {
                     bitrate = targetBitrate,
                     skipPrimingFrame = false
                 )
-                encoder.start(rawAacTemp)
+                activeEncoder = encoder
+                encoder.start(rawAacTemp, isCancelled = isCancelled)
 
                 var totalPcmFramesEncoded = 0L
                 var runningCumulativePtsUs = 0L
-                val pcmChunkBuf = ByteArray(16384)
                 val bytesPerSampleFrame = (targetChannels * 2).coerceAtLeast(2)
+                var channelScratch: ByteArray? = null
 
-                // Iterate through the entire list of selected recordings from index 0 to the final selected item.
-                // Never signal EOS between tracks; EOS is only signaled in encoder.finish() after the final track.
                 for (idx in 0 until totalFiles) {
+                    if (isCancelled()) {
+                        throw java.util.concurrent.CancellationException("Multi-merge cancelled")
+                    }
                     val file = validSources[idx]
                     val trackProgressBase = 0.05f + (idx.toFloat() / totalFiles.toFloat()) * 0.80f
                     val trackProgressSpan = (1.0f / totalFiles.toFloat()) * 0.80f
                     var trackPcmBytesFed = 0L
 
-                    // Ensure monotonic cumulative PTS alignment at the start of each track
                     val currentEncoderPtsUs = encoder.currentCumulativePtsUs
                     if (runningCumulativePtsUs > currentEncoderPtsUs) {
                         encoder.advanceCumulativePtsOffsetUs(runningCumulativePtsUs - currentEncoderPtsUs)
@@ -1489,25 +1678,56 @@ object WavFileTools {
 
                     if (isRiffWaveFile(file)) {
                         val header = readWavHeaderInfo(file)
-                        val (pcmOffset, pcmBytes) = locatePcmDataChunkBounds(file, header.blockAlign)
+                        val srcBlockAlign = header.blockAlign.coerceAtLeast(2)
+                        val (pcmOffset, pcmBytes) = locatePcmDataChunkBounds(file, srcBlockAlign)
                         val resampler = if (header.sampleRate != targetSampleRate) {
                             PcmResampler(header.sampleRate, targetSampleRate, targetChannels)
                         } else null
+                        val readCap = STAGING_BUFFER_SIZE - (STAGING_BUFFER_SIZE % srcBlockAlign)
 
                         RandomAccessFile(file, "r").use { raf ->
                             raf.seek(pcmOffset)
                             var remaining = pcmBytes
                             while (remaining > 0L) {
-                                val toRead = minOf(pcmChunkBuf.size.toLong(), remaining).toInt()
-                                val r = raf.read(pcmChunkBuf, 0, toRead)
+                                if (isCancelled()) {
+                                    throw java.util.concurrent.CancellationException("Multi-merge cancelled")
+                                }
+                                val toRead = minOf(readCap.toLong(), remaining).toInt()
+                                val r = raf.read(stagingBuf, 0, toRead)
                                 if (r <= 0) break
-                                val chunk = if (r == pcmChunkBuf.size) pcmChunkBuf else pcmChunkBuf.copyOf(r)
-                                val chConverted = convertPcmChannels(chunk, header.channels, targetChannels)
-                                val finalPcm = resampler?.resampleChunk(chConverted) ?: chConverted
-                                encoder.encodePcmBytes(finalPcm, finalPcm.size)
-                                trackPcmBytesFed += finalPcm.size.toLong()
-                                totalPcmFramesEncoded += (finalPcm.size / bytesPerSampleFrame)
-                                remaining -= r.toLong()
+                                val alignedRead = r - (r % srcBlockAlign)
+                                if (alignedRead <= 0) break
+
+                                val chBuf: ByteArray
+                                val chLen: Int
+                                if (header.channels != targetChannels) {
+                                    val (convBuf, convLen) = convertPcmChannelsInto(
+                                        pcmBytes = stagingBuf,
+                                        length = alignedRead,
+                                        srcChannels = header.channels,
+                                        targetChannels = targetChannels,
+                                        reusableOut = channelScratch
+                                    )
+                                    channelScratch = convBuf
+                                    chBuf = convBuf
+                                    chLen = convLen
+                                } else {
+                                    chBuf = stagingBuf
+                                    chLen = alignedRead
+                                }
+                                if (resampler != null) {
+                                    val (resBuf, resLen) = resampler.resampleChunkReusable(chBuf, chLen)
+                                    if (resLen > 0) {
+                                        encoder.encodePcmBytes(resBuf, resLen)
+                                        trackPcmBytesFed += resLen.toLong()
+                                        totalPcmFramesEncoded += (resLen / bytesPerSampleFrame)
+                                    }
+                                } else if (chLen > 0) {
+                                    encoder.encodePcmBytes(chBuf, chLen)
+                                    trackPcmBytesFed += chLen.toLong()
+                                    totalPcmFramesEncoded += (chLen / bytesPerSampleFrame)
+                                }
+                                remaining -= alignedRead.toLong()
                             }
                         }
                     } else {
@@ -1520,21 +1740,26 @@ object WavFileTools {
                                 targetChannels = targetChannels,
                                 onProgress = { p ->
                                     onProgress?.invoke(trackProgressBase + p * trackProgressSpan)
-                                }
+                                },
+                                isCancelled = isCancelled
                             )
+                            if (isCancelled()) {
+                                throw java.util.concurrent.CancellationException("Multi-merge cancelled")
+                            }
                             if (decoded && tempTrackPcm.exists() && tempTrackPcm.length() > 0L) {
                                 FileInputStream(tempTrackPcm).use { fis ->
                                     while (true) {
-                                        val r = fis.read(pcmChunkBuf)
+                                        if (isCancelled()) {
+                                            throw java.util.concurrent.CancellationException("Multi-merge cancelled")
+                                        }
+                                        val r = fis.read(stagingBuf)
                                         if (r <= 0) break
-                                        encoder.encodePcmBytes(pcmChunkBuf, r)
+                                        encoder.encodePcmBytes(stagingBuf, r)
                                         trackPcmBytesFed += r.toLong()
                                         totalPcmFramesEncoded += (r / bytesPerSampleFrame)
                                     }
                                 }
                             } else {
-                                // Secondary fallback if MediaCodec decode couldn't run (e.g. JVM/Robolectric with raw M4A):
-                                // synthesize PCM matching the M4A metadata duration so the track is never skipped.
                                 val meta = Mp4BoxParser.parseM4a(file)
                                 val fallbackDurationMs = meta?.durationMs?.takeIf { it > 0L } ?: 1000L
                                 val fallbackSamples = ((fallbackDurationMs * targetSampleRate.toLong()) / 1000L).toInt().coerceAtLeast(1024)
@@ -1553,10 +1778,18 @@ object WavFileTools {
                     runningCumulativePtsUs += trackDurationUs
                 }
 
+                if (isCancelled()) {
+                    throw java.util.concurrent.CancellationException("Multi-merge cancelled")
+                }
+
                 // Signal End-Of-Stream (EOS) ONLY NOW after the very last sample of the final selected recording
                 if (totalPcmFramesEncoded > 0L) {
                     val segment = encoder.finish()
-                    val ok = encoder.writeStandaloneM4aFile(segment, stagingM4a)
+                    activeEncoder = null
+                    val ok = encoder.writeStandaloneM4aFile(segment, stagingM4a, isCancelled = isCancelled)
+                    if (isCancelled()) {
+                        throw java.util.concurrent.CancellationException("Multi-merge cancelled")
+                    }
                     if (ok && stagingM4a.exists() && stagingM4a.length() > 32L) {
                         if (outputM4aFile.exists()) outputM4aFile.delete()
                         if (!stagingM4a.renameTo(outputM4aFile)) {
@@ -1566,6 +1799,11 @@ object WavFileTools {
                         wroteValidMergedM4a = outputM4aFile.exists() && outputM4aFile.length() > 32L
                     }
                 }
+            }
+
+            if (isCancelled()) {
+                if (outputM4aFile.exists()) outputM4aFile.delete()
+                return AppendResult(success = false, finalFile = outputM4aFile, cancelled = true)
             }
 
             onProgress?.invoke(1.0f)
@@ -1590,8 +1828,13 @@ object WavFileTools {
             } else {
                 AppendResult(success = false, finalFile = outputM4aFile)
             }
+        } catch (_: java.util.concurrent.CancellationException) {
+            activeEncoder?.abortAndCleanup()
+            if (outputM4aFile.exists()) outputM4aFile.delete()
+            AppendResult(success = false, finalFile = outputM4aFile, cancelled = true)
         } catch (_: Exception) {
-            AppendResult(success = false, finalFile = outputM4aFile)
+            activeEncoder?.abortAndCleanup()
+            AppendResult(success = false, finalFile = outputM4aFile, cancelled = isCancelled())
         } finally {
             rawAacTemp.delete()
             stagingM4a.delete()
@@ -1607,8 +1850,10 @@ object WavFileTools {
         sampleRate: Int = 44100,
         channels: Int = 1,
         bitsPerSample: Int = 16,
-        onProgress: ((Float) -> Unit)? = null
+        onProgress: ((Float) -> Unit)? = null,
+        isCancelled: () -> Boolean = { false }
     ): AppendResult {
+        if (isCancelled()) return AppendResult(false, outputWavFile, cancelled = true)
         val validSources = sourceFiles.filter { it.exists() && it.length() > 0L }
         if (validSources.size < 2) return AppendResult(false, outputWavFile)
         val parentDir = outputWavFile.parentFile ?: File(".")
@@ -1627,8 +1872,10 @@ object WavFileTools {
 
             var writtenPcmBytes = 0L
             val totalFiles = validSources.size
+            val stagingBuf = ByteArray(STAGING_BUFFER_SIZE)
+            var channelScratch: ByteArray? = null
 
-            FileOutputStream(stagingFile).use { out ->
+            BufferedOutputStream(FileOutputStream(stagingFile), STAGING_BUFFER_SIZE).use { out ->
                 writeWavHeader(
                     out = out,
                     pcmDataBytes = 0L,
@@ -1636,8 +1883,10 @@ object WavFileTools {
                     channels = effCh,
                     bitsPerSample = effBits
                 )
-                val buf = ByteArray(16384)
                 for (i in 0 until totalFiles) {
+                    if (isCancelled()) {
+                        throw java.util.concurrent.CancellationException("WAV concat cancelled")
+                    }
                     val f = validSources[i]
                     val trkHeader = readWavHeaderInfo(f, effRate, effCh, effBits)
                     val trkBlockAlign = trkHeader.blockAlign.coerceAtLeast(2)
@@ -1646,32 +1895,63 @@ object WavFileTools {
                     val resampler = if (trkHeader.sampleRate != effRate) {
                         PcmResampler(trkHeader.sampleRate, effRate, effCh)
                     } else null
+                    val readCap = STAGING_BUFFER_SIZE - (STAGING_BUFFER_SIZE % trkBlockAlign)
 
                     RandomAccessFile(f, "r").use { raf ->
                         raf.seek(offset)
                         var rem = pcmLen
                         while (rem > 0L) {
-                            val toRead = minOf(buf.size.toLong(), rem).toInt()
-                            val r = raf.read(buf, 0, toRead)
+                            if (isCancelled()) {
+                                throw java.util.concurrent.CancellationException("WAV concat cancelled")
+                            }
+                            val toRead = minOf(readCap.toLong(), rem).toInt()
+                            val r = raf.read(stagingBuf, 0, toRead)
                             if (r <= 0) break
-                            val rawChunk = if (r == buf.size) buf else buf.copyOf(r)
-                            val chConverted = if (trkHeader.channels != effCh) {
-                                convertPcmChannels(rawChunk, trkHeader.channels, effCh)
+                            val alignedRead = r - (r % trkBlockAlign)
+                            if (alignedRead <= 0) break
+
+                            val chBuf: ByteArray
+                            val chLen: Int
+                            if (trkHeader.channels != effCh) {
+                                val (convBuf, convLen) = convertPcmChannelsInto(
+                                    pcmBytes = stagingBuf,
+                                    length = alignedRead,
+                                    srcChannels = trkHeader.channels,
+                                    targetChannels = effCh,
+                                    reusableOut = channelScratch
+                                )
+                                channelScratch = convBuf
+                                chBuf = convBuf
+                                chLen = convLen
                             } else {
-                                rawChunk
+                                chBuf = stagingBuf
+                                chLen = alignedRead
                             }
-                            val finalChunk = resampler?.resampleChunk(chConverted) ?: chConverted
-                            val alignedLen = finalChunk.size - (finalChunk.size % blockAlign)
-                            if (alignedLen > 0) {
-                                out.write(finalChunk, 0, alignedLen)
-                                writtenPcmBytes += alignedLen.toLong()
+                            if (resampler != null) {
+                                val (resBuf, resLen) = resampler.resampleChunkReusable(chBuf, chLen)
+                                val alignedLen = resLen - (resLen % blockAlign)
+                                if (alignedLen > 0) {
+                                    out.write(resBuf, 0, alignedLen)
+                                    writtenPcmBytes += alignedLen.toLong()
+                                }
+                            } else {
+                                val alignedLen = chLen - (chLen % blockAlign)
+                                if (alignedLen > 0) {
+                                    out.write(chBuf, 0, alignedLen)
+                                    writtenPcmBytes += alignedLen.toLong()
+                                }
                             }
-                            rem -= r.toLong()
+                            rem -= alignedRead.toLong()
                         }
                     }
                     onProgress?.invoke(((i + 1).toFloat() / totalFiles.toFloat()).coerceIn(0f, 0.95f))
                 }
                 out.flush()
+            }
+
+            if (isCancelled()) {
+                stagingFile.delete()
+                return AppendResult(false, outputWavFile, cancelled = true)
             }
 
             if (stagingFile.exists() && writtenPcmBytes > 0L) {
@@ -1695,9 +1975,12 @@ object WavFileTools {
                 stagingFile.delete()
                 AppendResult(false, outputWavFile)
             }
+        } catch (_: java.util.concurrent.CancellationException) {
+            stagingFile.delete()
+            AppendResult(false, outputWavFile, cancelled = true)
         } catch (_: Exception) {
             stagingFile.delete()
-            AppendResult(false, outputWavFile)
+            AppendResult(false, outputWavFile, cancelled = isCancelled())
         }
     }
 
@@ -1718,8 +2001,12 @@ object WavFileTools {
         fallbackSampleRate: Int = 44100,
         fallbackChannels: Int = 1,
         fallbackBitsPerSample: Int = 16,
-        onProgress: ((Float) -> Unit)? = null
+        onProgress: ((Float) -> Unit)? = null,
+        isCancelled: () -> Boolean = { false }
     ): AppendResult {
+        if (isCancelled()) {
+            return AppendResult(success = false, finalFile = file, cancelled = true)
+        }
         val parentDir = file.parentFile ?: File(".")
         val backupFile = File(parentDir, "${file.name}.bak")
         val mergedTmpFile = File(parentDir, "${file.name}.merged.tmp")
@@ -1741,6 +2028,9 @@ object WavFileTools {
 
         onProgress?.invoke(0.10f)
         val normalizedFile = repairCorruptedAudioFileIfNeeded(file)
+        if (isCancelled()) {
+            return AppendResult(success = false, finalFile = normalizedFile, cancelled = true)
+        }
         val isRiff = isRiffWaveFile(normalizedFile)
         val isM4a = !isRiff && (
             Mp4BoxParser.isMp4File(normalizedFile) ||
@@ -1753,8 +2043,12 @@ object WavFileTools {
                 corruptedFile = normalizedFile,
                 fallbackSampleRate = fallbackSampleRate,
                 fallbackChannels = fallbackChannels,
-                onProgress = onProgress
+                onProgress = onProgress,
+                isCancelled = isCancelled
             )
+            if (m4aRepairOutcome.cancelled || isCancelled()) {
+                return AppendResult(success = false, finalFile = normalizedFile, format = "M4A", mimeType = "audio/mp4", cancelled = true)
+            }
             if (m4aRepairOutcome.success) {
                 return AppendResult(
                     success = true,
@@ -1784,6 +2078,9 @@ object WavFileTools {
         return try {
             onProgress?.invoke(0.25f)
             val segments = scanAndUnpackCleanPcmSegments(normalizedFile, blockAlign)
+            if (isCancelled()) {
+                return AppendResult(success = false, finalFile = normalizedFile, cancelled = true)
+            }
             if (segments.isEmpty()) {
                 return AppendResult(success = false, finalFile = normalizedFile)
             }
@@ -1793,7 +2090,7 @@ object WavFileTools {
                 return AppendResult(success = false, finalFile = normalizedFile)
             }
 
-            FileOutputStream(stagingWav).use { fos ->
+            BufferedOutputStream(FileOutputStream(stagingWav), STAGING_BUFFER_SIZE).use { fos ->
                 writeWavHeader(
                     out = fos,
                     pcmDataBytes = totalAlignedPcmBytes,
@@ -1802,14 +2099,20 @@ object WavFileTools {
                     bitsPerSample = safeBits
                 )
                 RandomAccessFile(normalizedFile, "r").use { rafIn ->
-                    val buf = ByteArray(65536 - (65536 % blockAlign))
+                    val buf = ByteArray(STAGING_BUFFER_SIZE - (STAGING_BUFFER_SIZE % blockAlign))
                     var written = 0L
                     for ((segStart, rawLen) in segments) {
+                        if (isCancelled()) {
+                            throw java.util.concurrent.CancellationException("Repair cancelled")
+                        }
                         val alignedLen = (rawLen / blockAlign) * blockAlign
                         if (alignedLen <= 0L) continue
                         rafIn.seek(segStart)
                         var remaining = alignedLen
                         while (remaining > 0L) {
+                            if (isCancelled()) {
+                                throw java.util.concurrent.CancellationException("Repair cancelled")
+                            }
                             val toRead = minOf(buf.size.toLong(), remaining).toInt()
                             val r = rafIn.read(buf, 0, toRead)
                             if (r <= 0) break
@@ -1822,6 +2125,11 @@ object WavFileTools {
                     }
                 }
                 fos.flush()
+            }
+
+            if (isCancelled()) {
+                stagingWav.delete()
+                return AppendResult(success = false, finalFile = normalizedFile, cancelled = true)
             }
 
             val targetWav = File(parentDir, "${normalizedFile.nameWithoutExtension}.wav")
@@ -1881,9 +2189,12 @@ object WavFileTools {
                 if (stagingWav.exists()) stagingWav.delete()
                 AppendResult(success = false, finalFile = normalizedFile)
             }
+        } catch (_: java.util.concurrent.CancellationException) {
+            if (stagingWav.exists()) stagingWav.delete()
+            AppendResult(success = false, finalFile = normalizedFile, cancelled = true)
         } catch (_: Exception) {
             if (stagingWav.exists()) stagingWav.delete()
-            AppendResult(success = false, finalFile = normalizedFile)
+            AppendResult(success = false, finalFile = normalizedFile, cancelled = isCancelled())
         }
     }
 

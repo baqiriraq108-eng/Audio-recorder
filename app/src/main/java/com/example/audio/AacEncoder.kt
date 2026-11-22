@@ -4,9 +4,11 @@ import android.media.MediaCodec
 import android.media.MediaCodecInfo
 import android.media.MediaFormat
 import android.os.Build
+import java.io.BufferedOutputStream
 import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
+import java.io.OutputStream
 import java.io.RandomAccessFile
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
@@ -48,6 +50,26 @@ class AacEncoder(
 ) {
     companion object {
         const val AAC_FRAME_SAMPLES = 1024
+        const val STAGING_BUFFER_SIZE = 262_144
+        const val ACTIVE_STALL_WATCHDOG_MS = 15_000L
+        const val EOS_STALL_WATCHDOG_MS = 4_000L
+
+        /**
+         * Computes a safe byte slice size that strictly fits inside a hardware `MediaCodec`
+         * input buffer's dynamically reported capacity while preserving PCM [blockAlign] frame
+         * boundaries so no `BufferOverflowException` or sample-misalignment click can occur.
+         */
+        fun computeSafeMediaCodecSliceSize(
+            remainingBytes: Int,
+            bufferCapacity: Int,
+            blockAlign: Int
+        ): Int {
+            if (remainingBytes <= 0 || bufferCapacity <= 0) return 0
+            val safeAlign = blockAlign.coerceAtLeast(1)
+            val clamped = minOf(remainingBytes, bufferCapacity)
+            if (clamped < safeAlign) return clamped
+            return clamped - (clamped % safeAlign)
+        }
 
         /**
          * Inspects a base M4A file and creates an [AacEncoder] configured to match its exact
@@ -125,7 +147,7 @@ class AacEncoder(
     }
 
     private var mediaCodec: MediaCodec? = null
-    private var rawOutputStream: FileOutputStream? = null
+    private var rawOutputStream: BufferedOutputStream? = null
     private var rawAacTempFile: File? = null
     private val frameSizesList = ArrayList<Int>(2048)
     private var codecConfigBytes: ByteArray = Mp4BoxParser.buildAudioSpecificConfig(
@@ -144,6 +166,7 @@ class AacEncoder(
     private var consecutiveFailedFrames: Int = 0
     private val pcmCarryBuffer = ByteArray(AAC_FRAME_SAMPLES * 4)
     private var pcmCarryCount = 0
+    private var scratchOutputFrame = ByteArray(4096)
 
     val currentCumulativePtsUs: Long
         get() = computePresentationTimeUs(submittedPcmSamples) + cumulativePtsOffsetUs
@@ -193,7 +216,7 @@ class AacEncoder(
         rawAccessUnitsFile.parentFile?.mkdirs()
         if (rawAccessUnitsFile.exists()) rawAccessUnitsFile.delete()
         rawAacTempFile = rawAccessUnitsFile
-        rawOutputStream = FileOutputStream(rawAccessUnitsFile)
+        rawOutputStream = BufferedOutputStream(FileOutputStream(rawAccessUnitsFile), 131_072)
         frameSizesList.clear()
         submittedPcmSamples = 0L
         cumulativePtsOffsetUs = 0L
@@ -284,6 +307,9 @@ class AacEncoder(
         var offset = 0
 
         while (offset < length) {
+            if (cancellationCheck?.invoke() == true) {
+                throw java.util.concurrent.CancellationException("AAC encoding cancelled")
+            }
             val needed = bytesPerFrame - pcmCarryCount
             val toCopy = minOf(needed, length - offset)
             System.arraycopy(pcmBytes, offset, pcmCarryBuffer, pcmCarryCount, toCopy)
@@ -301,46 +327,64 @@ class AacEncoder(
         if (cancellationCheck?.invoke() == true) {
             throw java.util.concurrent.CancellationException("AAC encoding cancelled")
         }
-        val rawPtsUs = computePresentationTimeUs(submittedPcmSamples) + cumulativePtsOffsetUs
-        val monotonicPtsUs = if (rawPtsUs <= lastQueuedPtsUs) lastQueuedPtsUs + 1L else rawPtsUs
-        lastQueuedPtsUs = monotonicPtsUs
+        val bytesPerSampleFrame = (channelCount * 2).coerceAtLeast(2)
 
         val codec = mediaCodec
         if (codec != null && !useFallbackPacketizer) {
-            var queued = false
-            var retries = 0
-            while (!queued && retries < 30) {
+            var subOffset = 0
+            var lastProgressWallMs = System.currentTimeMillis()
+            while (subOffset < byteLength) {
                 if (cancellationCheck?.invoke() == true) {
                     throw java.util.concurrent.CancellationException("AAC encoding cancelled")
                 }
-                val inputIndex = codec.dequeueInputBuffer(5_000L)
+                var inputIndex = codec.dequeueInputBuffer(0L)
+                if (inputIndex < 0) {
+                    if (drainEncoderOutput(eos = false, waitTimeoutUs = 0L)) {
+                        lastProgressWallMs = System.currentTimeMillis()
+                    }
+                    inputIndex = codec.dequeueInputBuffer(1_000L)
+                }
                 if (inputIndex >= 0) {
                     val inputBuffer = codec.getInputBuffer(inputIndex)
                     if (inputBuffer != null) {
                         inputBuffer.clear()
-                        val cap = minOf(byteLength, inputBuffer.remaining())
-                        inputBuffer.put(frameBytes, 0, cap)
-                        codec.queueInputBuffer(inputIndex, 0, cap, monotonicPtsUs, 0)
-                        submittedPcmSamples += AAC_FRAME_SAMPLES.toLong()
-                        consecutiveFailedFrames = 0
-                        queued = true
-                    } else {
-                        retries++
+                        val remainingInFrame = byteLength - subOffset
+                        val sliceLen = computeSafeMediaCodecSliceSize(
+                            remainingBytes = remainingInFrame,
+                            bufferCapacity = inputBuffer.remaining(),
+                            blockAlign = bytesPerSampleFrame
+                        )
+                        if (sliceLen > 0) {
+                            val rawPtsUs = computePresentationTimeUs(submittedPcmSamples) + cumulativePtsOffsetUs
+                            val monotonicPtsUs = if (rawPtsUs <= lastQueuedPtsUs) lastQueuedPtsUs + 1L else rawPtsUs
+                            lastQueuedPtsUs = monotonicPtsUs
+
+                            inputBuffer.put(frameBytes, subOffset, sliceLen)
+                            codec.queueInputBuffer(inputIndex, 0, sliceLen, monotonicPtsUs, 0)
+                            submittedPcmSamples += (sliceLen / bytesPerSampleFrame).toLong()
+                            subOffset += sliceLen
+                            consecutiveFailedFrames = 0
+                            lastProgressWallMs = System.currentTimeMillis()
+                            drainEncoderOutput(eos = false, waitTimeoutUs = 0L)
+                            continue
+                        }
                     }
+                }
+                val drained = drainEncoderOutput(eos = false, waitTimeoutUs = 1_000L)
+                if (drained) {
+                    lastProgressWallMs = System.currentTimeMillis()
                 } else {
-                    // Drain with a brief wait timeout so queued output buffers release input slots cleanly
-                    drainEncoderOutput(eos = false, waitTimeoutUs = 5_000L)
-                    retries++
+                    val stalledMs = System.currentTimeMillis() - lastProgressWallMs
+                    if (stalledMs > ACTIVE_STALL_WATCHDOG_MS) {
+                        consecutiveFailedFrames++
+                        throw IllegalStateException("AAC MediaCodec stalled for ${stalledMs}ms while queuing PCM input frames.")
+                    }
                 }
             }
-            if (!queued) {
-                consecutiveFailedFrames++
-                if (consecutiveFailedFrames >= 3) {
-                    throw IllegalStateException("AAC MediaCodec stalled while queuing PCM input frames.")
-                }
-            }
-            drainEncoderOutput(eos = false, waitTimeoutUs = 0L)
         } else {
+            val rawPtsUs = computePresentationTimeUs(submittedPcmSamples) + cumulativePtsOffsetUs
+            val monotonicPtsUs = if (rawPtsUs <= lastQueuedPtsUs) lastQueuedPtsUs + 1L else rawPtsUs
+            lastQueuedPtsUs = monotonicPtsUs
             // Deterministic AAC-LC access unit packetizer for JVM/Robolectric test environments
             writeFallbackAccessUnit(frameBytes, byteLength)
             submittedPcmSamples += AAC_FRAME_SAMPLES.toLong()
@@ -368,19 +412,20 @@ class AacEncoder(
         }
     }
 
-    private fun drainEncoderOutput(eos: Boolean, waitTimeoutUs: Long = if (eos) 10_000L else 0L) {
-        val codec = mediaCodec ?: return
-        val outStream = rawOutputStream ?: return
+    private fun drainEncoderOutput(eos: Boolean, waitTimeoutUs: Long = if (eos) 2_000L else 0L): Boolean {
+        val codec = mediaCodec ?: return false
+        val outStream = rawOutputStream ?: return false
         val bufferInfo = MediaCodec.BufferInfo()
+        var anyProgress = false
 
         if (eos) {
             var eosQueued = false
-            var eosRetries = 0
-            while (!eosQueued && eosRetries < 30) {
+            var lastEosProgressMs = System.currentTimeMillis()
+            while (!eosQueued) {
                 if (cancellationCheck?.invoke() == true) {
                     throw java.util.concurrent.CancellationException("AAC encoding cancelled during EOS")
                 }
-                val inputIndex = codec.dequeueInputBuffer(5_000L)
+                val inputIndex = codec.dequeueInputBuffer(1_000L)
                 if (inputIndex >= 0) {
                     val rawPtsUs = computePresentationTimeUs(submittedPcmSamples) + cumulativePtsOffsetUs
                     val eosPtsUs = if (rawPtsUs <= lastQueuedPtsUs) lastQueuedPtsUs + 1L else rawPtsUs
@@ -392,34 +437,37 @@ class AacEncoder(
                         MediaCodec.BUFFER_FLAG_END_OF_STREAM
                     )
                     eosQueued = true
+                    anyProgress = true
                 } else {
-                    val outIdx = codec.dequeueOutputBuffer(bufferInfo, 5_000L)
+                    val outIdx = codec.dequeueOutputBuffer(bufferInfo, 1_000L)
                     if (outIdx >= 0) {
                         processOutputBuffer(codec, outIdx, bufferInfo, outStream)
+                        lastEosProgressMs = System.currentTimeMillis()
+                        anyProgress = true
+                    } else if (System.currentTimeMillis() - lastEosProgressMs > EOS_STALL_WATCHDOG_MS) {
+                        break
                     }
-                    eosRetries++
                 }
             }
         }
 
-        var emptyLoops = 0
+        var lastDrainProgressMs = System.currentTimeMillis()
         var totalDrainIterations = 0
-        val maxDrainIterations = if (eos) 400 else 64
+        val maxDrainIterations = if (eos) 2000 else 64
         while (totalDrainIterations < maxDrainIterations) {
             totalDrainIterations++
             if (cancellationCheck?.invoke() == true) {
                 throw java.util.concurrent.CancellationException("AAC output drain cancelled")
             }
-            val outIndex = codec.dequeueOutputBuffer(bufferInfo, waitTimeoutUs)
+            val effectiveWaitUs = if (totalDrainIterations == 1) waitTimeoutUs else if (eos) 1_000L else 0L
+            val outIndex = codec.dequeueOutputBuffer(bufferInfo, effectiveWaitUs)
             if (outIndex >= 0) {
                 val isStreamEos = processOutputBuffer(codec, outIndex, bufferInfo, outStream)
-                if (isStreamEos) break
-                if (bufferInfo.size > 0) {
-                    emptyLoops = 0
-                } else {
-                    emptyLoops++
-                    if (emptyLoops > 20) break
+                if (bufferInfo.size > 0 || isStreamEos) {
+                    lastDrainProgressMs = System.currentTimeMillis()
+                    anyProgress = true
                 }
+                if (isStreamEos) break
             } else if (outIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
                 val newFormat = codec.outputFormat
                 val csd0 = newFormat.getByteBuffer("csd-0")?.duplicate()
@@ -428,23 +476,25 @@ class AacEncoder(
                     csd0.get(cfg)
                     updateCodecConfigIfNeeded(cfg)
                 }
-                emptyLoops++
-                if (emptyLoops > 10) break
+                lastDrainProgressMs = System.currentTimeMillis()
+                anyProgress = true
             } else if (outIndex == MediaCodec.INFO_TRY_AGAIN_LATER) {
                 if (!eos) break
-                emptyLoops++
-                if (emptyLoops > 35) break
+                if (System.currentTimeMillis() - lastDrainProgressMs > EOS_STALL_WATCHDOG_MS) {
+                    break
+                }
             } else {
                 break
             }
         }
+        return anyProgress
     }
 
     private fun processOutputBuffer(
         codec: MediaCodec,
         outIndex: Int,
         bufferInfo: MediaCodec.BufferInfo,
-        outStream: FileOutputStream
+        outStream: OutputStream
     ): Boolean {
         val outBuf = codec.getOutputBuffer(outIndex)
         val isCodecConfig = (bufferInfo.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0
@@ -459,21 +509,24 @@ class AacEncoder(
                 updateCodecConfigIfNeeded(cfg)
             }
         } else if (outBuf != null && bufferInfo.size > 0) {
+            val frameLen = bufferInfo.size
+            if (scratchOutputFrame.size < frameLen) {
+                scratchOutputFrame = ByteArray(maxOf(frameLen, scratchOutputFrame.size * 2))
+            }
             outBuf.position(bufferInfo.offset)
-            outBuf.limit(bufferInfo.offset + bufferInfo.size)
-            val rawFrame = ByteArray(bufferInfo.size)
-            outBuf.get(rawFrame)
+            outBuf.limit(bufferInfo.offset + frameLen)
+            outBuf.get(scratchOutputFrame, 0, frameLen)
 
-            // Strip ADTS 7-byte or 9-byte header if any hardware encoder prepends it,
-            // keeping strictly raw AAC access units for MP4 mdat
-            val cleanAccessUnit = stripAdtsHeaderIfPresent(rawFrame)
-            if (cleanAccessUnit.isNotEmpty()) {
+            // Strip ADTS 7-byte or 9-byte header in-place via offset arithmetic (zero per-frame allocation)
+            val adtsOffset = detectAdtsHeaderLength(scratchOutputFrame, frameLen)
+            val cleanLen = frameLen - adtsOffset
+            if (cleanLen > 0) {
                 if (primingFramesRemainingToSkip > 0) {
                     primingFramesRemainingToSkip--
                     totalPrimingFramesSkipped++
                 } else {
-                    outStream.write(cleanAccessUnit)
-                    frameSizesList.add(cleanAccessUnit.size)
+                    outStream.write(scratchOutputFrame, adtsOffset, cleanLen)
+                    frameSizesList.add(cleanLen)
                 }
             }
         }
@@ -483,18 +536,18 @@ class AacEncoder(
         return isStreamEos
     }
 
-    private fun stripAdtsHeaderIfPresent(frame: ByteArray): ByteArray {
-        if (frame.size > 7 &&
+    private fun detectAdtsHeaderLength(frame: ByteArray, length: Int): Int {
+        if (length > 7 &&
             (frame[0].toInt() and 0xFF) == 0xFF &&
             (frame[1].toInt() and 0xF0) == 0xF0
         ) {
             val protectionAbsent = frame[1].toInt() and 0x01
             val headerLen = if (protectionAbsent == 1) 7 else 9
-            if (frame.size > headerLen) {
-                return frame.copyOfRange(headerLen, frame.size)
+            if (length > headerLen) {
+                return headerLen
             }
         }
-        return frame
+        return 0
     }
 
     private fun writeFallbackAccessUnit(frameBytes: ByteArray, byteLength: Int) {
@@ -506,15 +559,15 @@ class AacEncoder(
         }
         // Compact deterministic AAC-LC raw frame representation (~160-240 bytes per 1024-sample frame)
         val targetSize = (160 + (byteLength % 64)).coerceAtLeast(64)
-        val unit = ByteArray(targetSize)
-        unit[0] = if (channelCount == 2) 0x21.toByte() else 0x01.toByte()
-        val copyLen = minOf(byteLength, targetSize - 2)
-        for (i in 0 until copyLen) {
-            unit[i + 1] = frameBytes[i]
+        if (scratchOutputFrame.size < targetSize) {
+            scratchOutputFrame = ByteArray(targetSize)
         }
-        unit[targetSize - 1] = 0x07.toByte() // AAC raw_data_block END element syntactic tag (ID_END = 7)
-        outStream.write(unit)
-        frameSizesList.add(unit.size)
+        scratchOutputFrame[0] = if (channelCount == 2) 0x21.toByte() else 0x01.toByte()
+        val copyLen = minOf(byteLength, targetSize - 2)
+        System.arraycopy(frameBytes, 0, scratchOutputFrame, 1, copyLen)
+        scratchOutputFrame[targetSize - 1] = 0x07.toByte() // AAC raw_data_block END element syntactic tag (ID_END = 7)
+        outStream.write(scratchOutputFrame, 0, targetSize)
+        frameSizesList.add(targetSize)
     }
 
     /**
@@ -522,6 +575,10 @@ class AacEncoder(
      * and returns the [EncodedAacSegment] containing the raw AAC access units and per-frame byte sizes.
      */
     fun finish(): EncodedAacSegment {
+        if (cancellationCheck?.invoke() == true) {
+            abortAndCleanup()
+            throw java.util.concurrent.CancellationException("AAC encoding cancelled before finish")
+        }
         if (!isStarted) {
             val emptyFile = rawAacTempFile ?: File("empty.aac")
             return EncodedAacSegment(
@@ -549,6 +606,9 @@ class AacEncoder(
 
         try {
             drainEncoderOutput(eos = true)
+        } catch (e: java.util.concurrent.CancellationException) {
+            abortAndCleanup()
+            throw e
         } catch (_: Exception) {}
 
         try {
@@ -630,11 +690,11 @@ class AacEncoder(
                     forceCo64 = force64BitOffsets || chunkOffset > 0xFFFFFFFFL
                 )
 
-                FileOutputStream(tempOut).use { fos ->
+                val copyBuf = ByteArray(STAGING_BUFFER_SIZE)
+                BufferedOutputStream(FileOutputStream(tempOut), STAGING_BUFFER_SIZE).use { fos ->
                     fos.write(ftypBytes)
                     fos.write(mdatHeaderBytes)
                     FileInputStream(segment.rawAacFile).use { fis ->
-                        val copyBuf = ByteArray(65536)
                         while (true) {
                             if (isCancelled?.invoke() == true) {
                                 throw java.util.concurrent.CancellationException("M4A write cancelled")
@@ -671,12 +731,12 @@ class AacEncoder(
                     forceCo64 = force64BitOffsets || chunkOffset > 0xFFFFFFFFL
                 )
 
-                FileOutputStream(tempOut).use { fos ->
+                val copyBuf = ByteArray(STAGING_BUFFER_SIZE)
+                BufferedOutputStream(FileOutputStream(tempOut), STAGING_BUFFER_SIZE).use { fos ->
                     fos.write(ftypBytes)
                     fos.write(finalMoov)
                     fos.write(mdatHeaderBytes)
                     FileInputStream(segment.rawAacFile).use { fis ->
-                        val copyBuf = ByteArray(65536)
                         while (true) {
                             if (isCancelled?.invoke() == true) {
                                 throw java.util.concurrent.CancellationException("M4A write cancelled")
@@ -753,8 +813,10 @@ class AacEncoder(
             start(rawAacOutputFile, isCancelled = isCancelled)
             RandomAccessFile(wavFile, "r").use { raf ->
                 raf.seek(pcmOffset)
-                val alignedBufSize = 16384 - (16384 % srcBlockAlign)
-                val buf = ByteArray(alignedBufSize)
+                // Single reusable 256 KB staging buffer allocated upfront (zero per-iteration GC churn)
+                val alignedBufSize = STAGING_BUFFER_SIZE - (STAGING_BUFFER_SIZE % srcBlockAlign)
+                val stagingBuf = ByteArray(alignedBufSize)
+                var channelScratch: ByteArray? = null
                 var remaining = totalPcmBytes
                 var readTotal = 0L
                 while (remaining > 0L) {
@@ -762,20 +824,37 @@ class AacEncoder(
                         abortAndCleanup()
                         return null
                     }
-                    val toRead = minOf(buf.size.toLong(), remaining).toInt()
-                    val r = raf.read(buf, 0, toRead)
+                    val toRead = minOf(stagingBuf.size.toLong(), remaining).toInt()
+                    val r = raf.read(stagingBuf, 0, toRead)
                     if (r <= 0) break
                     val alignedRead = r - (r % srcBlockAlign)
                     if (alignedRead <= 0) break
-                    val rawChunk = if (alignedRead == buf.size) buf else buf.copyOf(alignedRead)
-                    val chConverted = if (srcChannels != channelCount) {
-                        WavFileTools.convertPcmChannels(rawChunk, srcChannels, channelCount)
+
+                    val chBuf: ByteArray
+                    val chLen: Int
+                    if (srcChannels != channelCount) {
+                        val (convertedBuf, convertedLen) = WavFileTools.convertPcmChannelsInto(
+                            pcmBytes = stagingBuf,
+                            length = alignedRead,
+                            srcChannels = srcChannels,
+                            targetChannels = channelCount,
+                            reusableOut = channelScratch
+                        )
+                        channelScratch = convertedBuf
+                        chBuf = convertedBuf
+                        chLen = convertedLen
                     } else {
-                        rawChunk
+                        chBuf = stagingBuf
+                        chLen = alignedRead
                     }
-                    val finalChunk = resampler?.resampleChunk(chConverted) ?: chConverted
-                    if (finalChunk.isNotEmpty()) {
-                        encodePcmBytes(finalChunk, finalChunk.size)
+
+                    if (resampler != null) {
+                        val (resampledBuf, resampledLen) = resampler.resampleChunkReusable(chBuf, chLen)
+                        if (resampledLen > 0) {
+                            encodePcmBytes(resampledBuf, resampledLen)
+                        }
+                    } else if (chLen > 0) {
+                        encodePcmBytes(chBuf, chLen)
                     }
                     remaining -= alignedRead.toLong()
                     readTotal += alignedRead.toLong()

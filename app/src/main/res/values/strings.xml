@@ -52,4 +52,8 @@
     <string name="merge_cancelling_badge">Undoing</string>
     <string name="library_tab_merging">Merging</string>
     <string name="library_tab_reverting">Reverting</string>
+    <string name="cancel_merge_dialog_title">Cancel merging?</string>
+    <string name="cancel_merge_dialog_message">Your original recording will stay untouched, and the newly recorded segment will be saved separately so nothing is lost.</string>
+    <string name="cancel_merge_abort_action">Abort Merge &amp; Save Separately</string>
+    <string name="cancel_merge_continue_action">Continue Merging</string>
 </resources>

@@ -37,6 +37,7 @@ import androidx.compose.material.icons.filled.RadioButtonUnchecked
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Save
 import androidx.compose.material.icons.filled.Transform
+import androidx.compose.material.icons.filled.WarningAmber
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -67,12 +68,14 @@ import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.graphics.vector.path
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
+import com.example.R
 import com.example.data.AudioFormatOption
 import com.example.data.AudioFormatUtils
 import com.example.data.RecordingEntity
@@ -1685,6 +1688,131 @@ fun UnifiedTrashConfirmDialog(
                             color = PrimaryText,
                             maxLines = 1,
                             overflow = TextOverflow.Ellipsis
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun CancelMergeConfirmDialog(
+    onAbortMerge: () -> Unit,
+    onContinueMerging: () -> Unit
+) {
+    val title = stringResource(R.string.cancel_merge_dialog_title)
+    val message = stringResource(R.string.cancel_merge_dialog_message)
+    val abortLabel = stringResource(R.string.cancel_merge_abort_action)
+    val continueLabel = stringResource(R.string.cancel_merge_continue_action)
+
+    Dialog(
+        onDismissRequest = onContinueMerging,
+        properties = DialogProperties(usePlatformDefaultWidth = false)
+    ) {
+        Surface(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 24.dp)
+                .clip(RoundedCornerShape(24.dp))
+                .testTag("cancel_merge_confirm_dialog"),
+            color = WarmSecondarySurface,
+            shape = RoundedCornerShape(24.dp),
+            tonalElevation = 0.dp
+        ) {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 24.dp, vertical = 22.dp),
+                horizontalAlignment = Alignment.CenterHorizontally
+            ) {
+                Box(
+                    contentAlignment = Alignment.Center,
+                    modifier = Modifier
+                        .size(48.dp)
+                        .clip(CircleShape)
+                        .background(ElevatedSurface)
+                        .border(1.dp, OutlineWarm, CircleShape)
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.WarningAmber,
+                        contentDescription = title,
+                        tint = PeachAccent,
+                        modifier = Modifier.size(26.dp)
+                    )
+                }
+
+                Spacer(modifier = Modifier.height(14.dp))
+
+                Text(
+                    text = title,
+                    style = MaterialTheme.typography.titleLarge.copy(
+                        fontWeight = FontWeight.Bold,
+                        fontSize = 20.sp
+                    ),
+                    color = PrimaryText,
+                    textAlign = TextAlign.Center
+                )
+
+                Spacer(modifier = Modifier.height(10.dp))
+
+                Text(
+                    text = message,
+                    style = MaterialTheme.typography.bodyMedium.copy(
+                        fontSize = 14.sp,
+                        lineHeight = 20.sp
+                    ),
+                    color = SecondaryText,
+                    textAlign = TextAlign.Center
+                )
+
+                Spacer(modifier = Modifier.height(22.dp))
+
+                Column(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    Box(
+                        contentAlignment = Alignment.Center,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(48.dp)
+                            .clip(CircleShape)
+                            .background(PeachAccent)
+                            .m3PressScale(
+                                shape = CircleShape,
+                                onClick = onAbortMerge
+                            )
+                            .padding(horizontal = 16.dp)
+                            .testTag("cancel_merge_abort_button")
+                    ) {
+                        AutoSizingActionButtonText(
+                            text = abortLabel,
+                            color = OnPeachAccent,
+                            initialFontSizeSp = 15f,
+                            minFontSizeSp = 12f
+                        )
+                    }
+
+                    Box(
+                        contentAlignment = Alignment.Center,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(48.dp)
+                            .clip(CircleShape)
+                            .background(TonalDarkBrown)
+                            .m3PressScale(
+                                shape = CircleShape,
+                                onClick = onContinueMerging
+                            )
+                            .padding(horizontal = 16.dp)
+                            .testTag("cancel_merge_continue_button")
+                    ) {
+                        AutoSizingActionButtonText(
+                            text = continueLabel,
+                            color = PrimaryText,
+                            initialFontSizeSp = 15f,
+                            minFontSizeSp = 12f
                         )
                     }
                 }

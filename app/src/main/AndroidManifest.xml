@@ -29,6 +29,7 @@
     </queries>
 
     <application
+        android:name=".AudioRecorderApplication"
         android:allowBackup="true"
         android:dataExtractionRules="@xml/data_extraction_rules"
         android:fullBackupContent="@xml/backup_rules"
@@ -56,6 +57,7 @@
             android:name=".service.RecordingForegroundService"
             android:enabled="true"
             android:exported="false"
+            android:stopWithTask="false"
             android:foregroundServiceType="microphone|mediaPlayback" />
 
         <provider

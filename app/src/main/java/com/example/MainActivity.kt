@@ -79,6 +79,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
+import com.example.ui.components.CancelMergeConfirmDialog
 import com.example.ui.components.ExportWithoutSilenceDialog
 import com.example.ui.components.FormatConversionSheet
 import com.example.ui.components.PostRecordingSaveSheet
@@ -110,7 +111,11 @@ class MainActivity : ComponentActivity() {
         enableEdgeToEdge()
         configureMaxRefreshRate()
         setContent {
-            val recorderViewModel: RecorderViewModel = viewModel()
+            val sharedViewModelStoreOwner = (application as? androidx.lifecycle.ViewModelStoreOwner) ?: this
+            val recorderViewModel: RecorderViewModel = viewModel(
+                viewModelStoreOwner = sharedViewModelStoreOwner,
+                factory = androidx.lifecycle.ViewModelProvider.AndroidViewModelFactory.getInstance(application)
+            )
 
             LaunchedEffect(latestIntentAction) {
                 when (latestIntentAction) {
@@ -147,9 +152,16 @@ class MainActivity : ComponentActivity() {
 
     override fun onStop() {
         if (!isChangingConfigurations) {
-            com.example.service.RecordingIslandOverlayManager.onAppForegroundChanged(this, false)
+            com.example.service.RecordingIslandOverlayManager.onAppForegroundChanged(applicationContext, false)
         }
         super.onStop()
+    }
+
+    override fun onDestroy() {
+        if (!isChangingConfigurations) {
+            com.example.service.RecordingIslandOverlayManager.onAppForegroundChanged(applicationContext, false)
+        }
+        super.onDestroy()
     }
 
     override fun onNewIntent(intent: android.content.Intent) {
@@ -196,6 +208,7 @@ fun AudioRecorderStudioApp(viewModel: RecorderViewModel) {
     val pendingDriveConsent by viewModel.pendingDriveConsent.collectAsStateWithLifecycle()
     val pendingDriveActivityIntent by viewModel.pendingDriveActivityIntent.collectAsStateWithLifecycle()
     val pendingDriveFolderPicker by viewModel.pendingDriveFolderPicker.collectAsStateWithLifecycle()
+    val showCancelMergeConfirmDialog by viewModel.showCancelMergeConfirmDialog.collectAsStateWithLifecycle()
 
     val snackbarHostState = remember { SnackbarHostState() }
 
@@ -444,6 +457,14 @@ fun AudioRecorderStudioApp(viewModel: RecorderViewModel) {
             onCancel = { viewModel.cancelFormatConversion() }
         )
     }
+
+    // Native Confirmation Dialog for aborting an active audio merge from Recorder or Library
+    if (showCancelMergeConfirmDialog) {
+        CancelMergeConfirmDialog(
+            onAbortMerge = { viewModel.confirmCancelActiveMerge() },
+            onContinueMerging = { viewModel.dismissCancelMergeConfirmation() }
+        )
+    }
 }
 
 @Composable
@@ -501,7 +522,7 @@ private fun RecorderDestination(
         appendTarget = appendTarget,
         mergeProgress = mergeProgress,
         isMergeCancelling = isMergeCancelling,
-        onCancelMerge = { viewModel.cancelActiveMerge() },
+        onCancelMerge = { viewModel.requestCancelMergeConfirmation() },
         activeAudioDeviceName = activeAudioDeviceName,
         isConnectingBluetoothMic = isConnectingBluetoothMic,
         onStartRecording = { viewModel.startRecording() },
@@ -573,6 +594,7 @@ private fun LibraryDestination(viewModel: RecorderViewModel) {
         mergeProgress = mergeProgress,
         mergeTargetStorage = mergeTargetStorage,
         isMergeCancelling = isMergeCancelling,
+        onRequestCancelMerge = { viewModel.requestCancelMergeConfirmation() },
         onSelectStorageTab = { viewModel.selectLibraryStorageTab(it) },
         onSearchQueryChange = { viewModel.updateSearchQuery(it) },
         onSelectFilter = { viewModel.selectFilterChip(it) },
