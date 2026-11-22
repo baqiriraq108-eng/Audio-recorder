@@ -3270,12 +3270,235 @@ class ExampleRobolectricTest {
 
         secondController.pause().stop().destroy()
     }
+
+    @Test
+    fun `verify Greek Save and Reject notification broadcasts complete and clear UI after task removal`() {
+        val app = ApplicationProvider.getApplicationContext<android.app.Application>()
+        RecordingIslandOverlayManager.dismissAndReset()
+
+        val vm = com.example.viewmodel.RecorderViewModel(app)
+        val serviceController = Robolectric.buildService(RecordingForegroundService::class.java).create()
+        val service = serviceController.get()
+        val nm = app.getSystemService(Context.NOTIFICATION_SERVICE) as android.app.NotificationManager
+        val shadowNm = Shadows.shadowOf(nm)
+
+        try {
+            // 1. Start recording + simulate UI task removal while recording
+            vm.startRecording()
+            service.onStartCommand(
+                Intent(app, RecordingForegroundService::class.java).apply {
+                    action = RecordingForegroundService.ACTION_START_FOREGROUND
+                    putExtra(RecordingForegroundService.EXTRA_TITLE, "Recording")
+                },
+                0,
+                101
+            )
+            RecordingIslandOverlayManager.onAppForegroundChanged(app, false)
+            service.onTaskRemoved(Intent(Intent.ACTION_MAIN))
+
+            // 2. Tap Stop & Save -> enters Greek Θ Don't / Σ Save confirmation in both Notification & Dynamic Island
+            val receiver = com.example.service.RecordingNotificationActionReceiver()
+            receiver.onReceive(
+                app,
+                Intent(app, com.example.service.RecordingNotificationActionReceiver::class.java).apply {
+                    action = RecordingForegroundService.ACTION_NOTIFICATION_STOP_SAVE
+                }
+            )
+            Shadows.shadowOf(android.os.Looper.getMainLooper()).idle()
+
+            assertTrue("Dialog state must reflect pending Greek confirmation", vm.showAppendSaveConfirmDialog.value)
+            assertTrue("Dynamic Island must show Greek confirmation", RecordingIslandOverlayManager.lastIsShowingAppendConfirm)
+            val confirmNotif = shadowNm.getNotification(RecordingForegroundService.NOTIFICATION_ID)
+            org.junit.Assert.assertNotNull(confirmNotif)
+            assertEquals(2, confirmNotif.actions.size)
+
+            // 3. Tap Θ Don't via BroadcastReceiver -> must clear both Notification & Dynamic Island and reset to READY
+            receiver.onReceive(
+                app,
+                Intent(app, com.example.service.RecordingNotificationActionReceiver::class.java).apply {
+                    action = RecordingForegroundService.ACTION_NOTIFICATION_CANCEL_APPEND_SAVE
+                }
+            )
+            Shadows.shadowOf(android.os.Looper.getMainLooper()).idle()
+
+            assertFalse("Confirmation dialog must close after Θ Don't", vm.showAppendSaveConfirmDialog.value)
+            assertFalse("Dynamic Island must dismiss Greek confirmation after Θ Don't", RecordingIslandOverlayManager.lastIsShowingAppendConfirm)
+            assertEquals(com.example.data.RecordingStatus.READY, vm.recordingStatus.value)
+            org.junit.Assert.assertNull(
+                "Ongoing notification must be removed after Θ Don't",
+                shadowNm.getNotification(RecordingForegroundService.NOTIFICATION_ID)
+            )
+
+            // 4. Start another recording -> pause -> swipe app away -> show Greek confirmation -> tap Σ Save via BroadcastReceiver
+            vm.startRecording()
+            vm.pauseRecording()
+            service.onStartCommand(
+                Intent(app, RecordingForegroundService::class.java).apply {
+                    action = RecordingForegroundService.ACTION_START_FOREGROUND
+                    putExtra(RecordingForegroundService.EXTRA_TITLE, "Recording")
+                    putExtra(RecordingForegroundService.EXTRA_IS_PAUSED, true)
+                },
+                0,
+                102
+            )
+            RecordingIslandOverlayManager.onAppForegroundChanged(app, false)
+            service.onTaskRemoved(Intent(Intent.ACTION_MAIN))
+
+            receiver.onReceive(
+                app,
+                Intent(app, com.example.service.RecordingNotificationActionReceiver::class.java).apply {
+                    action = RecordingForegroundService.ACTION_NOTIFICATION_STOP_SAVE
+                }
+            )
+            Shadows.shadowOf(android.os.Looper.getMainLooper()).idle()
+            assertTrue(RecordingIslandOverlayManager.lastIsShowingAppendConfirm)
+
+            // Trigger Σ Save broadcast -> immediately enters Saving state with 0 action buttons (Greek buttons vanish!)
+            service.showSavingInProgressState()
+            val savingNotif = shadowNm.getNotification(RecordingForegroundService.NOTIFICATION_ID)
+            org.junit.Assert.assertNotNull("Saving progress notification must replace Greek confirmation", savingNotif)
+            assertEquals("Greek buttons must be removed immediately while saving", 0, savingNotif.actions?.size ?: 0)
+            assertTrue("Dynamic Island must show saving progress", RecordingIslandOverlayManager.lastIsShowingSavingProgress)
+            assertFalse("Dynamic Island Greek confirmation flag must clear immediately", RecordingIslandOverlayManager.lastIsShowingAppendConfirm)
+
+            // Simulate background thread completion calling showFinishedSavedConfirmation -> posts Finished recording on main thread
+            val workerDone = java.util.concurrent.CountDownLatch(1)
+            Thread {
+                service.showFinishedSavedConfirmation("Finished recording")
+                workerDone.countDown()
+            }.start()
+            workerDone.await(2, java.util.concurrent.TimeUnit.SECONDS)
+            Shadows.shadowOf(android.os.Looper.getMainLooper()).idle()
+
+            assertTrue("Dynamic Island must display finished completion state", RecordingIslandOverlayManager.lastIsShowingFinishedCompletion)
+            assertFalse("Dynamic Island saving progress flag must clear on finish", RecordingIslandOverlayManager.lastIsShowingSavingProgress)
+            val finishedNotif = shadowNm.getNotification(RecordingForegroundService.NOTIFICATION_ID)
+            org.junit.Assert.assertNotNull("Finished recording notification must persist on NOTIFICATION_ID", finishedNotif)
+            assertEquals(
+                "Finished recording",
+                finishedNotif.extras.getCharSequence(android.app.Notification.EXTRA_TITLE)?.toString()
+            )
+        } finally {
+            RecordingIslandOverlayManager.dismissAndReset()
+            vm.resetActiveRecording()
+        }
+    }
+
+    @Test
+    fun `verify player supports minimizing and returning to Main Recorder screen without stopping session`() {
+        val app = ApplicationProvider.getApplicationContext<android.app.Application>()
+        val vm = com.example.viewmodel.RecorderViewModel(app)
+        val tempFile = File(app.cacheDir, "player_minimize_test.wav")
+        WavFileTools.createStudioSampleAudioFile(
+            outputFile = tempFile,
+            durationSeconds = 2,
+            sampleRate = 22050
+        )
+        val entity = com.example.data.RecordingEntity(
+            id = 919L,
+            title = "Return Home Playback",
+            filePath = tempFile.absolutePath,
+            durationMs = 2000L,
+            format = "WAV",
+            sampleRate = 22050,
+            bitDepth = 16,
+            channels = 1,
+            bitrate = 352800,
+            sizeBytes = tempFile.length()
+        )
+
+        try {
+            vm.navigateTo(com.example.viewmodel.AppDestination.LIBRARY)
+            vm.openSavedRecordingPlayer(entity, autoPlay = false)
+
+            assertEquals(entity.id, vm.openedPlayerRecording.value?.id)
+            assertFalse("Newly opened player must be expanded", vm.isPlayerMinimized.value)
+
+            // Return directly to Main interface (Recorder) while keeping playback session alive as mini-player
+            vm.minimizeSavedRecordingPlayer(returnToMain = true)
+            assertEquals(com.example.viewmodel.AppDestination.RECORDER, vm.currentDestination.value)
+            assertTrue("Player must be minimized when returning to Main screen", vm.isPlayerMinimized.value)
+            org.junit.Assert.assertNotNull("Playback session must remain active in mini-player", vm.openedPlayerRecording.value)
+
+            // Navigate across tabs without closing mini-player
+            vm.navigateTo(com.example.viewmodel.AppDestination.STORAGE)
+            assertEquals(com.example.viewmodel.AppDestination.STORAGE, vm.currentDestination.value)
+            org.junit.Assert.assertNotNull(vm.openedPlayerRecording.value)
+            assertTrue(vm.isPlayerMinimized.value)
+
+            // Expand mini-player back to full player screen
+            vm.expandSavedRecordingPlayer()
+            assertFalse("Expanded player must clear minimized flag", vm.isPlayerMinimized.value)
+            assertEquals(entity.id, vm.openedPlayerRecording.value?.id)
+
+            // Explicit close clears session
+            vm.closeSavedRecordingPlayer()
+            org.junit.Assert.assertNull(vm.openedPlayerRecording.value)
+            assertFalse(vm.isPlayerMinimized.value)
+        } finally {
+            vm.closeSavedRecordingPlayer()
+            tempFile.delete()
+        }
+    }
+
+    @Test
+    fun `verify audible Cue & Review scrubbing plays sound during hold and restores pause or play state on release`() {
+        val app = ApplicationProvider.getApplicationContext<android.app.Application>()
+        val vm = com.example.viewmodel.RecorderViewModel(app)
+        val tempFile = File(app.cacheDir, "audible_scrub_cue_review_test.wav")
+        WavFileTools.createStudioSampleAudioFile(
+            outputFile = tempFile,
+            durationSeconds = 6,
+            sampleRate = 22050
+        )
+        val entity = com.example.data.RecordingEntity(
+            id = 927L,
+            title = "Audible Scrub Memo",
+            filePath = tempFile.absolutePath,
+            durationMs = 6000L,
+            format = "WAV",
+            sampleRate = 22050,
+            bitDepth = 16,
+            channels = 1,
+            bitrate = 352800,
+            sizeBytes = tempFile.length()
+        )
+
+        try {
+            // 1. Paused state -> hold Rewind / Forward must turn audio playback ON audibly, then auto-pause at release point
+            vm.openSavedRecordingPlayer(entity, autoPlay = false)
+            assertFalse("Idle opened player must begin paused", vm.audioEngine.isPlaying.value)
+            assertTrue("Idle opened player must prepare duration metadata", vm.audioEngine.playbackDurationMs.value >= 5000L)
+
+            vm.beginAudibleScrub()
+            assertTrue("Holding seek from paused state must start audible cue playback", vm.audioEngine.isPlaying.value)
+
+            vm.seekPlaybackDuringScrub(2400L)
+            assertEquals(2400L, vm.audioEngine.playbackPositionMs.value)
+
+            vm.seekPlaybackDuringScrub(3600L)
+            assertEquals(3600L, vm.audioEngine.playbackPositionMs.value)
+
+            vm.endAudibleScrub()
+            assertFalse("Releasing hold after starting from paused must pause playback right where user stopped", vm.audioEngine.isPlaying.value)
+            assertTrue("Stopped playback cursor must remain near the heard cue position", vm.audioEngine.playbackPositionMs.value >= 3500L)
+
+            // 2. Playing state -> hold Rewind / Forward must keep playing seamlessly after release
+            vm.togglePlayPauseInPlayer()
+            assertTrue("Playback must be active before second scrub", vm.audioEngine.isPlaying.value)
+
+            vm.beginAudibleScrub()
+            assertTrue("Playback remains active during audible scrub", vm.audioEngine.isPlaying.value)
+
+            vm.seekPlaybackDuringScrub(1500L)
+            assertEquals(1500L, vm.audioEngine.playbackPositionMs.value)
+
+            vm.endAudibleScrub()
+            assertTrue("Releasing hold when already playing must continue playing seamlessly", vm.audioEngine.isPlaying.value)
+            assertTrue("Playback cursor must reflect the cue rewind position", vm.audioEngine.playbackPositionMs.value in 1400L..2200L)
+        } finally {
+            vm.closeSavedRecordingPlayer()
+            tempFile.delete()
+        }
+    }
 }
-
-
-
-
-
-
-
-

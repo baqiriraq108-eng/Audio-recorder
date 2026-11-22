@@ -5,6 +5,7 @@ import androidx.activity.compose.BackHandler
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.animateContentSize
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -66,11 +67,13 @@ import com.example.data.PlaybackSpeedOption
 import com.example.data.RecorderSettings
 import com.example.data.RecordingEntity
 import com.example.data.SilenceInterval
+import com.example.ui.components.HoldToSeekTransportButton
 import com.example.ui.components.ShareExportActionSheet
 import com.example.ui.components.StudioInteractiveWaveform
 import com.example.ui.theme.ElevatedSurface
 import com.example.ui.theme.ObsidianBackground
 import com.example.ui.theme.OnPeachAccent
+import com.example.ui.theme.OutlineWarm
 import com.example.ui.theme.PeachAccent
 import com.example.ui.theme.PlayerButtonLabelStyle
 import com.example.ui.theme.PlayerCompactSecondaryStyle
@@ -117,9 +120,13 @@ fun SavedRecordingPlayerScreen(
     onExportWithoutSilence: (RecordingEntity) -> Unit,
     onTrimRecording: (RecordingEntity, Long, Long, Boolean) -> Unit = { _, _, _, _ -> },
     onOpenExportConversion: (RecordingEntity) -> Unit = {},
+    onMinimizePlayer: () -> Unit = onClosePlayer,
+    onScrubHoldStart: () -> Unit = {},
+    onScrubSeekToMs: (Long) -> Unit = onSeekToMs,
+    onScrubHoldEnd: () -> Unit = {},
     statusBannerContent: @Composable () -> Unit = {}
 ) {
-    BackHandler(onBack = onClosePlayer)
+    BackHandler(onBack = onMinimizePlayer)
 
     val context = LocalContext.current
     var showShareExportSheet by remember { mutableStateOf(false) }
@@ -144,24 +151,25 @@ fun SavedRecordingPlayerScreen(
             .testTag("saved_recording_player_screen"),
         verticalArrangement = Arrangement.SpaceBetween
     ) {
-        // 1. Top Header Bar (Back Button, Recording Title, Share/Export Action Button)
+        // 1. Top Header Bar (Minimize Back Button aligned with Sort Button hierarchy + Recording Title)
         Row(
             modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.SpaceBetween,
+            horizontalArrangement = Arrangement.Start,
             verticalAlignment = Alignment.CenterVertically
         ) {
             Box(
                 contentAlignment = Alignment.Center,
                 modifier = Modifier
-                    .size(48.dp)
+                    .size(40.dp)
                     .clip(CircleShape)
                     .background(ElevatedSurface)
-                    .m3PressScale(shape = CircleShape, onClick = onClosePlayer)
+                    .border(1.dp, OutlineWarm, CircleShape)
+                    .m3PressScale(shape = CircleShape, onClick = onMinimizePlayer)
                     .testTag("player_back_button")
             ) {
                 Icon(
                     imageVector = Icons.AutoMirrored.Filled.ArrowBack,
-                    contentDescription = "Back to Library",
+                    contentDescription = stringResource(R.string.player_back_minimize),
                     tint = PeachAccent,
                     modifier = Modifier.size(20.dp)
                 )
@@ -406,33 +414,32 @@ fun SavedRecordingPlayerScreen(
                     )
                 }
 
-                // 2. Rewind -3s Button (12.dp rounded corners, 48.dp accessible touch target)
-                Box(
-                    contentAlignment = Alignment.Center,
-                    modifier = Modifier
-                        .size(48.dp)
-                        .clip(RoundedCornerShape(12.dp))
-                        .background(ElevatedSurface)
-                        .m3PressScale(
-                            shape = RoundedCornerShape(12.dp),
-                            onClick = {
-                                if (isTrimMode) {
-                                    val target = (playbackPositionMs - 3_000L).coerceIn(trimStartMs, trimEndMs)
-                                    onSeekToMs(target)
-                                } else {
-                                    onSeekRelativeMs(-3_000L)
-                                }
-                            }
-                        )
-                        .testTag("player_rewind_button")
-                ) {
-                    Icon(
-                        imageVector = Icons.Default.FastRewind,
-                        contentDescription = "Rewind 3 seconds",
-                        tint = PeachAccent,
-                        modifier = Modifier.size(22.dp)
-                    )
-                }
+                // 2. Rewind Button (Quick tap -3s, press-and-hold audibly rewinds cue-by-cue until release)
+                HoldToSeekTransportButton(
+                    icon = Icons.Default.FastRewind,
+                    contentDescription = "Rewind",
+                    directionSign = -1,
+                    containerColor = ElevatedSurface,
+                    iconTint = PeachAccent,
+                    buttonSize = 48.dp,
+                    cornerRadius = 12.dp,
+                    iconSize = 22.dp,
+                    testTagName = "player_rewind_button",
+                    getCurrentPositionMs = { playbackPositionMs },
+                    minBoundMs = if (isTrimMode) trimStartMs else 0L,
+                    maxBoundMs = if (isTrimMode) trimEndMs else effectiveDuration,
+                    onSingleTapSeek = { delta ->
+                        if (isTrimMode) {
+                            val target = (playbackPositionMs + delta).coerceIn(trimStartMs, trimEndMs)
+                            onSeekToMs(target)
+                        } else {
+                            onSeekRelativeMs(delta)
+                        }
+                    },
+                    onScrubHoldStart = onScrubHoldStart,
+                    onScrubCueSeekToMs = onScrubSeekToMs,
+                    onScrubHoldEnd = onScrubHoldEnd
+                )
 
                 // 3. Central Play / Pause Button (Primary transport hero: 60.dp)
                 Box(
@@ -462,33 +469,32 @@ fun SavedRecordingPlayerScreen(
                     )
                 }
 
-                // 4. Fast-Forward +3s Button (12.dp rounded corners, 48.dp accessible touch target)
-                Box(
-                    contentAlignment = Alignment.Center,
-                    modifier = Modifier
-                        .size(48.dp)
-                        .clip(RoundedCornerShape(12.dp))
-                        .background(ElevatedSurface)
-                        .m3PressScale(
-                            shape = RoundedCornerShape(12.dp),
-                            onClick = {
-                                if (isTrimMode) {
-                                    val target = (playbackPositionMs + 3_000L).coerceIn(trimStartMs, trimEndMs)
-                                    onSeekToMs(target)
-                                } else {
-                                    onSeekRelativeMs(3_000L)
-                                }
-                            }
-                        )
-                        .testTag("player_forward_button")
-                ) {
-                    Icon(
-                        imageVector = Icons.Default.FastForward,
-                        contentDescription = "Fast forward 3 seconds",
-                        tint = PeachAccent,
-                        modifier = Modifier.size(22.dp)
-                    )
-                }
+                // 4. Fast-Forward Button (Quick tap +3s, press-and-hold audibly advances cue-by-cue until release)
+                HoldToSeekTransportButton(
+                    icon = Icons.Default.FastForward,
+                    contentDescription = "Fast forward",
+                    directionSign = 1,
+                    containerColor = ElevatedSurface,
+                    iconTint = PeachAccent,
+                    buttonSize = 48.dp,
+                    cornerRadius = 12.dp,
+                    iconSize = 22.dp,
+                    testTagName = "player_forward_button",
+                    getCurrentPositionMs = { playbackPositionMs },
+                    minBoundMs = if (isTrimMode) trimStartMs else 0L,
+                    maxBoundMs = if (isTrimMode) trimEndMs else effectiveDuration,
+                    onSingleTapSeek = { delta ->
+                        if (isTrimMode) {
+                            val target = (playbackPositionMs + delta).coerceIn(trimStartMs, trimEndMs)
+                            onSeekToMs(target)
+                        } else {
+                            onSeekRelativeMs(delta)
+                        }
+                    },
+                    onScrubHoldStart = onScrubHoldStart,
+                    onScrubCueSeekToMs = onScrubSeekToMs,
+                    onScrubHoldEnd = onScrubHoldEnd
+                )
 
                 // 5. Continue Recording on Same File Button (48.dp circular button)
                 Box(

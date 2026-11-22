@@ -56,4 +56,14 @@
     <string name="cancel_merge_dialog_message">Your original recording will stay untouched, and the newly recorded segment will be saved separately so nothing is lost.</string>
     <string name="cancel_merge_abort_action">Abort Merge &amp; Save Separately</string>
     <string name="cancel_merge_continue_action">Continue Merging</string>
+    <string name="notification_saving_recording">Saving recording…</string>
+    <string name="player_back_minimize">Minimize player</string>
+    <string name="player_return_main">Main screen</string>
+    <string name="player_close_stop">Close player</string>
+    <string name="mini_player_expand">Expand player</string>
+    <string name="mini_player_rewind">Rewind 3 seconds</string>
+    <string name="mini_player_play">Play</string>
+    <string name="mini_player_pause">Pause</string>
+    <string name="mini_player_forward">Fast forward 3 seconds</string>
+    <string name="mini_player_close">Close player</string>
 </resources>

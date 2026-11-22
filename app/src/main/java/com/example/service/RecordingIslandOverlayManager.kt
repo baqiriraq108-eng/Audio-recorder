@@ -16,6 +16,8 @@ import android.graphics.Shader
 import android.graphics.drawable.GradientDrawable
 import android.net.Uri
 import android.os.Build
+import android.os.Handler
+import android.os.Looper
 import android.os.SystemClock
 import android.provider.Settings
 import android.text.Editable
@@ -147,12 +149,26 @@ object RecordingIslandOverlayManager {
         private set
 
     @Volatile
+    var lastIsShowingSavingProgress: Boolean = false
+        private set
+
+    @Volatile
     var lastIsShowingFinishedCompletion: Boolean = false
         private set
 
     @Volatile
     var lastFinishedTitle: String = "Finished recording"
         private set
+
+    private val mainHandler: Handler by lazy { Handler(Looper.getMainLooper()) }
+
+    private fun runOnMainThread(block: () -> Unit) {
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            block()
+        } else {
+            mainHandler.post(block)
+        }
+    }
 
     @Volatile
     var suggestedRecordingTitle: String = ""
@@ -257,6 +273,7 @@ object RecordingIslandOverlayManager {
     private var attachedWindowView: FrameLayout? = null
     private var attachedTrashWindowView: View? = null
     private var attachedConfirmState: Boolean? = null
+    private var attachedSavingState: Boolean? = null
     private var attachedFinishedState: Boolean? = null
 
     private var snapBackAnimator: ValueAnimator? = null
@@ -339,32 +356,37 @@ object RecordingIslandOverlayManager {
     }
 
     fun shouldDisplayOverlay(): Boolean {
-        return (isRecordingSessionActive || lastIsShowingFinishedCompletion) && !isAppInForeground
+        return (isRecordingSessionActive || lastIsShowingSavingProgress || lastIsShowingFinishedCompletion) && !isAppInForeground
     }
 
     fun onAppForegroundChanged(context: Context, inForeground: Boolean) {
-        appContext = context.applicationContext
-        val previousInForeground = isAppInForeground
-        isAppInForeground = inForeground
-        if (inForeground) {
-            // Hide overlay capsule immediately when MainActivity is in the foreground
-            lastIsShowingFinishedCompletion = false
-            hideBottomTrashTarget()
-            detachOverlayWindow()
-        } else if (isRecordingSessionActive || lastIsShowingFinishedCompletion) {
-            if (previousInForeground && !canDrawSystemOverlay(context)) {
-                maybePromptOverlayPermissionOnce(context)
+        val appCtx = context.applicationContext
+        appContext = appCtx
+        runOnMainThread {
+            val previousInForeground = isAppInForeground
+            isAppInForeground = inForeground
+            if (inForeground) {
+                // Hide overlay capsule immediately when MainActivity is in the foreground
+                lastIsShowingSavingProgress = false
+                lastIsShowingFinishedCompletion = false
+                hideBottomTrashTarget()
+                detachOverlayWindow()
+            } else if (isRecordingSessionActive || lastIsShowingSavingProgress || lastIsShowingFinishedCompletion) {
+                if (previousInForeground && !canDrawSystemOverlay(appCtx)) {
+                    maybePromptOverlayPermissionOnce(appCtx)
+                }
+                if ((previousInForeground || !isOverlayAttachedToWindow) &&
+                    !lastIsShowingAppendConfirm &&
+                    !lastIsShowingSavingProgress &&
+                    !lastIsShowingFinishedCompletion
+                ) {
+                    currentMode = OverlayMode.DOCKED_PILL
+                    currentMorphProgress = 0f
+                    pillDragOffsetX = 0
+                    pillDragOffsetY = defaultTopY(appCtx)
+                }
+                syncOverlayView(appCtx)
             }
-            if ((previousInForeground || !isOverlayAttachedToWindow) &&
-                !lastIsShowingAppendConfirm &&
-                !lastIsShowingFinishedCompletion
-            ) {
-                currentMode = OverlayMode.DOCKED_PILL
-                currentMorphProgress = 0f
-                pillDragOffsetX = 0
-                pillDragOffsetY = defaultTopY(context)
-            }
-            syncOverlayView(context.applicationContext)
         }
     }
 
@@ -398,50 +420,81 @@ object RecordingIslandOverlayManager {
     ) {
         val appCtx = context.applicationContext
         appContext = appCtx
-        val wasShowingConfirm = lastIsShowingAppendConfirm
-        isRecordingSessionActive = true
-        lastIsShowingFinishedCompletion = false
-        lastStateTitle = title
-        lastIsPaused = isPaused
-        lastElapsedMs = elapsedMs.coerceAtLeast(0L)
-        lastWaveformBitmap = waveformBitmap
-        lastOscillatingDisplacements = oscillatingDisplacements.copyOf()
-        lastIsShowingAppendConfirm = isShowingAppendConfirmation
-        if (isShowingAppendConfirmation) {
+        val displacementsCopy = oscillatingDisplacements.copyOf()
+        runOnMainThread {
+            val wasShowingConfirm = lastIsShowingAppendConfirm
+            isRecordingSessionActive = true
+            lastIsShowingSavingProgress = false
+            lastIsShowingFinishedCompletion = false
+            lastStateTitle = title
+            lastIsPaused = isPaused
+            lastElapsedMs = elapsedMs.coerceAtLeast(0L)
+            lastWaveformBitmap = waveformBitmap
+            lastOscillatingDisplacements = displacementsCopy
+            lastIsShowingAppendConfirm = isShowingAppendConfirmation
+            if (isShowingAppendConfirmation) {
+                isDraggingPill = false
+                hideBottomTrashTarget()
+                pillDragOffsetX = 0
+                pillDragOffsetY = defaultTopY(appCtx)
+                if (!wasShowingConfirm || suggestedRecordingTitle.isBlank()) {
+                    val explicitCandidate = defaultSuggestedTitle?.trim().orEmpty()
+                    val isRealTargetTitle = explicitCandidate.isNotEmpty() &&
+                        !explicitCandidate.equals("Recording", ignoreCase = true) &&
+                        !explicitCandidate.equals("Paused", ignoreCase = true)
+                    val initialTitle = if (isRealTargetTitle) {
+                        explicitCandidate
+                    } else {
+                        generateDefaultTimestampedTitle(defaultSuggestedTitle ?: title)
+                    }
+                    suggestedRecordingTitle = initialTitle
+                    if (currentEditedRecordingTitle.isBlank() || isRealTargetTitle) {
+                        currentEditedRecordingTitle = initialTitle
+                    }
+                }
+                // Recording capsule transitions to Greek Save/Cancel confirmation card
+                currentMode = OverlayMode.EXPANDED_CARD
+            }
+
+            if (shouldDisplayOverlay()) {
+                // While the user is actively dragging the compact pill, only update in-place text/waveform
+                // and NEVER recreate layout params or interrupt the 1:1 finger drag!
+                if (isDraggingPill && currentMode == OverlayMode.DOCKED_PILL && !isShowingAppendConfirmation) {
+                    updatePersistentRecordingLayersInPlace(appCtx)
+                    return@runOnMainThread
+                }
+                syncOverlayView(appCtx)
+            } else {
+                hideBottomTrashTarget()
+                detachOverlayWindow()
+            }
+        }
+    }
+
+    /**
+     * Immediately removes the Greek `Θ Don't` / `Σ Save` confirmation buttons from the Dynamic Island
+     * the instant Save is tapped, displaying a clean saving indicator until completion arrives.
+     */
+    fun showSavingProgressOverlay(context: Context) {
+        val appCtx = context.applicationContext
+        appContext = appCtx
+        runOnMainThread {
+            if (lastIsShowingFinishedCompletion) return@runOnMainThread
             isDraggingPill = false
             hideBottomTrashTarget()
             pillDragOffsetX = 0
             pillDragOffsetY = defaultTopY(appCtx)
-            if (!wasShowingConfirm || suggestedRecordingTitle.isBlank()) {
-                val explicitCandidate = defaultSuggestedTitle?.trim().orEmpty()
-                val isRealTargetTitle = explicitCandidate.isNotEmpty() &&
-                    !explicitCandidate.equals("Recording", ignoreCase = true) &&
-                    !explicitCandidate.equals("Paused", ignoreCase = true)
-                val initialTitle = if (isRealTargetTitle) {
-                    explicitCandidate
-                } else {
-                    generateDefaultTimestampedTitle(defaultSuggestedTitle ?: title)
-                }
-                suggestedRecordingTitle = initialTitle
-                if (currentEditedRecordingTitle.isBlank() || isRealTargetTitle) {
-                    currentEditedRecordingTitle = initialTitle
-                }
-            }
-            // Recording capsule transitions to Greek Save/Cancel confirmation card
+            lastIsShowingAppendConfirm = false
+            lastIsShowingSavingProgress = true
+            lastIsShowingFinishedCompletion = false
             currentMode = OverlayMode.EXPANDED_CARD
-        }
-
-        if (shouldDisplayOverlay()) {
-            // While the user is actively dragging the compact pill, only update in-place text/waveform
-            // and NEVER recreate layout params or interrupt the 1:1 finger drag!
-            if (isDraggingPill && currentMode == OverlayMode.DOCKED_PILL && !isShowingAppendConfirmation) {
-                updatePersistentRecordingLayersInPlace(appCtx)
-                return
+            if (shouldDisplayOverlay()) {
+                syncOverlayView(appCtx, forceRecreate = true)
+            } else {
+                lastCreatedWindowLayoutParams = createWindowLayoutParams(appCtx)
+                currentOverlayRootView = buildOverlayContentView(appCtx)
+                detachWindowOnly()
             }
-            syncOverlayView(appCtx)
-        } else {
-            hideBottomTrashTarget()
-            detachOverlayWindow()
         }
     }
 
@@ -457,32 +510,34 @@ object RecordingIslandOverlayManager {
         val appCtx = context.applicationContext
         appContext = appCtx
         val resolvedTitle = title.ifBlank { "Finished recording" }
+        runOnMainThread {
+            isDraggingPill = false
+            hideBottomTrashTarget()
+            pillDragOffsetX = 0
+            pillDragOffsetY = defaultTopY(appCtx)
 
-        isDraggingPill = false
-        hideBottomTrashTarget()
-        pillDragOffsetX = 0
-        pillDragOffsetY = defaultTopY(appCtx)
+            // Deduplicate: if already showing the finished completion capsule, update title in-place and return
+            if (lastIsShowingFinishedCompletion && currentOverlayRootView != null) {
+                lastFinishedTitle = resolvedTitle
+                currentOverlayRootView?.findViewById<TextView>(R.id.notif_finished_title)?.text =
+                    buildGradientBlendedTitle(resolvedTitle)
+                return@runOnMainThread
+            }
 
-        // Deduplicate: if already showing the finished completion capsule, update title in-place and return
-        if (lastIsShowingFinishedCompletion && currentOverlayRootView != null) {
+            isRecordingSessionActive = false
+            lastIsShowingAppendConfirm = false
+            lastIsShowingSavingProgress = false
+            lastIsShowingFinishedCompletion = true
             lastFinishedTitle = resolvedTitle
-            currentOverlayRootView?.findViewById<TextView>(R.id.notif_finished_title)?.text =
-                buildGradientBlendedTitle(resolvedTitle)
-            return
-        }
+            currentMode = OverlayMode.EXPANDED_CARD
 
-        isRecordingSessionActive = false
-        lastIsShowingAppendConfirm = false
-        lastIsShowingFinishedCompletion = true
-        lastFinishedTitle = resolvedTitle
-        currentMode = OverlayMode.EXPANDED_CARD
-
-        if (shouldDisplayOverlay()) {
-            syncOverlayView(appCtx, forceRecreate = true)
-        } else {
-            lastCreatedWindowLayoutParams = createWindowLayoutParams(appCtx)
-            currentOverlayRootView = buildOverlayContentView(appCtx)
-            detachWindowOnly()
+            if (shouldDisplayOverlay()) {
+                syncOverlayView(appCtx, forceRecreate = true)
+            } else {
+                lastCreatedWindowLayoutParams = createWindowLayoutParams(appCtx)
+                currentOverlayRootView = buildOverlayContentView(appCtx)
+                detachWindowOnly()
+            }
         }
     }
 
@@ -493,41 +548,43 @@ object RecordingIslandOverlayManager {
      */
     fun expandFromDockedPill() {
         val ctx = appContext ?: return
-        if (lastIsShowingAppendConfirm || lastIsShowingFinishedCompletion) return
-        cancelSnapBackAnimator()
-        isDraggingPill = false
-        hideBottomTrashTarget()
-        pillDragOffsetX = 0
-        pillDragOffsetY = defaultTopY(ctx)
-        currentMode = OverlayMode.EXPANDED_CARD
-        lastMorphPivotY = 0f
-        lastMorphRefreshRateHz = TARGET_HIGH_REFRESH_RATE_HZ
+        runOnMainThread {
+            if (lastIsShowingAppendConfirm || lastIsShowingSavingProgress || lastIsShowingFinishedCompletion) return@runOnMainThread
+            cancelSnapBackAnimator()
+            isDraggingPill = false
+            hideBottomTrashTarget()
+            pillDragOffsetX = 0
+            pillDragOffsetY = defaultTopY(ctx)
+            currentMode = OverlayMode.EXPANDED_CARD
+            lastMorphPivotY = 0f
+            lastMorphRefreshRateHz = TARGET_HIGH_REFRESH_RATE_HZ
 
-        // Ensure the persistent morph shell exists without destroying it if already built
-        ensurePersistentMorphShell(ctx)
-        updatePersistentRecordingLayersInPlace(ctx)
+            // Ensure the persistent morph shell exists without destroying it if already built
+            ensurePersistentMorphShell(ctx)
+            updatePersistentRecordingLayersInPlace(ctx)
 
-        val lp = createWindowLayoutParams(ctx)
-        activePillWindowParams = lp
-        lastCreatedWindowLayoutParams = lp
+            val lp = createWindowLayoutParams(ctx)
+            activePillWindowParams = lp
+            lastCreatedWindowLayoutParams = lp
 
-        persistentDockedPillLayer?.isClickable = false
-        persistentExpandedCardLayer?.let { cardLayer ->
-            cardLayer.visibility = View.VISIBLE
-            cardLayer.isClickable = true
-            currentOverlayRootView = cardLayer
+            persistentDockedPillLayer?.isClickable = false
+            persistentExpandedCardLayer?.let { cardLayer ->
+                cardLayer.visibility = View.VISIBLE
+                cardLayer.isClickable = true
+                currentOverlayRootView = cardLayer
+            }
+
+            // Expand window minimum height prior to starting the in-place geometric morph so zero
+            // mid-animation WindowManager relayout calls occur while width & height expand.
+            attachedWindowView?.minimumHeight = measuredExpandedHeightPx
+            if (isOverlayAttachedToWindow && attachedWindowView != null) {
+                try {
+                    windowManager?.updateViewLayout(attachedWindowView, lp)
+                } catch (_: Exception) {}
+            }
+
+            startInPlaceGeometricMorph(ctx, targetProgress = 1f)
         }
-
-        // Expand window minimum height prior to starting the in-place geometric morph so zero
-        // mid-animation WindowManager relayout calls occur while width & height expand.
-        attachedWindowView?.minimumHeight = measuredExpandedHeightPx
-        if (isOverlayAttachedToWindow && attachedWindowView != null) {
-            try {
-                windowManager?.updateViewLayout(attachedWindowView, lp)
-            } catch (_: Exception) {}
-        }
-
-        startInPlaceGeometricMorph(ctx, targetProgress = 1f)
     }
 
     /**
@@ -537,31 +594,33 @@ object RecordingIslandOverlayManager {
      */
     fun collapseToDockedPill() {
         val ctx = appContext ?: return
-        if (lastIsShowingAppendConfirm || lastIsShowingFinishedCompletion) return
-        cancelSnapBackAnimator()
-        isDraggingPill = false
-        hideBottomTrashTarget()
-        pillDragOffsetX = 0
-        pillDragOffsetY = defaultTopY(ctx)
-        currentMode = OverlayMode.DOCKED_PILL
-        lastMorphPivotY = 0f
-        lastMorphRefreshRateHz = TARGET_HIGH_REFRESH_RATE_HZ
+        runOnMainThread {
+            if (lastIsShowingAppendConfirm || lastIsShowingSavingProgress || lastIsShowingFinishedCompletion) return@runOnMainThread
+            cancelSnapBackAnimator()
+            isDraggingPill = false
+            hideBottomTrashTarget()
+            pillDragOffsetX = 0
+            pillDragOffsetY = defaultTopY(ctx)
+            currentMode = OverlayMode.DOCKED_PILL
+            lastMorphPivotY = 0f
+            lastMorphRefreshRateHz = TARGET_HIGH_REFRESH_RATE_HZ
 
-        ensurePersistentMorphShell(ctx)
-        updatePersistentRecordingLayersInPlace(ctx)
+            ensurePersistentMorphShell(ctx)
+            updatePersistentRecordingLayersInPlace(ctx)
 
-        val lp = createWindowLayoutParams(ctx)
-        activePillWindowParams = lp
-        lastCreatedWindowLayoutParams = lp
+            val lp = createWindowLayoutParams(ctx)
+            activePillWindowParams = lp
+            lastCreatedWindowLayoutParams = lp
 
-        persistentExpandedCardLayer?.isClickable = false
-        persistentDockedPillLayer?.let { pillLayer ->
-            pillLayer.visibility = View.VISIBLE
-            pillLayer.isClickable = true
-            currentOverlayRootView = pillLayer
+            persistentExpandedCardLayer?.isClickable = false
+            persistentDockedPillLayer?.let { pillLayer ->
+                pillLayer.visibility = View.VISIBLE
+                pillLayer.isClickable = true
+                currentOverlayRootView = pillLayer
+            }
+
+            startInPlaceGeometricMorph(ctx, targetProgress = 0f)
         }
-
-        startInPlaceGeometricMorph(ctx, targetProgress = 0f)
     }
 
     fun handleHeaderTapOpenApp(context: Context) {
@@ -673,20 +732,23 @@ object RecordingIslandOverlayManager {
     }
 
     fun dismissAndReset() {
-        cancelSnapBackAnimator()
-        cancelMorphAnimator()
-        hideBottomTrashTarget()
-        isRecordingSessionActive = false
-        lastIsShowingAppendConfirm = false
-        lastIsShowingFinishedCompletion = false
-        suggestedRecordingTitle = ""
-        currentEditedRecordingTitle = ""
-        isDraggingPill = false
-        pillDragOffsetX = 0
-        appContext?.let { pillDragOffsetY = defaultTopY(it) }
-        currentMode = OverlayMode.DOCKED_PILL
-        currentMorphProgress = 0f
-        detachOverlayWindow()
+        runOnMainThread {
+            cancelSnapBackAnimator()
+            cancelMorphAnimator()
+            hideBottomTrashTarget()
+            isRecordingSessionActive = false
+            lastIsShowingAppendConfirm = false
+            lastIsShowingSavingProgress = false
+            lastIsShowingFinishedCompletion = false
+            suggestedRecordingTitle = ""
+            currentEditedRecordingTitle = ""
+            isDraggingPill = false
+            pillDragOffsetX = 0
+            appContext?.let { pillDragOffsetY = defaultTopY(it) }
+            currentMode = OverlayMode.DOCKED_PILL
+            currentMorphProgress = 0f
+            detachOverlayWindow()
+        }
     }
 
     private fun cancelSnapBackAnimator() {
@@ -1215,7 +1277,7 @@ object RecordingIslandOverlayManager {
     }
 
     internal fun buildOverlayContentView(context: Context): View {
-        return if (!lastIsShowingAppendConfirm && !lastIsShowingFinishedCompletion) {
+        return if (!lastIsShowingAppendConfirm && !lastIsShowingSavingProgress && !lastIsShowingFinishedCompletion) {
             ensurePersistentMorphShell(context)
             if (currentMode == OverlayMode.DOCKED_PILL) {
                 persistentDockedPillLayer!!
@@ -1705,7 +1767,7 @@ object RecordingIslandOverlayManager {
         if (lastIsShowingFinishedCompletion) {
             dismissBothFinishedNotificationAndOverlay(context)
             return true
-        } else if (currentMode == OverlayMode.EXPANDED_CARD && !lastIsShowingAppendConfirm) {
+        } else if (currentMode == OverlayMode.EXPANDED_CARD && !lastIsShowingAppendConfirm && !lastIsShowingSavingProgress) {
             collapseToDockedPill()
             return true
         }
@@ -1797,6 +1859,22 @@ object RecordingIslandOverlayManager {
             return outerWrapper
         }
 
+        if (lastIsShowingSavingProgress && !lastIsShowingAppendConfirm) {
+            val savingCard = inflater.inflate(R.layout.notification_finished_compact, outerWrapper, false)
+            savingCard.isClickable = false
+            savingCard.isFocusable = false
+            savingCard.findViewById<ImageView>(R.id.notif_finished_badge)?.setImageResource(R.drawable.ic_island_waveform)
+            savingCard.findViewById<TextView>(R.id.notif_finished_title)?.text =
+                buildGradientBlendedTitle(context.getString(R.string.notification_saving_recording))
+            val cardLp = FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.WRAP_CONTENT,
+                Gravity.TOP or Gravity.CENTER_HORIZONTAL
+            )
+            outerWrapper.addView(savingCard, cardLp)
+            return outerWrapper
+        }
+
         // Greek Save / Cancel confirmation card (`notification_append_confirm_compact`)
         val confirmCard = inflater.inflate(R.layout.notification_append_confirm_compact, outerWrapper, false)
         confirmCard.isClickable = true
@@ -1867,7 +1945,33 @@ object RecordingIslandOverlayManager {
         confirmCard.findViewById<View>(R.id.notif_append_dont_button)?.setOnClickListener {
             hideOverlayKeyboard(context, titleInputField)
             dismissAndReset()
-            onCancelAppendSaveCallback?.invoke()
+            val cb = onCancelAppendSaveCallback
+            if (cb != null) {
+                cb.invoke()
+            } else {
+                val liveService = RecordingForegroundService.activeInstance
+                if (liveService != null) {
+                    liveService.handleCancelAppendSaveFromNotification()
+                } else {
+                    try {
+                        val nm = context.getSystemService(Context.NOTIFICATION_SERVICE) as? android.app.NotificationManager
+                        nm?.cancel(RecordingForegroundService.NOTIFICATION_ID)
+                        nm?.cancel(RecordingForegroundService.FINISHED_NOTIFICATION_ID)
+                    } catch (_: Exception) {}
+                    val directHandler = RecordingForegroundService.activeCancelAppendSaveHandler
+                        ?: RecordingForegroundService.activeDiscardHandler
+                    if (directHandler != null) {
+                        directHandler.invoke()
+                    } else {
+                        try {
+                            context.sendBroadcast(
+                                Intent(RecordingForegroundService.ACTION_USER_CANCEL_APPEND_SAVE)
+                                    .setPackage(context.packageName)
+                            )
+                        } catch (_: Exception) {}
+                    }
+                }
+            }
         }
         confirmCard.findViewById<View>(R.id.notif_append_save_button)?.setOnClickListener {
             hideOverlayKeyboard(context, titleInputField)
@@ -1881,15 +1985,37 @@ object RecordingIslandOverlayManager {
 
             val titleCallback = onConfirmAppendSaveWithTitleCallback
             val callback = onConfirmAppendSaveCallback
-            if (titleCallback != null) {
-                titleCallback.invoke(finalTitle)
-            } else if (callback != null) {
-                callback.invoke()
-            } else {
-                showFinishedCompletionOverlay(
-                    context = context,
-                    title = context.getString(R.string.notification_finished_recording)
-                )
+            val liveService = RecordingForegroundService.activeInstance
+            val staticWithTitle = RecordingForegroundService.activeConfirmAppendSaveWithTitleHandler
+            val staticPlain = RecordingForegroundService.activeConfirmAppendSaveHandler
+
+            when {
+                titleCallback != null -> {
+                    showSavingProgressOverlay(context)
+                    titleCallback.invoke(finalTitle)
+                }
+                callback != null -> {
+                    showSavingProgressOverlay(context)
+                    callback.invoke()
+                }
+                liveService != null -> {
+                    showSavingProgressOverlay(context)
+                    liveService.handleConfirmAppendSaveFromNotification(finalTitle)
+                }
+                staticWithTitle != null -> {
+                    showSavingProgressOverlay(context)
+                    staticWithTitle.invoke(finalTitle)
+                }
+                staticPlain != null -> {
+                    showSavingProgressOverlay(context)
+                    staticPlain.invoke()
+                }
+                else -> {
+                    showFinishedCompletionOverlay(
+                        context = context,
+                        title = context.getString(R.string.notification_finished_recording)
+                    )
+                }
             }
         }
         val cardLp = FrameLayout.LayoutParams(
@@ -2005,7 +2131,10 @@ object RecordingIslandOverlayManager {
             WindowManager.LayoutParams.TYPE_PHONE
         }
 
-        val isPill = currentMode == OverlayMode.DOCKED_PILL && !lastIsShowingAppendConfirm && !lastIsShowingFinishedCompletion
+        val isPill = currentMode == OverlayMode.DOCKED_PILL &&
+            !lastIsShowingAppendConfirm &&
+            !lastIsShowingSavingProgress &&
+            !lastIsShowingFinishedCompletion
 
         // Keep window width constant at fixedExpandedWidthPx across DOCKED_PILL <-> EXPANDED_CARD
         // so WindowManagerService never reallocates or shifts windowFrame.left during expansion/collapse.
@@ -2066,7 +2195,7 @@ object RecordingIslandOverlayManager {
             return
         }
 
-        val isSpecialCard = lastIsShowingAppendConfirm || lastIsShowingFinishedCompletion
+        val isSpecialCard = lastIsShowingAppendConfirm || lastIsShowingSavingProgress || lastIsShowingFinishedCompletion
         val existingHost = attachedWindowView
 
         // Fast path for normal active recording (DOCKED_PILL or EXPANDED_CARD):
@@ -2104,6 +2233,7 @@ object RecordingIslandOverlayManager {
                         wm.updateViewLayout(existingHost, lp)
                     } catch (_: Exception) {}
                     attachedConfirmState = false
+                    attachedSavingState = false
                     attachedFinishedState = false
                     return
                 }
@@ -2120,6 +2250,7 @@ object RecordingIslandOverlayManager {
                 wm.addView(hostContainer, lp)
                 attachedWindowView = hostContainer
                 attachedConfirmState = false
+                attachedSavingState = false
                 attachedFinishedState = false
                 isOverlayAttachedToWindow = true
             } catch (_: Exception) {
@@ -2129,12 +2260,13 @@ object RecordingIslandOverlayManager {
             return
         }
 
-        // Special state path: Greek Save Confirmation card or Finished Recording completion card
+        // Special state path: Greek Save Confirmation card, Saving Progress card, or Finished Recording completion card
         if (!forceRecreate &&
             isOverlayAttachedToWindow &&
             existingHost != null &&
             currentOverlayRootView != null &&
             attachedConfirmState == lastIsShowingAppendConfirm &&
+            attachedSavingState == lastIsShowingSavingProgress &&
             attachedFinishedState == lastIsShowingFinishedCompletion
         ) {
             if (lastIsShowingFinishedCompletion) {
@@ -2166,6 +2298,7 @@ object RecordingIslandOverlayManager {
                     wm.updateViewLayout(existingHost, lp)
                 } catch (_: Exception) {}
                 attachedConfirmState = lastIsShowingAppendConfirm
+                attachedSavingState = lastIsShowingSavingProgress
                 attachedFinishedState = lastIsShowingFinishedCompletion
                 return
             }
@@ -2183,6 +2316,7 @@ object RecordingIslandOverlayManager {
             wm.addView(hostContainer, lp)
             attachedWindowView = hostContainer
             attachedConfirmState = lastIsShowingAppendConfirm
+            attachedSavingState = lastIsShowingSavingProgress
             attachedFinishedState = lastIsShowingFinishedCompletion
             isOverlayAttachedToWindow = true
         } catch (_: Exception) {
@@ -2231,6 +2365,7 @@ object RecordingIslandOverlayManager {
         attachedWindowView = null
         activePillWindowParams = null
         attachedConfirmState = null
+        attachedSavingState = null
         attachedFinishedState = null
         isOverlayAttachedToWindow = false
         if (viewToRemove != null) {

@@ -21,6 +21,7 @@ import androidx.compose.animation.scaleIn
 import androidx.compose.animation.scaleOut
 import androidx.compose.animation.togetherWith
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
@@ -39,11 +40,18 @@ import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.safeDrawing
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.FastForward
+import androidx.compose.material.icons.filled.FastRewind
 import androidx.compose.material.icons.filled.LibraryMusic
 import androidx.compose.material.icons.filled.Mic
+import androidx.compose.material.icons.filled.Pause
+import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Storage
 import androidx.compose.material.icons.outlined.LibraryMusic
@@ -51,6 +59,7 @@ import androidx.compose.material.icons.outlined.MicNone
 import androidx.compose.material.icons.outlined.Settings
 import androidx.compose.material.icons.outlined.Storage
 import androidx.compose.material3.Icon
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.NavigationRail
 import androidx.compose.material3.Scaffold
@@ -65,6 +74,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import com.example.data.AudioFormatUtils
 import com.example.data.RecordingEntity
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -74,6 +84,9 @@ import androidx.compose.ui.graphics.RectangleShape
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -82,6 +95,7 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 import com.example.ui.components.CancelMergeConfirmDialog
 import com.example.ui.components.ExportWithoutSilenceDialog
 import com.example.ui.components.FormatConversionSheet
+import com.example.ui.components.HoldToSeekTransportButton
 import com.example.ui.components.PostRecordingSaveSheet
 import com.example.ui.screens.LibraryScreen
 import com.example.ui.screens.RecorderScreen
@@ -97,8 +111,13 @@ import com.example.ui.theme.NavBarInactiveLabelStyle
 import com.example.ui.theme.NavInactiveContent
 import com.example.ui.theme.NavPillIndicator
 import com.example.ui.theme.ObsidianBackground
+import com.example.ui.theme.OnPeachAccent
+import com.example.ui.theme.OutlineWarm
 import com.example.ui.theme.PeachAccent
 import com.example.ui.theme.PrimaryText
+import com.example.ui.theme.SecondaryText
+import com.example.ui.theme.WarmSecondarySurface
+import com.example.ui.theme.m3PressScale
 import com.example.viewmodel.AppDestination
 import com.example.viewmodel.RecorderViewModel
 
@@ -201,6 +220,10 @@ fun AudioRecorderStudioApp(viewModel: RecorderViewModel) {
     val context = androidx.compose.ui.platform.LocalContext.current
     val currentDestination by viewModel.currentDestination.collectAsStateWithLifecycle()
     val openedPlayerRecording by viewModel.openedPlayerRecording.collectAsStateWithLifecycle()
+    val isPlayerMinimized by viewModel.isPlayerMinimized.collectAsStateWithLifecycle()
+    val isPlaybackPlaying by viewModel.audioEngine.isPlaying.collectAsStateWithLifecycle()
+    val playbackPositionMs by viewModel.audioEngine.playbackPositionMs.collectAsStateWithLifecycle()
+    val playbackDurationMs by viewModel.audioEngine.playbackDurationMs.collectAsStateWithLifecycle()
     val pendingSaveSession by viewModel.pendingSaveSession.collectAsStateWithLifecycle()
     val conversionState by viewModel.conversionState.collectAsStateWithLifecycle()
     val silenceExportState by viewModel.silenceExportState.collectAsStateWithLifecycle()
@@ -209,6 +232,8 @@ fun AudioRecorderStudioApp(viewModel: RecorderViewModel) {
     val pendingDriveActivityIntent by viewModel.pendingDriveActivityIntent.collectAsStateWithLifecycle()
     val pendingDriveFolderPicker by viewModel.pendingDriveFolderPicker.collectAsStateWithLifecycle()
     val showCancelMergeConfirmDialog by viewModel.showCancelMergeConfirmDialog.collectAsStateWithLifecycle()
+    val isFullPlayerOpen = openedPlayerRecording != null && !isPlayerMinimized
+    val isMiniPlayerVisible = openedPlayerRecording != null && isPlayerMinimized
 
     val snackbarHostState = remember { SnackbarHostState() }
 
@@ -278,8 +303,8 @@ fun AudioRecorderStudioApp(viewModel: RecorderViewModel) {
         }
     }
 
-    // Predictive back / BackHandler on secondary destinations returns to Recorder when player isn't open
-    BackHandler(enabled = openedPlayerRecording == null && currentDestination != AppDestination.RECORDER) {
+    // Predictive back / BackHandler on secondary destinations returns to Recorder when full player isn't open
+    BackHandler(enabled = !isFullPlayerOpen && currentDestination != AppDestination.RECORDER) {
         viewModel.navigateTo(AppDestination.RECORDER)
     }
 
@@ -294,7 +319,7 @@ fun AudioRecorderStudioApp(viewModel: RecorderViewModel) {
             contentWindowInsets = WindowInsets.safeDrawing,
             containerColor = ObsidianBackground,
             snackbarHost = {
-                if (openedPlayerRecording == null && currentDestination != AppDestination.RECORDER) {
+                if (!isFullPlayerOpen && currentDestination != AppDestination.RECORDER) {
                     StudioAnchoredStatusBanner(
                         snackbarHostState = snackbarHostState,
                         modifier = Modifier
@@ -304,11 +329,33 @@ fun AudioRecorderStudioApp(viewModel: RecorderViewModel) {
                 }
             },
             bottomBar = {
-                if (!isWideScreen && openedPlayerRecording == null) {
-                    StudioBottomNavigationBar(
-                        currentDestination = currentDestination,
-                        onNavigate = { viewModel.navigateTo(it) }
-                    )
+                if (!isWideScreen && !isFullPlayerOpen) {
+                    Column(modifier = Modifier.fillMaxWidth()) {
+                        if (isMiniPlayerVisible) {
+                            openedPlayerRecording?.let { miniRec ->
+                                StudioMiniPlayerBar(
+                                    recording = miniRec,
+                                    isPlaying = isPlaybackPlaying,
+                                    positionMs = playbackPositionMs,
+                                    durationMs = playbackDurationMs,
+                                    onExpand = { viewModel.expandSavedRecordingPlayer() },
+                                    onSeekRelative = { delta -> viewModel.seekPlaybackRelative(delta) },
+                                    onScrubHoldStart = { viewModel.beginAudibleScrub() },
+                                    onScrubSeekToMs = { pos -> viewModel.seekPlaybackDuringScrub(pos) },
+                                    onScrubHoldEnd = { viewModel.endAudibleScrub() },
+                                    onTogglePlayPause = { viewModel.togglePlayPauseInPlayer() },
+                                    onClose = { viewModel.closeSavedRecordingPlayer() },
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .padding(horizontal = 12.dp, vertical = 6.dp)
+                                )
+                            }
+                        }
+                        StudioBottomNavigationBar(
+                            currentDestination = currentDestination,
+                            onNavigate = { viewModel.navigateTo(it) }
+                        )
+                    }
                 }
             }
         ) { innerPadding ->
@@ -317,7 +364,7 @@ fun AudioRecorderStudioApp(viewModel: RecorderViewModel) {
                     .fillMaxSize()
                     .padding(innerPadding)
             ) {
-                if (isWideScreen && openedPlayerRecording == null) {
+                if (isWideScreen && !isFullPlayerOpen) {
                     StudioNavigationRail(
                         currentDestination = currentDestination,
                         onNavigate = { viewModel.navigateTo(it) }
@@ -362,7 +409,7 @@ fun AudioRecorderStudioApp(viewModel: RecorderViewModel) {
                                     viewModel = viewModel,
                                     onNavigateToSettings = { viewModel.navigateTo(AppDestination.SETTINGS) },
                                     statusBannerContent = {
-                                        if (openedPlayerRecording == null) {
+                                        if (!isFullPlayerOpen) {
                                             StudioAnchoredStatusBanner(
                                                 snackbarHostState = snackbarHostState,
                                                 modifier = Modifier
@@ -386,9 +433,33 @@ fun AudioRecorderStudioApp(viewModel: RecorderViewModel) {
                         }
                     }
 
+                    if (isWideScreen && isMiniPlayerVisible) {
+                        openedPlayerRecording?.let { miniRec ->
+                            StudioMiniPlayerBar(
+                                recording = miniRec,
+                                isPlaying = isPlaybackPlaying,
+                                positionMs = playbackPositionMs,
+                                durationMs = playbackDurationMs,
+                                onExpand = { viewModel.expandSavedRecordingPlayer() },
+                                onSeekRelative = { delta -> viewModel.seekPlaybackRelative(delta) },
+                                onScrubHoldStart = { viewModel.beginAudibleScrub() },
+                                onScrubSeekToMs = { pos -> viewModel.seekPlaybackDuringScrub(pos) },
+                                onScrubHoldEnd = { viewModel.endAudibleScrub() },
+                                onTogglePlayPause = { viewModel.togglePlayPauseInPlayer() },
+                                onClose = { viewModel.closeSavedRecordingPlayer() },
+                                modifier = Modifier
+                                    .align(Alignment.BottomCenter)
+                                    .widthIn(max = 560.dp)
+                                    .fillMaxWidth()
+                                    .navigationBarsPadding()
+                                    .padding(horizontal = 16.dp, vertical = 12.dp)
+                            )
+                        }
+                    }
+
                     // Independent Saved Recording Player View with smooth entrance
                     androidx.compose.animation.AnimatedVisibility(
-                        visible = openedPlayerRecording != null,
+                        visible = isFullPlayerOpen,
                         enter = fadeIn(tween(220, easing = M3MotionTokens.EmphasizedDecelerateEasing)) +
                             scaleIn(initialScale = 0.98f, animationSpec = tween(220, easing = M3MotionTokens.EmphasizedDecelerateEasing)),
                         exit = fadeOut(tween(140, easing = M3MotionTokens.EmphasizedAccelerateEasing)) +
@@ -803,8 +874,175 @@ private fun PlayerDestination(
                 viewModel.trimRecording(rec, startMs, endMs, overwrite)
             },
             onOpenExportConversion = { viewModel.openConversionSheet(it) },
+            onMinimizePlayer = { viewModel.minimizeSavedRecordingPlayer(returnToMain = false) },
+            onScrubHoldStart = { viewModel.beginAudibleScrub() },
+            onScrubSeekToMs = { viewModel.seekPlaybackDuringScrub(it) },
+            onScrubHoldEnd = { viewModel.endAudibleScrub() },
             statusBannerContent = statusBannerContent
         )
+    }
+}
+
+@Composable
+private fun StudioMiniPlayerBar(
+    recording: RecordingEntity,
+    isPlaying: Boolean,
+    positionMs: Long,
+    durationMs: Long,
+    onExpand: () -> Unit,
+    onSeekRelative: (Long) -> Unit,
+    onScrubHoldStart: () -> Unit,
+    onScrubSeekToMs: (Long) -> Unit,
+    onScrubHoldEnd: () -> Unit,
+    onTogglePlayPause: () -> Unit,
+    onClose: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    val effectiveDuration = durationMs.takeIf { it > 0L } ?: recording.durationMs.coerceAtLeast(1L)
+    val progressFraction = (positionMs.toFloat() / effectiveDuration.toFloat()).coerceIn(0f, 1f)
+    val expandDescription = stringResource(R.string.mini_player_expand)
+
+    Surface(
+        color = WarmSecondarySurface,
+        shape = RoundedCornerShape(16.dp),
+        tonalElevation = 2.dp,
+        shadowElevation = 4.dp,
+        modifier = modifier
+            .clip(RoundedCornerShape(16.dp))
+            .border(1.dp, OutlineWarm, RoundedCornerShape(16.dp))
+            .clickable(onClick = onExpand)
+            .semantics { contentDescription = expandDescription }
+            .testTag("studio_mini_player_bar")
+    ) {
+        Column(modifier = Modifier.fillMaxWidth()) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 12.dp, vertical = 8.dp)
+            ) {
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        text = recording.title,
+                        style = MaterialTheme.typography.titleSmall,
+                        color = PrimaryText,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                    Spacer(modifier = Modifier.height(2.dp))
+                    Text(
+                        text = "${AudioFormatUtils.formatDurationHMS(positionMs)} / ${AudioFormatUtils.formatDurationHMS(effectiveDuration)}",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = SecondaryText,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                }
+
+                Spacer(modifier = Modifier.width(8.dp))
+
+                Row(
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    // Rewind (Quick tap -3s, press-and-hold audibly rewinds cue-by-cue until release)
+                    HoldToSeekTransportButton(
+                        icon = Icons.Default.FastRewind,
+                        contentDescription = stringResource(R.string.mini_player_rewind),
+                        directionSign = -1,
+                        containerColor = ElevatedSurface,
+                        borderColor = OutlineWarm,
+                        iconTint = PeachAccent,
+                        buttonSize = 36.dp,
+                        cornerRadius = 10.dp,
+                        iconSize = 18.dp,
+                        testTagName = "mini_player_rewind_button",
+                        getCurrentPositionMs = { positionMs },
+                        minBoundMs = 0L,
+                        maxBoundMs = effectiveDuration,
+                        onSingleTapSeek = onSeekRelative,
+                        onScrubHoldStart = onScrubHoldStart,
+                        onScrubCueSeekToMs = onScrubSeekToMs,
+                        onScrubHoldEnd = onScrubHoldEnd
+                    )
+
+                    // Play / Pause (Primary transport hero: 40.dp circle, PeachAccent fill, OnPeachAccent icon)
+                    Box(
+                        contentAlignment = Alignment.Center,
+                        modifier = Modifier
+                            .size(40.dp)
+                            .clip(CircleShape)
+                            .background(PeachAccent)
+                            .m3PressScale(
+                                shape = CircleShape,
+                                onClick = onTogglePlayPause
+                            )
+                            .testTag("mini_player_play_pause_button")
+                    ) {
+                        Icon(
+                            imageVector = if (isPlaying) Icons.Default.Pause else Icons.Default.PlayArrow,
+                            contentDescription = stringResource(
+                                if (isPlaying) R.string.mini_player_pause else R.string.mini_player_play
+                            ),
+                            tint = OnPeachAccent,
+                            modifier = Modifier.size(20.dp)
+                        )
+                    }
+
+                    // Fast-Forward (Quick tap +3s, press-and-hold audibly advances cue-by-cue until release)
+                    HoldToSeekTransportButton(
+                        icon = Icons.Default.FastForward,
+                        contentDescription = stringResource(R.string.mini_player_forward),
+                        directionSign = 1,
+                        containerColor = ElevatedSurface,
+                        borderColor = OutlineWarm,
+                        iconTint = PeachAccent,
+                        buttonSize = 36.dp,
+                        cornerRadius = 10.dp,
+                        iconSize = 18.dp,
+                        testTagName = "mini_player_forward_button",
+                        getCurrentPositionMs = { positionMs },
+                        minBoundMs = 0L,
+                        maxBoundMs = effectiveDuration,
+                        onSingleTapSeek = onSeekRelative,
+                        onScrubHoldStart = onScrubHoldStart,
+                        onScrubCueSeekToMs = onScrubSeekToMs,
+                        onScrubHoldEnd = onScrubHoldEnd
+                    )
+
+                    // Close Preview Bar (Tertiary utility dismiss: 36.dp circle, ElevatedSurface + OutlineWarm border, SecondaryText icon)
+                    Box(
+                        contentAlignment = Alignment.Center,
+                        modifier = Modifier
+                            .size(36.dp)
+                            .clip(CircleShape)
+                            .background(ElevatedSurface)
+                            .border(1.dp, OutlineWarm, CircleShape)
+                            .m3PressScale(
+                                shape = CircleShape,
+                                onClick = onClose
+                            )
+                            .testTag("mini_player_close_button")
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.Close,
+                            contentDescription = stringResource(R.string.mini_player_close),
+                            tint = SecondaryText,
+                            modifier = Modifier.size(18.dp)
+                        )
+                    }
+                }
+            }
+
+            LinearProgressIndicator(
+                progress = { progressFraction },
+                color = PeachAccent,
+                trackColor = ElevatedSurface,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(2.dp)
+            )
+        }
     }
 }
 

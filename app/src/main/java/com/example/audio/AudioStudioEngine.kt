@@ -162,6 +162,11 @@ class AudioStudioEngine(private val context: Context) {
         Build.FINGERPRINT.equals("robolectric", ignoreCase = true)
 
     private val pendingSeekMs = AtomicLong(-1L)
+    private val pendingScrubFlush = AtomicBoolean(false)
+    @Volatile
+    private var isAudibleScrubbing: Boolean = false
+    @Volatile
+    private var wasPlayingBeforeScrub: Boolean = false
     private var lastMediaPlayerSeekUptimeMs: Long = 0L
 
     init {
@@ -1776,7 +1781,10 @@ class AudioStudioEngine(private val context: Context) {
         preindexedSilenceMap: List<SilenceInterval> = emptyList()
     ) {
         if (!file.exists()) return
-        stopPlaybackInternal(resetSavedCounter = startPositionMs == 0L)
+        stopPlaybackInternal(
+            resetSavedCounter = startPositionMs == 0L,
+            resetScrubState = false
+        )
 
         val repairedFile = WavFileTools.repairCorruptedAudioFileIfNeeded(file)
         currentSessionFile = repairedFile
@@ -1949,9 +1957,16 @@ class AudioStudioEngine(private val context: Context) {
                     )
 
                     while (isActive && _isPlaying.value) {
-                        // 1. Check for interactive user seek (scrubbing waveform or +/-3s)
+                        // 1. Check for interactive user seek (scrubbing waveform, hold-to-seek, or +/-3s)
                         val requestedSeekMs = pendingSeekMs.getAndSet(-1L)
                         if (requestedSeekMs >= 0L) {
+                            if (pendingScrubFlush.getAndSet(false) && trackReady && audioTrack != null) {
+                                try {
+                                    audioTrack.pause()
+                                    audioTrack.flush()
+                                    audioTrack.play()
+                                } catch (_: Exception) {}
+                            }
                             val rawSeekOffset = alignToBlock(
                                 rawOffset = (requestedSeekMs.coerceIn(0L, totalDurationMs) * bytesPerSecond) / 1000L,
                                 blockAlign = blockAlign,
@@ -1983,8 +1998,8 @@ class AudioStudioEngine(private val context: Context) {
                         val currentConfig = silenceSkipConfig
                         var jumpedThisIteration = false
 
-                        // 2. Real-Time Silence Trimming Filter (when Skip Silence is ON and enabled in Settings)
-                        if (currentConfig.isEffectivelyEnabled && totalDurationMs > 400L) {
+                        // 2. Real-Time Silence Trimming Filter (paused during audible hold-scrubbing so every cue is heard accurately)
+                        if (!isAudibleScrubbing && currentConfig.isEffectivelyEnabled && totalDurationMs > 400L) {
                             val jumpTargetMs = resolveRealtimeSilenceJump(
                                 currentPosMs = currentPosMs,
                                 totalDurationMs = totalDurationMs
@@ -2189,6 +2204,9 @@ class AudioStudioEngine(private val context: Context) {
             }
             if (written <= 0) {
                 delay(effectiveFrameMs)
+            } else if (isAudibleScrubbing) {
+                // Keep PCM cursor aligned near real-time speaker output while still avoiding buffer underruns
+                delay((effectiveFrameMs / 2L).coerceAtLeast(4L))
             }
         } else {
             if (trackReady && audioTrack != null) {
@@ -2388,11 +2406,79 @@ class AudioStudioEngine(private val context: Context) {
         }
     }
 
+    fun prepareIdlePlayerMetadata(
+        file: File,
+        durationMs: Long,
+        peaks: List<Float>
+    ) {
+        stopPlaybackInternal(resetSavedCounter = true)
+        currentSessionFile = file
+        _playbackDurationMs.value = durationMs.coerceAtLeast(1L)
+        _playbackPositionMs.value = 0L
+        if (peaks.isNotEmpty()) {
+            activePlaybackPeaks = peaks
+        }
+        isUsingPcmEngine = file.exists() && WavFileTools.isRiffWaveFile(file)
+    }
+
+    fun beginScrubHold(
+        currentFile: File?,
+        peaks: List<Float>,
+        preindexedSilenceMap: List<SilenceInterval> = preindexedSilenceIntervals,
+        fallbackDurationMs: Long = 0L
+    ) {
+        if (isAudibleScrubbing) return
+        if (_playbackDurationMs.value <= 0L && fallbackDurationMs > 0L) {
+            _playbackDurationMs.value = fallbackDurationMs
+        }
+        isAudibleScrubbing = true
+        wasPlayingBeforeScrub = _isPlaying.value
+        _activeSilenceJumping.value = false
+        if (!wasPlayingBeforeScrub) {
+            togglePlayPause(
+                currentFile = currentFile,
+                peaks = peaks,
+                preindexedSilenceMap = preindexedSilenceMap
+            )
+        }
+    }
+
+    fun seekToForScrub(positionMs: Long) {
+        val rawMax = _playbackDurationMs.value.coerceAtLeast(1L)
+        val safeUpper = if (rawMax > 250L) rawMax - 120L else rawMax
+        val clamped = positionMs.coerceIn(0L, safeUpper)
+        _playbackPositionMs.value = clamped
+        if (isUsingPcmEngine) {
+            pendingScrubFlush.set(true)
+            pendingSeekMs.set(clamped)
+        } else {
+            try {
+                lastMediaPlayerSeekUptimeMs = SystemClock.uptimeMillis()
+                mediaPlayer?.seekTo(clamped.toInt())
+            } catch (_: Exception) {}
+        }
+    }
+
+    fun endScrubHold() {
+        if (!isAudibleScrubbing) return
+        val shouldPauseAfterScrub = !wasPlayingBeforeScrub
+        isAudibleScrubbing = false
+        wasPlayingBeforeScrub = false
+        pendingScrubFlush.set(false)
+        if (shouldPauseAfterScrub && _isPlaying.value) {
+            togglePlayPause(
+                currentFile = currentSessionFile,
+                peaks = activePlaybackPeaks
+            )
+        }
+    }
+
     fun seekTo(positionMs: Long) {
         val maxDur = _playbackDurationMs.value.coerceAtLeast(1L)
         val clamped = positionMs.coerceIn(0L, maxDur)
         _playbackPositionMs.value = clamped
         if (isUsingPcmEngine) {
+            pendingScrubFlush.set(true)
             pendingSeekMs.set(clamped)
         } else {
             try {
@@ -2454,16 +2540,24 @@ class AudioStudioEngine(private val context: Context) {
     }
 
     fun stopPlayback() {
-        stopPlaybackInternal(resetSavedCounter = false)
+        stopPlaybackInternal(resetSavedCounter = false, resetScrubState = true)
     }
 
-    private fun stopPlaybackInternal(resetSavedCounter: Boolean) {
+    private fun stopPlaybackInternal(
+        resetSavedCounter: Boolean,
+        resetScrubState: Boolean = true
+    ) {
         pcmPlaybackJob?.cancel()
         pcmPlaybackJob = null
         playbackTickerJob?.cancel()
         playbackTickerJob = null
         _isPlaying.value = false
         _activeSilenceJumping.value = false
+        if (resetScrubState) {
+            isAudibleScrubbing = false
+            wasPlayingBeforeScrub = false
+        }
+        pendingScrubFlush.set(false)
         pendingSeekMs.set(-1L)
         if (resetSavedCounter) {
             _silenceSkippedSavedMs.value = 0L
@@ -2495,10 +2589,12 @@ class AudioStudioEngine(private val context: Context) {
                     val nowUptime = SystemClock.uptimeMillis()
                     val pos = mp.currentPosition.toLong()
                     val dur = mp.duration.toLong().coerceAtLeast(1L)
-                    _playbackPositionMs.value = pos
+                    if ((nowUptime - lastMediaPlayerSeekUptimeMs) > 120L) {
+                        _playbackPositionMs.value = pos
+                    }
                     _playbackDurationMs.value = dur
 
-                    if (silenceSkipConfig.isEffectivelyEnabled && dur > 500L && (nowUptime - lastMediaPlayerSeekUptimeMs) > 120L) {
+                    if (!isAudibleScrubbing && silenceSkipConfig.isEffectivelyEnabled && dur > 500L && (nowUptime - lastMediaPlayerSeekUptimeMs) > 120L) {
                         val jumpTarget = resolveRealtimeSilenceJump(
                             currentPosMs = pos,
                             totalDurationMs = dur

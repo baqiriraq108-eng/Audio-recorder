@@ -6,6 +6,8 @@ import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.net.Uri
+import android.os.Handler
+import android.os.Looper
 import androidx.compose.runtime.Immutable
 import androidx.core.content.ContextCompat
 import androidx.documentfile.provider.DocumentFile
@@ -107,6 +109,15 @@ class RecorderViewModel(application: Application) : AndroidViewModel(application
     val repository = RecordingRepository(application, database.recordingDao())
     val driveClient = GoogleDriveRestClient(application)
     val audioEngine = AudioStudioEngine(application)
+    private val mainHandler = Handler(Looper.getMainLooper())
+
+    private fun runOnMainThread(block: () -> Unit) {
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            block()
+        } else {
+            mainHandler.post(block)
+        }
+    }
 
     private val _currentDestination = MutableStateFlow(AppDestination.RECORDER)
     val currentDestination: StateFlow<AppDestination> = _currentDestination.asStateFlow()
@@ -301,6 +312,9 @@ class RecorderViewModel(application: Application) : AndroidViewModel(application
     // Dedicated Saved Recording Player View state (independent from Recorder tab)
     private val _openedPlayerRecording = MutableStateFlow<RecordingEntity?>(null)
     val openedPlayerRecording: StateFlow<RecordingEntity?> = _openedPlayerRecording.asStateFlow()
+
+    private val _isPlayerMinimized = MutableStateFlow(false)
+    val isPlayerMinimized: StateFlow<Boolean> = _isPlayerMinimized.asStateFlow()
 
     // Library active storage tab (Local vs. Cloud — complete data isolation)
     private val _activeLibraryStorageTab = MutableStateFlow(_settings.value.defaultStorageDestination)
@@ -670,16 +684,32 @@ class RecorderViewModel(application: Application) : AndroidViewModel(application
             audioEngine.stopPlayback()
         } catch (_: Exception) {}
         _openedPlayerRecording.value = null
+        _isPlayerMinimized.value = false
     }
 
     fun navigateTo(destination: AppDestination) {
         if (_openedPlayerRecording.value != null) {
-            closeSavedRecordingPlayer()
+            _isPlayerMinimized.value = true
         }
         _currentDestination.value = destination
         if (destination == AppDestination.STORAGE) {
             refreshLocalPhoneFolders()
             refreshDriveFoldersAndQuota()
+        }
+    }
+
+    fun minimizeSavedRecordingPlayer(returnToMain: Boolean = false) {
+        if (_openedPlayerRecording.value != null) {
+            _isPlayerMinimized.value = true
+        }
+        if (returnToMain) {
+            _currentDestination.value = AppDestination.RECORDER
+        }
+    }
+
+    fun expandSavedRecordingPlayer() {
+        if (_openedPlayerRecording.value != null) {
+            _isPlayerMinimized.value = false
         }
     }
 
@@ -813,6 +843,7 @@ class RecorderViewModel(application: Application) : AndroidViewModel(application
             _recordingStatus.value = RecordingStatus.PAUSED
         }
         _openedPlayerRecording.value = null
+        _isPlayerMinimized.value = false
         _currentDestination.value = AppDestination.RECORDER
         _showAppendSaveConfirmDialog.value = true
         showAppendSaveConfirmationNotification()
@@ -853,6 +884,9 @@ class RecorderViewModel(application: Application) : AndroidViewModel(application
         } else {
             resetActiveRecording()
         }
+        // Guarantee complete dismissal even if the session was already in an intermediate state
+        _showAppendSaveConfirmDialog.value = false
+        stopForegroundServiceNotification()
     }
 
     fun stopAndPromptSave() {
@@ -1480,6 +1514,7 @@ class RecorderViewModel(application: Application) : AndroidViewModel(application
     fun startContinueRecordingFlow(recording: RecordingEntity) {
         audioEngine.stopPlayback()
         _openedPlayerRecording.value = null
+        _isPlayerMinimized.value = false
         _showAppendSaveConfirmDialog.value = false
         _appendTarget.value = recording
         _liveBookmarks.value = recording.bookmarkList
@@ -1533,6 +1568,7 @@ class RecorderViewModel(application: Application) : AndroidViewModel(application
             recording
         }
         _openedPlayerRecording.value = effectiveRecording
+        _isPlayerMinimized.value = false
         val file = repairedFile
         val currentSilence = _settings.value.silenceConfig
         if (autoPlay && file.exists()) {
@@ -1548,6 +1584,12 @@ class RecorderViewModel(application: Application) : AndroidViewModel(application
                     emptyList()
                 }
             )
+        } else if (file.exists()) {
+            audioEngine.prepareIdlePlayerMetadata(
+                file = file,
+                durationMs = effectiveRecording.durationMs,
+                peaks = effectiveRecording.peakList
+            )
         }
         startPlaybackForegroundServiceNotification(
             title = effectiveRecording.title,
@@ -1560,6 +1602,7 @@ class RecorderViewModel(application: Application) : AndroidViewModel(application
     fun closeSavedRecordingPlayer() {
         audioEngine.stopPlayback()
         _openedPlayerRecording.value = null
+        _isPlayerMinimized.value = false
         if (_recordingStatus.value == RecordingStatus.READY) {
             stopForegroundServiceNotification()
         }
@@ -1657,6 +1700,29 @@ class RecorderViewModel(application: Application) : AndroidViewModel(application
 
     fun seekPlaybackRelative(deltaMs: Long) {
         audioEngine.seekRelative(deltaMs)
+    }
+
+    fun beginAudibleScrub() {
+        val rec = _openedPlayerRecording.value ?: return
+        val currentSilence = _settings.value.silenceConfig
+        audioEngine.beginScrubHold(
+            currentFile = File(rec.filePath),
+            peaks = rec.peakList,
+            preindexedSilenceMap = if (currentSilence.smartAutoMode) {
+                rec.silenceIntervals
+            } else {
+                emptyList()
+            },
+            fallbackDurationMs = rec.durationMs
+        )
+    }
+
+    fun seekPlaybackDuringScrub(positionMs: Long) {
+        audioEngine.seekToForScrub(positionMs)
+    }
+
+    fun endAudibleScrub() {
+        audioEngine.endScrubHold()
     }
 
     fun setPlaybackSpeed(speed: Float) {
@@ -3732,58 +3798,88 @@ class RecorderViewModel(application: Application) : AndroidViewModel(application
         waveformPeaks: FloatArray? = null,
         clearAppendConfirmation: Boolean = false
     ) {
-        try {
-            val context = getApplication<Application>()
-            val intent = Intent(context, RecordingForegroundService::class.java).apply {
-                action = RecordingForegroundService.ACTION_UPDATE_NOTIFICATION
-                putExtra(RecordingForegroundService.EXTRA_TITLE, title)
-                putExtra(RecordingForegroundService.EXTRA_STATUS, status)
-                putExtra(RecordingForegroundService.EXTRA_IS_PAUSED, isPaused)
-                putExtra(RecordingForegroundService.EXTRA_IS_APPENDING, _appendTarget.value != null)
-                putExtra(RecordingForegroundService.EXTRA_RECORDING_ELAPSED_MS, elapsedMs)
-                putExtra(RecordingForegroundService.EXTRA_CLEAR_APPEND_CONFIRMATION, clearAppendConfirmation)
-                if (!isPaused && waveformPeaks != null && waveformPeaks.isNotEmpty()) {
-                    putExtra(RecordingForegroundService.EXTRA_WAVEFORM_PEAKS, waveformPeaks)
+        val isAppending = _appendTarget.value != null
+        val isSkipSilence = _settings.value.silenceConfig.isEffectivelyEnabled
+        val activePeaks = if (!isPaused && waveformPeaks != null && waveformPeaks.isNotEmpty()) waveformPeaks else null
+        runOnMainThread {
+            try {
+                val activeService = RecordingForegroundService.activeInstance
+                if (activeService != null) {
+                    activeService.updateRecordingNotificationFromViewModel(
+                        title = title,
+                        statusText = status,
+                        isPaused = isPaused,
+                        isSkipSilence = isSkipSilence,
+                        isAppending = isAppending,
+                        elapsedMs = elapsedMs,
+                        waveformPeaks = activePeaks,
+                        clearAppendConfirmation = clearAppendConfirmation
+                    )
+                    return@runOnMainThread
                 }
-                putExtra(
-                    RecordingForegroundService.EXTRA_IS_SKIP_SILENCE_ACTIVE,
-                    _settings.value.silenceConfig.isEffectivelyEnabled
-                )
-            }
-            context.startService(intent)
-        } catch (_: Exception) {}
+                val context = getApplication<Application>()
+                val intent = Intent(context, RecordingForegroundService::class.java).apply {
+                    action = RecordingForegroundService.ACTION_UPDATE_NOTIFICATION
+                    putExtra(RecordingForegroundService.EXTRA_TITLE, title)
+                    putExtra(RecordingForegroundService.EXTRA_STATUS, status)
+                    putExtra(RecordingForegroundService.EXTRA_IS_PAUSED, isPaused)
+                    putExtra(RecordingForegroundService.EXTRA_IS_APPENDING, isAppending)
+                    putExtra(RecordingForegroundService.EXTRA_RECORDING_ELAPSED_MS, elapsedMs)
+                    putExtra(RecordingForegroundService.EXTRA_CLEAR_APPEND_CONFIRMATION, clearAppendConfirmation)
+                    if (activePeaks != null) {
+                        putExtra(RecordingForegroundService.EXTRA_WAVEFORM_PEAKS, activePeaks)
+                    }
+                    putExtra(
+                        RecordingForegroundService.EXTRA_IS_SKIP_SILENCE_ACTIVE,
+                        isSkipSilence
+                    )
+                }
+                context.startService(intent)
+            } catch (_: Exception) {}
+        }
     }
 
     private fun showAppendSaveConfirmationNotification() {
-        try {
-            val context = getApplication<Application>()
-            val intent = Intent(context, RecordingForegroundService::class.java).apply {
-                action = RecordingForegroundService.ACTION_SHOW_APPEND_SAVE_CONFIRMATION
-                _appendTarget.value?.title?.takeIf { it.isNotBlank() }?.let { targetTitle ->
-                    putExtra(RecordingForegroundService.EXTRA_TITLE, targetTitle)
+        val targetTitle = _appendTarget.value?.title?.takeIf { it.isNotBlank() }
+        runOnMainThread {
+            try {
+                val activeService = RecordingForegroundService.activeInstance
+                if (activeService != null) {
+                    activeService.showAppendSaveConfirmation(targetTitle)
+                    return@runOnMainThread
                 }
-            }
-            context.startService(intent)
-        } catch (_: Exception) {}
+                val context = getApplication<Application>()
+                val intent = Intent(context, RecordingForegroundService::class.java).apply {
+                    action = RecordingForegroundService.ACTION_SHOW_APPEND_SAVE_CONFIRMATION
+                    if (targetTitle != null) {
+                        putExtra(RecordingForegroundService.EXTRA_TITLE, targetTitle)
+                    }
+                }
+                context.startService(intent)
+            } catch (_: Exception) {}
+        }
     }
 
     private fun showSavedConfirmationNotification(title: String = "Finished recording") {
-        try {
-            val context = getApplication<Application>()
-            if (com.example.service.RecordingIslandOverlayManager.lastIsShowingFinishedCompletion) {
-                return
-            }
-            if (com.example.service.RecordingIslandOverlayManager.isRecordingSessionActive ||
-                com.example.service.RecordingIslandOverlayManager.lastIsShowingAppendConfirm
-            ) {
+        runOnMainThread {
+            try {
+                val context = getApplication<Application>()
+                val activeService = RecordingForegroundService.activeInstance
+                if (activeService != null) {
+                    activeService.showFinishedSavedConfirmation(title)
+                    return@runOnMainThread
+                }
                 com.example.service.RecordingIslandOverlayManager.showFinishedCompletionOverlay(context, title)
-            }
-            val intent = Intent(context, RecordingForegroundService::class.java).apply {
-                action = RecordingForegroundService.ACTION_SHOW_SAVED_CONFIRMATION
-                putExtra(RecordingForegroundService.EXTRA_TITLE, title)
-            }
-            context.startService(intent)
-        } catch (_: Exception) {}
+                RecordingForegroundService.postFinishedNotificationFallback(context, title)
+                val intent = Intent(context, RecordingForegroundService::class.java).apply {
+                    action = RecordingForegroundService.ACTION_SHOW_SAVED_CONFIRMATION
+                    putExtra(RecordingForegroundService.EXTRA_TITLE, title)
+                }
+                try {
+                    context.startService(intent)
+                } catch (_: Exception) {}
+            } catch (_: Exception) {}
+        }
     }
 
     private fun startPlaybackForegroundServiceNotification(
@@ -3825,17 +3921,24 @@ class RecorderViewModel(application: Application) : AndroidViewModel(application
     }
 
     private fun stopForegroundServiceNotification() {
-        try {
-            com.example.service.RecordingIslandOverlayManager.dismissAndReset()
-            val context = getApplication<Application>()
-            val nm = context.getSystemService(Context.NOTIFICATION_SERVICE) as? android.app.NotificationManager
-            nm?.cancel(RecordingForegroundService.NOTIFICATION_ID)
-            nm?.cancel(RecordingForegroundService.FINISHED_NOTIFICATION_ID)
-            val intent = Intent(context, RecordingForegroundService::class.java).apply {
-                action = RecordingForegroundService.ACTION_STOP_FOREGROUND
-            }
-            context.startService(intent)
-        } catch (_: Exception) {}
+        runOnMainThread {
+            try {
+                com.example.service.RecordingIslandOverlayManager.dismissAndReset()
+                val context = getApplication<Application>()
+                val nm = context.getSystemService(Context.NOTIFICATION_SERVICE) as? android.app.NotificationManager
+                nm?.cancel(RecordingForegroundService.NOTIFICATION_ID)
+                nm?.cancel(RecordingForegroundService.FINISHED_NOTIFICATION_ID)
+                val activeService = RecordingForegroundService.activeInstance
+                if (activeService != null) {
+                    activeService.stopForegroundSession()
+                    return@runOnMainThread
+                }
+                val intent = Intent(context, RecordingForegroundService::class.java).apply {
+                    action = RecordingForegroundService.ACTION_STOP_FOREGROUND
+                }
+                context.startService(intent)
+            } catch (_: Exception) {}
+        }
     }
 
     fun refreshConnectedAudioDevices() {
